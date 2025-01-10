@@ -3,6 +3,7 @@ package graph
 // Options.go holds the option settings for a single graph request.
 
 import (
+	"context"
 	"fmt"
 	net_http "net/http"
 	"net/url"
@@ -12,7 +13,6 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/prometheus/common/model"
-	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kiali/kiali/business"
 	"github.com/kiali/kiali/config"
@@ -28,16 +28,20 @@ const (
 )
 
 const (
+	AmbientTrafficNone        string = "none"
+	AmbientTrafficTotal       string = "total"
+	AmbientTrafficWaypoint    string = "waypoint"
+	AmbientTrafficZtunnel     string = "ztunnel"
 	BoxByApp                  string = "app"
 	BoxByCluster              string = "cluster"
 	BoxByNamespace            string = "namespace"
 	BoxByNone                 string = "none"
-	NamespaceIstio            string = "istio-system"
 	RateNone                  string = "none"
 	RateReceived              string = "received" // tcp bytes received, grpc response messages, etc
 	RateRequests              string = "requests" // request count
 	RateSent                  string = "sent"     // tcp bytes sent, grpc request messages, etc
 	RateTotal                 string = "total"    // Sent+Received
+	defaultAmbientTraffic     string = AmbientTrafficTotal
 	defaultBoxBy              string = BoxByNone
 	defaultDuration           string = "10m"
 	defaultGraphType          string = GraphTypeWorkload
@@ -59,7 +63,7 @@ type NodeOptions struct {
 	AggregateValue string
 	App            string
 	Cluster        string
-	Namespace      string
+	Namespace      NamespaceInfo
 	Service        string
 	Version        string
 	Workload       string
@@ -85,14 +89,33 @@ type RequestedAppenders struct {
 }
 
 type RequestedRates struct {
-	Grpc string
-	Http string
-	Tcp  string
+	Ambient string
+	Grpc    string
+	Http    string
+	Tcp     string
 }
+
+// ClusterSensitiveKey is the recommended [string] type for maps keying on a cluster-sensitive name
+type ClusterSensitiveKey = string
+
+// GetClusterSensitiveKey returns a valid key for maps using a ClusterSensitiveKey
+func GetClusterSensitiveKey(cluster, name string) ClusterSensitiveKey {
+	return fmt.Sprintf("%s:%s", cluster, name)
+}
+
+type AccessibleNamespace struct {
+	Cluster           string
+	CreationTimestamp time.Time
+	IsAmbient         bool
+	Name              string
+}
+
+// AccessibleNamepaces is a map with Key: ClusterSensitive namespace Key, Value: *AccessibleNamespace
+type AccessibleNamespaces map[ClusterSensitiveKey]*AccessibleNamespace
 
 // TelemetryOptions are those supplied to Telemetry Vendors
 type TelemetryOptions struct {
-	AccessibleNamespaces map[string]time.Time
+	AccessibleNamespaces AccessibleNamespaces
 	Appenders            RequestedAppenders // requested appenders, nil if param not supplied
 	IncludeIdleEdges     bool               // include edges with request rates of 0
 	InjectServiceNodes   bool               // inject destination service nodes between source and destination nodes.
@@ -110,7 +133,7 @@ type Options struct {
 	TelemetryOptions
 }
 
-func NewOptions(r *net_http.Request) Options {
+func NewOptions(r *net_http.Request, namespacesService *business.NamespaceService) Options {
 	// path variables (0 or more will be set)
 	vars := mux.Vars(r)
 	aggregate := vars["aggregate"]
@@ -127,9 +150,11 @@ func NewOptions(r *net_http.Request) Options {
 	var includeIdleEdges bool
 	var injectServiceNodes bool
 	var queryTime int64
+	ambientTraffic := params.Get("ambientTraffic")
 	appenders := RequestedAppenders{All: true}
 	boxBy := params.Get("boxBy")
-	cluster := params.Get("cluster")
+	// @TODO requires refactoring to use clusterNameFromQuery
+	cluster := params.Get("clusterName")
 	configVendor := params.Get("configVendor")
 	durationString := params.Get("duration")
 	graphType := params.Get("graphType")
@@ -149,7 +174,6 @@ func NewOptions(r *net_http.Request) Options {
 		}
 		appenders = RequestedAppenders{All: false, AppenderNames: appenderNames}
 	}
-
 	if cluster == "" {
 		cluster = Unknown
 	}
@@ -167,10 +191,15 @@ func NewOptions(r *net_http.Request) Options {
 			BadRequest(fmt.Sprintf("Invalid duration [%s]", durationString))
 		}
 	}
+
 	if graphType == "" {
 		graphType = defaultGraphType
 	} else if graphType != GraphTypeApp && graphType != GraphTypeService && graphType != GraphTypeVersionedApp && graphType != GraphTypeWorkload {
 		BadRequest(fmt.Sprintf("Invalid graphType [%s]", graphType))
+	}
+	// service graphs do not inject service nodes
+	if graphType == GraphTypeService {
+		injectServiceNodesString = "false"
 	}
 	// app node graphs require an app graph type
 	if app != "" && graphType != GraphTypeApp && graphType != GraphTypeVersionedApp {
@@ -227,20 +256,7 @@ func NewOptions(r *net_http.Request) Options {
 
 	// Process namespaces options:
 	namespaceMap := NewNamespaceInfoMap()
-
-	authInfoContext := r.Context().Value("authInfo")
-	var authInfo *api.AuthInfo
-	if authInfoContext != nil {
-		if authInfoCheck, ok := authInfoContext.(*api.AuthInfo); !ok {
-			Error("authInfo is not of type *api.AuthInfo")
-		} else {
-			authInfo = authInfoCheck
-		}
-	} else {
-		Error("token missing in request context")
-	}
-
-	accessibleNamespaces := getAccessibleNamespaces(authInfo)
+	accessibleNamespaces := getAccessibleNamespaces(r.Context(), namespacesService)
 
 	// If path variable is set then it is the only relevant namespace (it's a node graph)
 	// Else if namespaces query param is set it specifies the relevant namespaces
@@ -253,25 +269,52 @@ func NewOptions(r *net_http.Request) Options {
 		BadRequest("At least one namespace must be specified via the namespaces query parameter.")
 	}
 
-	for _, namespaceToken := range strings.Split(namespaces, ",") {
-		namespaceToken = strings.TrimSpace(namespaceToken)
-		if creationTime, found := accessibleNamespaces[namespaceToken]; found {
-			namespaceMap[namespaceToken] = NamespaceInfo{
-				Name:     namespaceToken,
-				Duration: getSafeNamespaceDuration(namespaceToken, creationTime, time.Duration(duration), queryTime),
-				IsIstio:  config.IsIstioNamespace(namespaceToken),
+	for _, namespaceName := range strings.Split(namespaces, ",") {
+		namespaceName = strings.TrimSpace(namespaceName)
+		var earliestCreationTimestamp *time.Time
+		var isAmbient bool
+		for _, an := range accessibleNamespaces {
+			if namespaceName == an.Name {
+				if nil == earliestCreationTimestamp || earliestCreationTimestamp.After(an.CreationTimestamp) {
+					earliestCreationTimestamp = &an.CreationTimestamp
+				}
+				isAmbient = an.IsAmbient
 			}
+		}
+		if nil == earliestCreationTimestamp {
+			Forbidden(fmt.Sprintf("Requested namespace [%s] is not accessible.", namespaceName))
 		} else {
-			Forbidden(fmt.Sprintf("Requested namespace [%s] is not accessible.", namespaceToken))
+			namespaceMap[namespaceName] = NamespaceInfo{
+				Name:      namespaceName,
+				Duration:  getSafeNamespaceDuration(namespaceName, *earliestCreationTimestamp, time.Duration(duration), queryTime),
+				IsAmbient: isAmbient,
+				IsIstio:   config.IsIstioNamespace(namespaceName),
+			}
 		}
 	}
 
 	// Process Rate Options
 
 	rates := RequestedRates{
-		Grpc: defaultRateGrpc,
-		Http: defaultRateHttp,
-		Tcp:  defaultRateTcp,
+		Ambient: defaultAmbientTraffic,
+		Grpc:    defaultRateGrpc,
+		Http:    defaultRateHttp,
+		Tcp:     defaultRateTcp,
+	}
+
+	if ambientTraffic != "" {
+		switch ambientTraffic {
+		case AmbientTrafficNone:
+			rates.Ambient = AmbientTrafficNone
+		case AmbientTrafficTotal:
+			rates.Ambient = AmbientTrafficTotal
+		case AmbientTrafficWaypoint:
+			rates.Ambient = AmbientTrafficWaypoint
+		case AmbientTrafficZtunnel:
+			rates.Ambient = AmbientTrafficZtunnel
+		default:
+			BadRequest(fmt.Sprintf("Invalid Ambient Traffic [%s]", rates.Ambient))
+		}
 	}
 
 	if rateGrpc != "" {
@@ -352,7 +395,7 @@ func NewOptions(r *net_http.Request) Options {
 				AggregateValue: aggregateValue,
 				App:            app,
 				Cluster:        cluster,
-				Namespace:      namespace,
+				Namespace:      namespaceMap[namespace],
 				Service:        service,
 				Version:        version,
 				Workload:       workload,
@@ -378,21 +421,22 @@ func (o *TelemetryOptions) GetGraphKind() string {
 // The Set is implemented using the map convention. Each map entry is set to the
 // creation timestamp of the namespace, to be used to ensure valid time ranges for
 // queries against the namespace.
-func getAccessibleNamespaces(authInfo *api.AuthInfo) map[string]time.Time {
-	// Get the namespaces
-	business, err := business.Get(authInfo)
-	CheckError(err)
-
-	namespaces, err := business.Namespace.GetNamespaces()
+func getAccessibleNamespaces(ctx context.Context, namespacesService *business.NamespaceService) AccessibleNamespaces {
+	namespaces, err := namespacesService.GetNamespaces(ctx)
 	CheckError(err)
 
 	// Create a map to store the namespaces
-	namespaceMap := make(map[string]time.Time)
+	accessibleNamespaces := make(AccessibleNamespaces)
 	for _, namespace := range namespaces {
-		namespaceMap[namespace.Name] = namespace.CreationTimestamp
+		accessibleNamespaces[GetClusterSensitiveKey(namespace.Cluster, namespace.Name)] = &AccessibleNamespace{
+			Cluster:           namespace.Cluster,
+			CreationTimestamp: namespace.CreationTimestamp,
+			IsAmbient:         namespace.IsAmbient,
+			Name:              namespace.Name,
+		}
 	}
 
-	return namespaceMap
+	return accessibleNamespaces
 }
 
 // getSafeNamespaceDuration returns a safe duration for the query. If queryTime-requestedDuration > namespace

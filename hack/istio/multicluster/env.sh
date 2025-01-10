@@ -49,10 +49,17 @@ CLIENT_EXE_NAME="kubectl"
 ISTIO_DIR=""
 
 # If the scripts need image registry client, this is it (docker or podman)
-DORP="${DORP:-docker}"
+DORP="${DORP:-podman}"
 
 # The namespace where Istio will be found - this namespace must be the same on both clusters
-ISTIO_NAMESPACE="istio-system"
+ISTIO_NAMESPACE="${ISTIO_NAMESPACE:-istio-system}"
+
+# If you want to pull Istio images from a different image repository than what the hack script
+# will tell Istio to pull from, then set that hub name here. If you set this to "default",
+# the images will come from the repo that the Istio distro pulls from.
+# Suffice it to say, this setting is needed to avoid docker.io (and its throttling behavior) for
+# Istio production releases but allows you to run with Istio dev builds (set this to "default" for dev builds).
+ISTIO_HUB=""
 
 # If you want to override the tag that istioctl will use for the container images it pulls, set this.
 # (note: needed this because openshift requires a dev build of istioctl but we still want the released images.
@@ -67,6 +74,19 @@ MESH_ID="mesh-hack"
 NETWORK1_ID="network-east"
 NETWORK2_ID="network-west"
 
+# Deploy a single kiali or a kiali per cluster
+SINGLE_KIALI="${SINGLE_KIALI:-true}"
+
+# Deploy just in one cluster
+SINGLE_CLUSTER="${SINGLE_CLUSTER:-false}"
+
+# Use groups for OpenId authorization (single cluster)
+AUTH_GROUPS="${AUTH_GROUPS:-}"
+
+# Create kiali remote secrets so kiali can access the different clusters
+# When left empty, this will be true if SINGLE_KIALI is true or false otherwise.
+KIALI_CREATE_REMOTE_CLUSTER_SECRETS="${KIALI_CREATE_REMOTE_CLUSTER_SECRETS:-}"
+
 # If a gateway is required to cross the networks, set this to true and one will be created
 # See: https://istio.io/latest/docs/setup/install/multicluster/multi-primary_multi-network/
 CROSSNETWORK_GATEWAY_REQUIRED="true"
@@ -74,46 +94,70 @@ CROSSNETWORK_GATEWAY_REQUIRED="true"
 # Under some conditions, manually configuring the mesh network will be required.
 MANUAL_MESH_NETWORK_CONFIG=""
 
+# Tempo instead of Jaeger
+TEMPO="${TEMPO:-false}"
+
 # The names of each cluster
-CLUSTER1_NAME="east"
-CLUSTER2_NAME="west"
+CLUSTER1_NAME="${CLUSTER1_NAME:-east}"
+CLUSTER2_NAME="${CLUSTER2_NAME:-west}"
 
 # If using Kubernetes, these are the kube context names used to connect to the clusters
 # If using OpenShift, these are the URLs to the API login server (e.g. "https://api.server-name.com:6443")
-CLUSTER1_CONTEXT=""
-CLUSTER2_CONTEXT=""
+CLUSTER1_CONTEXT="${CLUSTER1_CONTEXT:-}"
+CLUSTER2_CONTEXT="${CLUSTER2_CONTEXT:-}"
 
 # if using OpenShift, these are the credentials needed to log on to the clusters
-CLUSTER1_USER="kiali"
-CLUSTER1_PASS="kiali"
-CLUSTER2_USER="kiali"
-CLUSTER2_PASS="kiali"
+CLUSTER1_USER="${CLUSTER1_USER:-kiali}"
+CLUSTER1_PASS="${CLUSTER1_PASS:-kiali}"
+CLUSTER2_USER="${CLUSTER2_USER:-kiali}"
+CLUSTER2_PASS="${CLUSTER2_PASS:-kiali}"
 
 # Should Kiali be installed? This installs the last release of Kiali via the kiali-server helm chart.
-# If you want another verison or your own dev build, you must disable this and install what you want manually.
-KIALI_ENABLED="true"
+# If you want another version, you must disable this and install what you want manually.
+KIALI_ENABLED="${KIALI_ENABLED:-true}"
+
+# When installing Kiali, this will determine if a released image is used or if a local dev image is to be pushed and used.
+KIALI_USE_DEV_IMAGE="${KIALI_USE_DEV_IMAGE:-false}"
+
+# Sets the auth strategy for kiali. If "openid" is used then keycloak is provisioned for the auth provider.
+KIALI_AUTH_STRATEGY="${KIALI_AUTH_STRATEGY:-openid}"
 
 # Should Bookinfo demo be installed? If so, where?
 BOOKINFO_ENABLED="true"
 BOOKINFO_NAMESPACE="bookinfo"
 
 # If true and client exe is kubectl, then two minikube instances will be installed/uninstalled by these scripts
-MANAGE_MINIKUBE="true"
+MANAGE_MINIKUBE="${MANAGE_MINIKUBE:-true}"
 
 # If true and client exe is kubectl, then two kind instances will be installed/uninstalled by these scripts
-MANAGE_KIND="false"
+MANAGE_KIND="${MANAGE_KIND:-false}"
+
+# Image of the kind cluster
+KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-}"
 
 # Minikube options - these are ignored if MANAGE_MINIKUBE is false
-MINIKUBE_DRIVER="virtualbox"
+MINIKUBE_DRIVER="kvm2"
 MINIKUBE_CPU=""
 MINIKUBE_DISK=""
 MINIKUBE_MEMORY=""
 
+# Keycloak settings.
+KEYCLOAK_ADDRESS="${KEYCLOAK_ADDRESS:-}"
+KEYCLOAK_DB_PASSWORD="${KEYCLOAK_DB_PASSWORD:-keycloak-password}"
+KEYCLOAK_KUBE_CLIENT_SECRET="${KEYCLOAK_KUBE_CLIENT_SECRET:-kube-client-secret}"
+KIALI_USER_PASSWORD="${KIALI_USER_PASSWORD:-kiali}"
+
+# Path to a Kiali server helm charts tarball
+KIALI_SERVER_HELM_CHARTS="${KIALI_SERVER_HELM_CHARTS:-}"
+
 # Some settings that can be configured when helm installing the two Kiali instances.
-KIALI1_WEB_FQDN=""
-KIALI1_WEB_SCHEMA=""
-KIALI2_WEB_FQDN=""
-KIALI2_WEB_SCHEMA=""
+KIALI1_WEB_FQDN="${KIALI1_WEB_FQDN:-}"
+KIALI1_WEB_SCHEMA="${KIALI1_WEB_SCHEMA:-}"
+KIALI2_WEB_FQDN="${KIALI2_WEB_FQDN:-}"
+KIALI2_WEB_SCHEMA="${KIALI2_WEB_SCHEMA:-}"
+
+# If true the local dev image of Kiali will be built and used in the Kiali deployment
+KIALI_BUILD_DEV_IMAGE="${KIALI_BUILD_DEV_IMAGE:-false}"
 
 # process command line args
 while [[ $# -gt 0 ]]; do
@@ -164,9 +208,17 @@ while [[ $# -gt 0 ]]; do
       CLUSTER2_USER="$2"
       shift;shift
       ;;
+    -cd|--certs-dir)
+      CERTS_DIR="$2"
+      shift;shift
+      ;;
     -dorp|--docker-or-podman)
       [ "${2:-}" != "docker" -a "${2:-}" != "podman" ] && echo "-dorp must be 'docker' or 'podman'" && exit 1
       DORP="$2"
+      shift;shift
+      ;;
+    -ag|--auth-groups)
+      AUTH_GROUPS="$2"
       shift;shift
       ;;
     -gr|--gateway-required)
@@ -182,13 +234,49 @@ while [[ $# -gt 0 ]]; do
       ISTIO_NAMESPACE="$2"
       shift;shift
       ;;
+    -ih|--istio-hub)
+      ISTIO_HUB="$2"
+      shift;shift
+      ;;
     -it|--istio-tag)
       ISTIO_TAG="$2"
+      shift;shift
+      ;;
+    -ka|--keycloak-address)
+      KEYCLOAK_ADDRESS="$2"
+      shift;shift
+      ;;
+    -kas|--kiali-auth-strategy)
+      [ "${2:-}" != "anonymous" -a "${2:-}" != "openid" -a "${2:-}" != "openshift" ] && echo "--kiali-auth-strategy must be 'anonymous', 'openid', or 'openshift'" && exit 1
+      KIALI_AUTH_STRATEGY="$2"
+      shift;shift
+      ;;
+    -kbdi|--kiali-build-dev-image)
+      [ "${2:-}" != "true" -a "${2:-}" != "false" ] && echo "--kiali-build-dev-image must be 'true' or 'false'" && exit 1
+      KIALI_BUILD_DEV_IMAGE="$2"
+      shift;shift
+      ;;
+    -kcrcs|--kiali-create-remote-cluster-secrets)
+      [ "${2:-}" != "true" -a "${2:-}" != "false" ] && echo "--kiali-create-remote-cluster-secrets must be 'true' or 'false'" && exit 1
+      KIALI_CREATE_REMOTE_CLUSTER_SECRETS="$2"
       shift;shift
       ;;
     -ke|--kiali-enabled)
       [ "${2:-}" != "true" -a "${2:-}" != "false" ] && echo "--kiali-enabled must be 'true' or 'false'" && exit 1
       KIALI_ENABLED="$2"
+      shift;shift
+      ;;
+    -kni|--kind-node-image)
+      KIND_NODE_IMAGE="$2"
+      shift;shift
+      ;;
+    -kshc|--kiali-server-helm-charts)
+      KIALI_SERVER_HELM_CHARTS="$2"
+      shift;shift
+      ;;
+    -kudi|--kiali-use-dev-image)
+      [ "${2:-}" != "true" -a "${2:-}" != "false" ] && echo "--kiali-use-dev-image must be 'true' or 'false'" && exit 1
+      KIALI_USE_DEV_IMAGE="$2"
       shift;shift
       ;;
     -k1wf|--kiali1-web-fqdn)
@@ -205,6 +293,18 @@ while [[ $# -gt 0 ]]; do
       ;;
     -k2ws|--kiali2-web-schema)
       KIALI2_WEB_SCHEMA="$2"
+      shift;shift
+      ;;
+    -kdp|--keycloak-db-password)
+      KEYCLOAK_DB_PASSWORD="$2"
+      shift;shift
+      ;;
+    -kcs|--keycloak-client-secret)
+      KEYCLOAK_KUBE_CLIENT_SECRET="$2"
+      shift;shift
+      ;;
+    -kup|--kiali-user-password)
+      KIALI_USER_PASSWORD="$2"
       shift;shift
       ;;
     -mcpu|--minikube-cpu)
@@ -252,6 +352,18 @@ while [[ $# -gt 0 ]]; do
       NETWORK2_ID="$2"
       shift;shift
       ;;
+    -sk|--single-cluster)
+      SINGLE_CLUSTER="$2"
+      shift;shift
+      ;;
+    -sk|--single-kiali)
+      SINGLE_KIALI="$2"
+      shift;shift
+      ;;
+    -te|--tempo)
+      TEMPO="$2"
+      shift;shift
+      ;;
     -h|--help)
       cat <<HELPMSG
 Valid command line arguments:
@@ -267,20 +379,40 @@ Valid command line arguments:
   -c2n|--cluster2-name <name>: The name of cluster2 (Default: west)
   -c2p|--cluster2-password <name>: If cluster2 is OpenShift, this is the password used to log in (Default: kiali)
   -c2u|--cluster2-username <name>: If cluster2 is OpenShift, this is the username used to log in (Default: kiali)
-  -dorp|--docker-or-podman <docker|podman>: What image registry client to use (Default: docker)
+  -cd|--certs-dir <dir>: Directory where the keycloak certs are located. (Default: /tmp/istio-multicluster-certs)
+  -dorp|--docker-or-podman <docker|podman>: What image registry client to use (Default: podman)
+  -ag|--auth-groups <string>: If using Group for authentication, a comma separated groups list. Just for OpenID.
   -gr|--gateway-required <bool>: If a gateway is required to cross between networks, set this to true
   -id|--istio-dir <dir>: Where Istio has already been downloaded. If not found, this script aborts.
   -in|--istio-namespace <name>: Where the Istio control plane is installed (default: istio-system).
+  -ih|--istio-hub <hub>: If you want to override the image hub used by istioctl (where the images are found),
+                         set this to the hub name, or "default" to use the default image locations.
   -it|--istio-tag <tag>: If you want to override the image tag used by istioctl, set this to the tag name.
-  -ke|--kiali-enabled <bool>: If "true" the latest release of Kiali will be installed in both clusters. If you want
-                              a different version of Kiali installed, you must set this to "false" and install it yourself.
-                              (Default: true)
   -k1wf|--kiali1-web-fqdn <fqdn>: If specified, this will be the #1 Kaili setting for spec.server.web_fqdn.
   -k1ws|--kiali1-web-schema <schema>: If specified, this will be the #1 Kaili setting for spec.server.web_schema.
   -k2wf|--kiali2-web-fqdn <fqdn>: If specified, this will be the #2 Kaili setting for spec.server.web_fqdn.
   -k2ws|--kiali2-web-schema <schema>: If specified, this will be the #2 Kaili setting for spec.server.web_schema.
+  -ka|--keycloak-address <ip or host name>: Address of the keycloak idp.
+  -kas|--kiali-auth-strategy <openid|openshift|anonymous>: The authentication strategy to use for Kiali (Default: openid)
+  -kbdi|--kiali-build-dev-image <bool>: If "true" the local dev image of Kiali will be built and used in the Kiali deployment.
+                                        Will be ignored if --kiali-enabled is 'false'. (Default: false)
+  -kcrcs|--kiali-create-remote-cluster-secrets <bool>: Create remote cluster secrets for kiali remote cluster access.
+  -kcs|--keycloak-client-secret <password>: Client secret for the openshift kube client in keycloak.
+  -kdp|--keycloak-db-password <password>: Password for the keycloak database.
+  -ke|--kiali-enabled <bool>: If "true" the latest release of Kiali will be installed in both clusters. If you want
+                              a different version of Kiali installed, you must set this to "false" and install it yourself.
+                              (Default: true)
+  -kni|--kind-node-image: Image of the kind cluster. Defaults to latest kind image if not specified.
+  -kshc|--kiali-server-helm-charts <path>: If specified, must be the path to a Kiali server helm charts tarball. If not
+                                           specified, the latest published helm charts is used. (Default: kiali-server)
+  -kudi|--kiali-use-dev-image: If "true" the local dev image of Kiali will be pushed and used in the Kiali deployment.
+                               The local dev image must be tagged as "quay.io/kiali/kiali:dev" prior to running this script;
+                               that will be the image pushed to the clusters. You can "make container-build-kiali" to build it.
+                               Will be ignored if --kiali-enabled is 'false'. (Default: false)
+                               CURRENTLY ONLY SUPPORTED WITH MINIKUBE!
+  -kup|--kiali-user-password <password>: Password for the kiali user in keycloak.
   -mcpu|--minikube-cpu <cpu count>: Number of CPUs to give to each minikube cluster
-  -md|--minikube-driver <name>: The driver used by minikube (e.g. virtualbox, kvm2) (Default: virtualbox)
+  -md|--minikube-driver <name>: The driver used by minikube (e.g. virtualbox, kvm2) (Default: kvm2)
   -mdisk|--minikube-disk <space>: Amount of disk space to give to each minikube cluster
   -mi|--mesh-id <id>: When Istio is installed, it will be part of the mesh with this given name. (Default: mesh-default)
   -mk|--manage-kind <bool>: If "true" and if --client-exe is kubectl, two kind instances will be managed
@@ -291,6 +423,9 @@ Valid command line arguments:
   -n1|--network1 <id>: When Istio is installed in cluster 1, it will be part of the network with this given name. (Default: network-default)
   -n2|--network2 <id>: When Istio is installed in cluster 2, it will be part of the network with this given name.
                        If this is left as empty string, it will be the same as --network1. (Default: "")
+  -sc|--single-cluster <bool>: If "true", perform action just in CLUSTER 1. (Default: false)
+  -sk|--single-kiali <bool>: If "true", a single kiali will be deployed for the whole mesh. (Default: true)
+  -te|--tempo <bool>: If "true", Tempo instead of Jaeger will be installed. (Default: false)
   -h|--help: this message
 HELPMSG
       exit 1
@@ -301,6 +436,8 @@ HELPMSG
       ;;
   esac
 done
+
+KEYCLOAK_CERTS_DIR=${CERTS_DIR}/keycloak
 
 if [ "${ISTIO_DIR}" == "" ]; then
   # Go to the main output directory and try to find an Istio there.
@@ -415,9 +552,29 @@ if [ -z "${NETWORK2_ID}" ]; then
   NETWORK2_ID="${NETWORK1_ID}"
 fi
 
+# If not told explicitly to create remote cluster secrets, only do so if SINGLE_KIALI is true.
+# We want the secrets by default if only installing one Kiali since presumably it needs access to the remote cluster.
+if [ -z "${KIALI_CREATE_REMOTE_CLUSTER_SECRETS}" ]; then
+  KIALI_CREATE_REMOTE_CLUSTER_SECRETS="${SINGLE_KIALI}"
+fi
+
+if [ "${KIALI_USE_DEV_IMAGE}" == "true" ]; then
+  if [ -z "${KIALI_SERVER_HELM_CHARTS:-}" ]; then
+    echo "ERROR: You must specify the Kiali Server Helm Charts (--kiali-server-helm-charts) tarball to use when using a dev image"
+    exit 1
+  else
+    # Used by the Kiali deployment functions, this declares what Kiali Server Helm Charts to use.
+    # The user should set this to a tarball if a different helm chart should be used.
+    # e.g. /source/helm-charts/_output/charts/kiali-server-1.64.0-SNAPSHOT.tgz
+    KIALI_SERVER_HELM_CHARTS="${KIALI_SERVER_HELM_CHARTS:-kiali-server}"
+  fi
+fi
+
 # Export all variables so child scripts pick them up
-export BOOKINFO_ENABLED \
+export AUTH_GROUPS \
+       BOOKINFO_ENABLED \
        BOOKINFO_NAMESPACE \
+       CERTS_DIR \
        CLIENT_EXE_NAME \
        CLUSTER1_CONTEXT \
        CLUSTER1_NAME \
@@ -432,8 +589,16 @@ export BOOKINFO_ENABLED \
        IS_OPENSHIFT \
        ISTIO_DIR \
        ISTIO_NAMESPACE \
+       ISTIO_HUB \
        ISTIO_TAG \
+       KEYCLOAK_CERTS_DIR \
+       KIALI_AUTH_STRATEGY \
+       KIALI_BUILD_DEV_IMAGE \
+       KIALI_CREATE_REMOTE_CLUSTER_SECRETS \
        KIALI_ENABLED \
+       KIALI_SERVER_HELM_CHARTS \
+       KIALI_USE_DEV_IMAGE \
+       KIND_NODE_IMAGE \
        MANAGE_KIND \
        MANAGE_MINIKUBE \
        MANUAL_MESH_NETWORK_CONFIG \
@@ -443,12 +608,17 @@ export BOOKINFO_ENABLED \
        MINIKUBE_MEMORY \
        MESH_ID \
        NETWORK1_ID \
-       NETWORK2_ID
+       NETWORK2_ID \
+       SINGLE_KIALI \
+       SINGLE_CLUSTER \
+       TEMPO
 
 cat <<EOM
 === SETTINGS ===
+AUTH_GROUPS=$AUTH_GROUPS
 BOOKINFO_ENABLED=$BOOKINFO_ENABLED
 BOOKINFO_NAMESPACE=$BOOKINFO_NAMESPACE
+CERTS_DIR=$CERTS_DIR
 CLIENT_EXE_NAME=$CLIENT_EXE_NAME
 CLUSTER1_CONTEXT=$CLUSTER1_CONTEXT
 CLUSTER1_NAME=$CLUSTER1_NAME
@@ -463,12 +633,20 @@ DORP=$DORP
 IS_OPENSHIFT=$IS_OPENSHIFT
 ISTIO_DIR=$ISTIO_DIR
 ISTIO_NAMESPACE=$ISTIO_NAMESPACE
+ISTIO_HUB=$ISTIO_HUB
 ISTIO_TAG=$ISTIO_TAG
+KEYCLOAK_CERTS_DIR=$KEYCLOAK_CERTS_DIR
+KIALI_AUTH_STRATEGY=$KIALI_AUTH_STRATEGY
+KIALI_BUILD_DEV_IMAGE=$KIALI_BUILD_DEV_IMAGE
+KIALI_CREATE_REMOTE_CLUSTER_SECRETS=$KIALI_CREATE_REMOTE_CLUSTER_SECRETS
 KIALI_ENABLED=$KIALI_ENABLED
+KIALI_SERVER_HELM_CHARTS=$KIALI_SERVER_HELM_CHARTS
+KIALI_USE_DEV_IMAGE=$KIALI_USE_DEV_IMAGE
 KIALI1_WEB_FQDN=$KIALI1_WEB_FQDN
 KIALI1_WEB_SCHEMA=$KIALI1_WEB_SCHEMA
 KIALI2_WEB_FQDN=$KIALI2_WEB_FQDN
 KIALI2_WEB_SCHEMA=$KIALI2_WEB_SCHEMA
+KIND_NODE_IMAGE=$KIND_NODE_IMAGE
 MANAGE_KIND=$MANAGE_KIND
 MANAGE_MINIKUBE=$MANAGE_MINIKUBE
 MANUAL_MESH_NETWORK_CONFIG=$MANUAL_MESH_NETWORK_CONFIG
@@ -479,6 +657,9 @@ MINIKUBE_MEMORY=$MINIKUBE_MEMORY
 MESH_ID=$MESH_ID
 NETWORK1_ID=$NETWORK1_ID
 NETWORK2_ID=$NETWORK2_ID
+SINGLE_CLUSTER=$SINGLE_CLUSTER
+SINGLE_KIALI=$SINGLE_KIALI
+TEMPO=$TEMPO
 === SETTINGS ===
 EOM
 

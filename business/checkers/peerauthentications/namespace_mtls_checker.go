@@ -1,14 +1,14 @@
 package peerauthentications
 
 import (
-	security_v1beta "istio.io/client-go/pkg/apis/security/v1beta1"
+	security_v1 "istio.io/client-go/pkg/apis/security/v1"
 
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
 )
 
 type NamespaceMtlsChecker struct {
-	PeerAuthn   security_v1beta.PeerAuthentication
+	PeerAuthn   *security_v1.PeerAuthentication
 	MTLSDetails kubernetes.MTLSDetails
 }
 
@@ -18,6 +18,11 @@ func (t NamespaceMtlsChecker) Check() ([]*models.IstioCheck, bool) {
 
 	// if PeerAuthn doesn't enables mTLS, stop validation with any check.
 	if strictMode := kubernetes.PeerAuthnHasStrictMTLS(t.PeerAuthn); !strictMode {
+		return validations, true
+	}
+
+	// if EnableAutoMtls is true, then we don't need to check for DestinationRules
+	if t.MTLSDetails.EnabledAutoMtls {
 		return validations, true
 	}
 

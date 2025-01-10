@@ -15,8 +15,6 @@ import (
 )
 
 func TestEnvVarLogLevel(t *testing.T) {
-	defer os.Unsetenv("LOG_LEVEL")
-
 	type levelsToTestStruct struct {
 		stringLevel string
 		level       zerolog.Level
@@ -56,51 +54,18 @@ func TestEnvVarLogLevel(t *testing.T) {
 			level:       zerolog.TraceLevel,
 		},
 		{
-			stringLevel: "0",
-			level:       zerolog.FatalLevel,
-		},
-		{
-			stringLevel: "1",
-			level:       zerolog.ErrorLevel,
-		},
-		{
-			stringLevel: "2",
-			level:       zerolog.WarnLevel,
-		},
-		{
-			stringLevel: "3",
-			level:       zerolog.InfoLevel,
-		},
-		{
-			stringLevel: "4",
-			level:       zerolog.DebugLevel,
-		},
-		{
-			stringLevel: "5",
-			level:       zerolog.TraceLevel,
-		},
-		{
 			stringLevel: "invalid",
 			level:       zerolog.InfoLevel,
 		},
 	}
 
 	for _, levelToTest := range levelsToTest {
-		os.Setenv("LOG_LEVEL", levelToTest.stringLevel)
+		t.Setenv("LOG_LEVEL", levelToTest.stringLevel)
 		assert.Equal(t, levelToTest.level, resolveLogLevelFromEnv(), fmt.Sprintf("LOG_LEVEL=%v,levelToTest=%+v", os.Getenv("LOG_LEVEL"), levelToTest))
 	}
 }
 
 func TestLogRegression(t *testing.T) {
-
-	originalEnv := os.Environ()
-	defer func() {
-		for _, kvp := range originalEnv {
-			kvpArray := strings.Split(kvp, "=")
-			os.Setenv(kvpArray[0], kvpArray[1])
-		}
-	}()
-
 	type loggedMessageAsJsonStruct struct {
 		Level   string
 		Time    string
@@ -142,7 +107,7 @@ func TestLogRegression(t *testing.T) {
 		t.Logf("Cleaned env vars")
 		os.Clearenv()
 		for envName, envValue := range test.envSettings {
-			os.Setenv(envName, envValue)
+			t.Setenv(envName, envValue)
 		}
 		t.Logf("Set ENVs: %v", os.Environ())
 
@@ -189,20 +154,11 @@ func TestLogRegression(t *testing.T) {
 }
 
 func TestEnvVarLogSampler(t *testing.T) {
-
-	originalEnv := os.Environ()
-	defer func() {
-		for _, kvp := range originalEnv {
-			kvpArray := strings.Split(kvp, "=")
-			os.Setenv(kvpArray[0], kvpArray[1])
-		}
-	}()
-
 	os.Clearenv()
 	t.Logf("Cleaned env vars")
-	os.Setenv("LOG_SAMPLER_RATE", "10")
-	os.Setenv("LOG_FORMAT", "json")
-	os.Setenv("LOG_LEVEL", "debug")
+	t.Setenv("LOG_SAMPLER_RATE", "10")
+	t.Setenv("LOG_FORMAT", "json")
+	t.Setenv("LOG_LEVEL", "debug")
 	t.Logf("Set ENVs: %v", os.Environ())
 
 	buf := &bytes.Buffer{}
@@ -223,8 +179,6 @@ func TestEnvVarLogSampler(t *testing.T) {
 }
 
 func TestSupportedTimeFormats(t *testing.T) {
-	defer os.Unsetenv("LOG_TIME_FIELD_FORMAT")
-
 	type formatsToTestStruct struct {
 		format     string
 		testResult string
@@ -246,7 +200,7 @@ func TestSupportedTimeFormats(t *testing.T) {
 	}
 
 	for _, formatToTest := range formatsToTest {
-		os.Setenv("LOG_TIME_FIELD_FORMAT", formatToTest.format)
+		t.Setenv("LOG_TIME_FIELD_FORMAT", formatToTest.format)
 		assert.Equal(t, formatToTest.testResult, resolveTimeFormatFromEnv(), fmt.Sprintf("LOG_TIME_FIELD_FORMAT=%v,formatToTest=%+v", os.Getenv("LOG_TIME_FIELD_FORMAT"), formatToTest))
 	}
 

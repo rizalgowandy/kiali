@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	networking_v1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
 
 	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/kubernetes"
@@ -19,18 +19,17 @@ func TestMultiHostMatchCorrect(t *testing.T) {
 
 	assert := assert.New(t)
 
-	destinationRules := []networking_v1alpha3.DestinationRule{
-		*data.CreateTestDestinationRule("test", "rule1", "host1"),
-		*data.CreateTestDestinationRule("test", "rule2", "host2.test.svc.cluster.local"),
+	destinationRules := []*networking_v1.DestinationRule{
+		data.CreateTestDestinationRule("test", "rule1", "host1"),
+		data.CreateTestDestinationRule("test", "rule2", "host2.test.svc.cluster.local"),
 	}
 
 	vals := MultiMatchChecker{
-		DestinationRules:         destinationRules,
-		ExportedDestinationRules: []networking_v1alpha3.DestinationRule{},
+		DestinationRules: destinationRules,
 	}.Check()
 
 	assert.Empty(vals)
-	validation, ok := vals[models.IstioValidationKey{ObjectType: "destinationrule", Namespace: "test", Name: "rule2"}]
+	validation, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.DestinationRules, Namespace: "test", Name: "rule2"}]
 	assert.False(ok)
 	assert.Nil(validation)
 }
@@ -41,15 +40,14 @@ func TestMultiHostMatchInvalid(t *testing.T) {
 
 	assert := assert.New(t)
 
-	destinationRules := []networking_v1alpha3.DestinationRule{
-		*data.CreateTestDestinationRule("test", "rule1", "host1"),
-		*data.CreateTestDestinationRule("test", "rule2", "host1.test.svc.cluster.local"),
-		*data.CreateTestDestinationRule("test", "rule3", "host1"),
+	destinationRules := []*networking_v1.DestinationRule{
+		data.CreateTestDestinationRule("test", "rule1", "host1"),
+		data.CreateTestDestinationRule("test", "rule2", "host1.test.svc.cluster.local"),
+		data.CreateTestDestinationRule("test", "rule3", "host1"),
 	}
 
 	vals := MultiMatchChecker{
-		DestinationRules:         destinationRules,
-		ExportedDestinationRules: []networking_v1alpha3.DestinationRule{},
+		DestinationRules: destinationRules,
 	}.Check()
 
 	assert.NotEmpty(vals)
@@ -62,7 +60,7 @@ func TestMultiHostMatchInvalid(t *testing.T) {
 }
 
 func validationAssertion(assert *assert.Assertions, vals models.IstioValidations, drName string, refNames []string) {
-	validation, ok := vals[models.IstioValidationKey{ObjectType: "destinationrule", Namespace: "test", Name: drName}]
+	validation, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.DestinationRules, Namespace: "test", Name: drName}]
 	assert.True(ok)
 	assert.True(validation.Valid) // As long as it is warning, this is true
 	assert.NotEmpty(validation.Checks)
@@ -73,9 +71,9 @@ func validationAssertion(assert *assert.Assertions, vals models.IstioValidations
 	for _, refName := range refNames {
 		assert.Contains(validation.References,
 			models.IstioValidationKey{
-				ObjectType: "destinationrule",
-				Namespace:  "test",
-				Name:       refName,
+				ObjectGVK: kubernetes.DestinationRules,
+				Namespace: "test",
+				Name:      refName,
 			},
 		)
 	}
@@ -87,19 +85,18 @@ func TestMultiHostMatchInvalidShortFormat(t *testing.T) {
 
 	assert := assert.New(t)
 
-	destinationRules := []networking_v1alpha3.DestinationRule{
-		*data.CreateTestDestinationRule("test", "rule1", "host1"),
-		*data.CreateTestDestinationRule("test", "rule2", "host1.test"),
+	destinationRules := []*networking_v1.DestinationRule{
+		data.CreateTestDestinationRule("test", "rule1", "host1"),
+		data.CreateTestDestinationRule("test", "rule2", "host1.test"),
 	}
 
 	vals := MultiMatchChecker{
-		DestinationRules:         destinationRules,
-		ExportedDestinationRules: []networking_v1alpha3.DestinationRule{},
+		DestinationRules: destinationRules,
 	}.Check()
 
 	assert.NotEmpty(vals)
 	assert.Equal(2, len(vals))
-	validation, ok := vals[models.IstioValidationKey{ObjectType: "destinationrule", Namespace: "test", Name: "rule2"}]
+	validation, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.DestinationRules, Namespace: "test", Name: "rule2"}]
 	assert.True(ok)
 	assert.True(validation.Valid) // As long as it is warning, this is true
 	assert.NotEmpty(validation.Checks)
@@ -116,18 +113,17 @@ func TestMultiHostMatchValidShortFormat(t *testing.T) {
 
 	assert := assert.New(t)
 
-	destinationRules := []networking_v1alpha3.DestinationRule{
-		*data.CreateTestDestinationRule("test", "rule1", "host1"),
-		*data.CreateTestDestinationRule("test", "rule2", "host2.test"),
+	destinationRules := []*networking_v1.DestinationRule{
+		data.CreateTestDestinationRule("test", "rule1", "host1"),
+		data.CreateTestDestinationRule("test", "rule2", "host2.test"),
 	}
 
 	vals := MultiMatchChecker{
-		DestinationRules:         destinationRules,
-		ExportedDestinationRules: []networking_v1alpha3.DestinationRule{},
+		DestinationRules: destinationRules,
 	}.Check()
 
 	assert.Empty(vals)
-	validation, ok := vals[models.IstioValidationKey{ObjectType: "destinationrule", Namespace: "test", Name: "rule2"}]
+	validation, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.DestinationRules, Namespace: "test", Name: "rule2"}]
 	assert.False(ok)
 	assert.Nil(validation)
 }
@@ -138,9 +134,9 @@ func TestMultiHostMatchValidShortFormatDiffNamespace(t *testing.T) {
 
 	assert := assert.New(t)
 
-	destinationRules := []networking_v1alpha3.DestinationRule{
-		*data.CreateTestDestinationRule("test", "rule1", "host1"),
-		*data.CreateTestDestinationRule("test", "rule2", "host2.bookinfo"),
+	destinationRules := []*networking_v1.DestinationRule{
+		data.CreateTestDestinationRule("test", "rule1", "host1"),
+		data.CreateTestDestinationRule("test", "rule2", "host2.bookinfo"),
 	}
 
 	vals := MultiMatchChecker{
@@ -148,8 +144,7 @@ func TestMultiHostMatchValidShortFormatDiffNamespace(t *testing.T) {
 			models.Namespace{Name: "bookinfo"},
 			models.Namespace{Name: "test"},
 		},
-		DestinationRules:         destinationRules,
-		ExportedDestinationRules: []networking_v1alpha3.DestinationRule{},
+		DestinationRules: destinationRules,
 	}.Check()
 
 	// MultiMatchChecker shouldn't fail if a host is in a different namespace
@@ -162,18 +157,17 @@ func TestMultiHostMatchWildcardInvalid(t *testing.T) {
 
 	assert := assert.New(t)
 
-	destinationRules := []networking_v1alpha3.DestinationRule{
-		*data.CreateTestDestinationRule("test", "rule1", "host1"),
-		*data.CreateTestDestinationRule("test", "rule2", "*.test.svc.cluster.local"),
+	destinationRules := []*networking_v1.DestinationRule{
+		data.CreateTestDestinationRule("test", "rule1", "host1"),
+		data.CreateTestDestinationRule("test", "rule2", "*.test.svc.cluster.local"),
 	}
 
 	vals := MultiMatchChecker{
-		DestinationRules:         destinationRules,
-		ExportedDestinationRules: []networking_v1alpha3.DestinationRule{},
+		DestinationRules: destinationRules,
 	}.Check()
 
 	assert.NotEmpty(vals)
-	validation, ok := vals[models.IstioValidationKey{ObjectType: "destinationrule", Namespace: "test", Name: "rule2"}]
+	validation, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.DestinationRules, Namespace: "test", Name: "rule2"}]
 	assert.True(ok)
 	assert.True(validation.Valid) // As long as it is warning, this is true
 	assert.NotEmpty(validation.Checks)
@@ -182,18 +176,17 @@ func TestMultiHostMatchWildcardInvalid(t *testing.T) {
 	assert.NotEmpty(validation.References)
 	assert.Equal("rule1", validation.References[0].Name)
 
-	destinationRules = []networking_v1alpha3.DestinationRule{
-		*data.CreateTestDestinationRule("test", "rule2", "*.test.svc.cluster.local"),
-		*data.CreateTestDestinationRule("test", "rule1", "host1"),
+	destinationRules = []*networking_v1.DestinationRule{
+		data.CreateTestDestinationRule("test", "rule2", "*.test.svc.cluster.local"),
+		data.CreateTestDestinationRule("test", "rule1", "host1"),
 	}
 
 	vals = MultiMatchChecker{
-		DestinationRules:         destinationRules,
-		ExportedDestinationRules: []networking_v1alpha3.DestinationRule{},
+		DestinationRules: destinationRules,
 	}.Check()
 
 	assert.NotEmpty(vals)
-	validation, ok = vals[models.IstioValidationKey{ObjectType: "destinationrule", Namespace: "test", Name: "rule1"}]
+	validation, ok = vals[models.IstioValidationKey{ObjectGVK: kubernetes.DestinationRules, Namespace: "test", Name: "rule1"}]
 	assert.True(ok)
 	assert.True(validation.Valid) // As long as it is warning, this is true
 	assert.NotEmpty(validation.Checks)
@@ -209,18 +202,17 @@ func TestMultiHostMatchBothWildcardInvalid(t *testing.T) {
 
 	assert := assert.New(t)
 
-	destinationRules := []networking_v1alpha3.DestinationRule{
-		*data.CreateTestDestinationRule("test", "rule1", "*"),
-		*data.CreateTestDestinationRule("test", "rule2", "*.test.svc.cluster.local"),
+	destinationRules := []*networking_v1.DestinationRule{
+		data.CreateTestDestinationRule("test", "rule1", "*"),
+		data.CreateTestDestinationRule("test", "rule2", "*.test.svc.cluster.local"),
 	}
 
 	vals := MultiMatchChecker{
-		DestinationRules:         destinationRules,
-		ExportedDestinationRules: []networking_v1alpha3.DestinationRule{},
+		DestinationRules: destinationRules,
 	}.Check()
 
 	assert.NotEmpty(vals)
-	validation, ok := vals[models.IstioValidationKey{ObjectType: "destinationrule", Namespace: "test", Name: "rule2"}]
+	validation, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.DestinationRules, Namespace: "test", Name: "rule2"}]
 	assert.True(ok)
 	assert.True(validation.Valid) // As long as it is warning, this is true
 	assert.NotEmpty(validation.Checks)
@@ -229,18 +221,17 @@ func TestMultiHostMatchBothWildcardInvalid(t *testing.T) {
 	assert.NotEmpty(validation.References)
 	assert.Equal("rule1", validation.References[0].Name)
 
-	destinationRules = []networking_v1alpha3.DestinationRule{
-		*data.CreateTestDestinationRule("test", "rule2", "*.test.svc.cluster.local"),
-		*data.CreateTestDestinationRule("test", "rule1", "*"),
+	destinationRules = []*networking_v1.DestinationRule{
+		data.CreateTestDestinationRule("test", "rule2", "*.test.svc.cluster.local"),
+		data.CreateTestDestinationRule("test", "rule1", "*"),
 	}
 
 	vals = MultiMatchChecker{
-		DestinationRules:         destinationRules,
-		ExportedDestinationRules: []networking_v1alpha3.DestinationRule{},
+		DestinationRules: destinationRules,
 	}.Check()
 
 	assert.NotEmpty(vals)
-	validation, ok = vals[models.IstioValidationKey{ObjectType: "destinationrule", Namespace: "test", Name: "rule1"}]
+	validation, ok = vals[models.IstioValidationKey{ObjectGVK: kubernetes.DestinationRules, Namespace: "test", Name: "rule1"}]
 	assert.True(ok)
 	assert.True(validation.Valid) // As long as it is warning, this is true
 	assert.NotEmpty(validation.Checks)
@@ -256,19 +247,18 @@ func TestMultiHostMatchingMeshWideMTLSDestinationRule(t *testing.T) {
 
 	assert := assert.New(t)
 
-	destinationRules := []networking_v1alpha3.DestinationRule{
-		*data.CreateTestDestinationRule("test", "rule1", "host1"),
-		*data.AddTrafficPolicyToDestinationRule(data.CreateMTLSTrafficPolicyForDestinationRules(),
+	destinationRules := []*networking_v1.DestinationRule{
+		data.CreateTestDestinationRule("test", "rule1", "host1"),
+		data.AddTrafficPolicyToDestinationRule(data.CreateMTLSTrafficPolicyForDestinationRules(),
 			data.CreateTestDestinationRule("test", "rule2", "*.local")),
 	}
 
 	vals := MultiMatchChecker{
-		DestinationRules:         destinationRules,
-		ExportedDestinationRules: []networking_v1alpha3.DestinationRule{},
+		DestinationRules: destinationRules,
 	}.Check()
 
 	assert.Empty(vals)
-	validation, ok := vals[models.IstioValidationKey{ObjectType: "destinationrule", Namespace: "test", Name: "rule2"}]
+	validation, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.DestinationRules, Namespace: "test", Name: "rule2"}]
 	assert.False(ok)
 	assert.Nil(validation)
 }
@@ -279,19 +269,18 @@ func TestMultiHostMatchingNamespaceWideMTLSDestinationRule(t *testing.T) {
 
 	assert := assert.New(t)
 
-	destinationRules := []networking_v1alpha3.DestinationRule{
-		*data.CreateTestDestinationRule("test", "rule1", "host1"),
-		*data.AddTrafficPolicyToDestinationRule(data.CreateMTLSTrafficPolicyForDestinationRules(),
+	destinationRules := []*networking_v1.DestinationRule{
+		data.CreateTestDestinationRule("test", "rule1", "host1"),
+		data.AddTrafficPolicyToDestinationRule(data.CreateMTLSTrafficPolicyForDestinationRules(),
 			data.CreateTestDestinationRule("test", "rule2", "*.test.svc.cluster.local")),
 	}
 
 	vals := MultiMatchChecker{
-		DestinationRules:         destinationRules,
-		ExportedDestinationRules: []networking_v1alpha3.DestinationRule{},
+		DestinationRules: destinationRules,
 	}.Check()
 
 	assert.Empty(vals)
-	validation, ok := vals[models.IstioValidationKey{ObjectType: "destinationrule", Namespace: "test", Name: "rule2"}]
+	validation, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.DestinationRules, Namespace: "test", Name: "rule2"}]
 	assert.False(ok)
 	assert.Nil(validation)
 }
@@ -302,28 +291,26 @@ func TestMultiHostMatchDifferentSubsets(t *testing.T) {
 
 	assert := assert.New(t)
 
-	destinationRules := []networking_v1alpha3.DestinationRule{
-		*data.AddSubsetToDestinationRule(data.CreateSubset("v1", "v1"),
+	destinationRules := []*networking_v1.DestinationRule{
+		data.AddSubsetToDestinationRule(data.CreateSubset("v1", "v1"),
 			data.AddSubsetToDestinationRule(data.CreateSubset("v2", "v2"), data.CreateEmptyDestinationRule("test", "rule1", "host1"))),
-		*data.AddSubsetToDestinationRule(data.CreateSubset("v3", "v3"),
+		data.AddSubsetToDestinationRule(data.CreateSubset("v3", "v3"),
 			data.AddSubsetToDestinationRule(data.CreateSubset("v4", "v4"), data.CreateEmptyDestinationRule("test", "rule2", "host1"))),
 	}
 
 	vals := MultiMatchChecker{
-		DestinationRules:         destinationRules,
-		ExportedDestinationRules: []networking_v1alpha3.DestinationRule{},
+		DestinationRules: destinationRules,
 	}.Check()
 
 	assert.Empty(vals)
 
 	destinationRules = append(destinationRules,
-		*data.AddSubsetToDestinationRule(data.CreateSubset("v1", "v1"),
+		data.AddSubsetToDestinationRule(data.CreateSubset("v1", "v1"),
 			data.AddSubsetToDestinationRule(data.CreateSubset("v5", "v5"), data.CreateEmptyDestinationRule("test", "rule5", "*.test.svc.cluster.local"))),
 	)
 
 	vals = MultiMatchChecker{
-		DestinationRules:         destinationRules,
-		ExportedDestinationRules: []networking_v1alpha3.DestinationRule{},
+		DestinationRules: destinationRules,
 	}.Check()
 
 	assert.NotEmpty(vals)
@@ -335,30 +322,28 @@ func TestReviewsExample(t *testing.T) {
 
 	assert := assert.New(t)
 
-	destinationRules := []networking_v1alpha3.DestinationRule{
-		*data.AddSubsetToDestinationRule(data.CreateSubset("v2", "v2"),
+	destinationRules := []*networking_v1.DestinationRule{
+		data.AddSubsetToDestinationRule(data.CreateSubset("v2", "v2"),
 			data.AddSubsetToDestinationRule(data.CreateSubset("v3", "v3"), data.CreateEmptyDestinationRule("bookinfo", "reviews", "reviews"))),
-		*data.AddSubsetToDestinationRule(data.CreateSubset("v1", "v1"), data.CreateEmptyDestinationRule("bookinfo", "reviews2", "reviews")),
+		data.AddSubsetToDestinationRule(data.CreateSubset("v1", "v1"), data.CreateEmptyDestinationRule("bookinfo", "reviews2", "reviews")),
 	}
 
 	vals := MultiMatchChecker{
-		DestinationRules:         destinationRules,
-		ExportedDestinationRules: []networking_v1alpha3.DestinationRule{},
+		DestinationRules: destinationRules,
 	}.Check()
 
 	assert.Empty(vals)
 
 	allMatch := data.CreateEmptyDestinationRule("bookinfo", "reviews3", "reviews")
-	destinationRules = append(destinationRules, *allMatch)
+	destinationRules = append(destinationRules, allMatch)
 
 	vals = MultiMatchChecker{
-		DestinationRules:         destinationRules,
-		ExportedDestinationRules: []networking_v1alpha3.DestinationRule{},
+		DestinationRules: destinationRules,
 	}.Check()
 
 	assert.NotEmpty(vals)
 	assert.Equal(3, len(vals))
-	validation, ok := vals[models.IstioValidationKey{ObjectType: "destinationrule", Namespace: "bookinfo", Name: "reviews3"}]
+	validation, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.DestinationRules, Namespace: "bookinfo", Name: "reviews3"}]
 	assert.True(ok)
 	assert.True(validation.Valid)
 	assert.NotEmpty(validation.Checks)
@@ -374,16 +359,15 @@ func TestMultiServiceEntry(t *testing.T) {
 
 	assert := assert.New(t)
 
-	seA := data.AddPortDefinitionToServiceEntry(data.CreateEmptyPortDefinition(443, "https", "TLS"), data.CreateEmptyMeshExternalServiceEntry("service-a", "test", []string{"api.service_a.com"}))
-	seB := data.AddPortDefinitionToServiceEntry(data.CreateEmptyPortDefinition(443, "https", "TLS"), data.CreateEmptyMeshExternalServiceEntry("service-b", "test", []string{"api.service_b.com"}))
+	seA := data.AddPortDefinitionToServiceEntry(data.CreateEmptyServicePortDefinition(443, "https", "TLS"), data.CreateEmptyMeshExternalServiceEntry("service-a", "test", []string{"api.service_a.com"}))
+	seB := data.AddPortDefinitionToServiceEntry(data.CreateEmptyServicePortDefinition(443, "https", "TLS"), data.CreateEmptyMeshExternalServiceEntry("service-b", "test", []string{"api.service_b.com"}))
 
 	drA := data.CreateEmptyDestinationRule("test", "service-a", "api.service_a.com")
 	drB := data.CreateEmptyDestinationRule("test", "service-b", "api.service_b.com")
 
 	vals := MultiMatchChecker{
-		DestinationRules:         []networking_v1alpha3.DestinationRule{*drA, *drB},
-		ExportedDestinationRules: []networking_v1alpha3.DestinationRule{},
-		ServiceEntries:           kubernetes.ServiceEntryHostnames([]networking_v1alpha3.ServiceEntry{*seA, *seB}),
+		DestinationRules: []*networking_v1.DestinationRule{drA, drB},
+		ServiceEntries:   kubernetes.ServiceEntryHostnames([]*networking_v1.ServiceEntry{seA, seB}),
 	}.Check()
 
 	assert.Empty(vals)
@@ -395,20 +379,19 @@ func TestMultiServiceEntryInvalid(t *testing.T) {
 
 	assert := assert.New(t)
 
-	seA := data.AddPortDefinitionToServiceEntry(data.CreateEmptyPortDefinition(443, "https", "TLS"), data.CreateEmptyMeshExternalServiceEntry("service-a", "test", []string{"api.service_a.com"}))
+	seA := data.AddPortDefinitionToServiceEntry(data.CreateEmptyServicePortDefinition(443, "https", "TLS"), data.CreateEmptyMeshExternalServiceEntry("service-a", "test", []string{"api.service_a.com"}))
 
 	drA := data.CreateEmptyDestinationRule("test", "service-a", "api.service_a.com")
 	drB := data.CreateEmptyDestinationRule("test", "service-a2", "api.service_a.com")
 
 	vals := MultiMatchChecker{
-		DestinationRules:         []networking_v1alpha3.DestinationRule{*drA, *drB},
-		ExportedDestinationRules: []networking_v1alpha3.DestinationRule{},
-		ServiceEntries:           kubernetes.ServiceEntryHostnames([]networking_v1alpha3.ServiceEntry{*seA}),
+		DestinationRules: []*networking_v1.DestinationRule{drA, drB},
+		ServiceEntries:   kubernetes.ServiceEntryHostnames([]*networking_v1.ServiceEntry{seA}),
 	}.Check()
 
 	assert.NotEmpty(vals)
 	assert.Equal(2, len(vals))
-	validation, ok := vals[models.IstioValidationKey{ObjectType: "destinationrule", Namespace: "test", Name: "service-a2"}]
+	validation, ok := vals[models.IstioValidationKey{ObjectGVK: kubernetes.DestinationRules, Namespace: "test", Name: "service-a2"}]
 	assert.True(ok)
 	assert.True(validation.Valid)
 	assert.NotEmpty(validation.Checks)

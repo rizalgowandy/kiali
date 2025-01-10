@@ -1,7 +1,7 @@
 package checkers
 
 import (
-	networking_v1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
 
 	"github.com/kiali/kiali/business/checkers/common"
 	"github.com/kiali/kiali/business/checkers/sidecars"
@@ -9,15 +9,13 @@ import (
 	"github.com/kiali/kiali/models"
 )
 
-const SidecarCheckerType = "sidecar"
-
 type SidecarChecker struct {
-	Sidecars               []networking_v1alpha3.Sidecar
-	ServiceEntries         []networking_v1alpha3.ServiceEntry
-	ExportedServiceEntries []networking_v1alpha3.ServiceEntry
-	ServiceList            models.ServiceList
-	Namespaces             models.Namespaces
-	WorkloadList           models.WorkloadList
+	Sidecars              []*networking_v1.Sidecar
+	ServiceEntries        []*networking_v1.ServiceEntry
+	Namespaces            models.Namespaces
+	WorkloadsPerNamespace map[string]models.WorkloadList
+	RegistryServices      []*kubernetes.RegistryService
+	Cluster               string
 }
 
 func (s SidecarChecker) Check() models.IstioValidations {
@@ -33,7 +31,7 @@ func (s SidecarChecker) runGroupChecks() models.IstioValidations {
 	validations := models.IstioValidations{}
 
 	enabledDRCheckers := []GroupChecker{
-		common.SidecarSelectorMultiMatchChecker(SidecarCheckerType, s.Sidecars, s.WorkloadList),
+		common.SidecarSelectorMultiMatchChecker(s.Cluster, kubernetes.Sidecars, s.Sidecars, s.WorkloadsPerNamespace),
 	}
 
 	for _, checker := range enabledDRCheckers {
@@ -53,19 +51,20 @@ func (s SidecarChecker) runIndividualChecks() models.IstioValidations {
 	return validations
 }
 
-func (s SidecarChecker) runChecks(sidecar networking_v1alpha3.Sidecar) models.IstioValidations {
+func (s SidecarChecker) runChecks(sidecar *networking_v1.Sidecar) models.IstioValidations {
 	policyName := sidecar.Name
-	key, rrValidation := EmptyValidValidation(policyName, sidecar.Namespace, SidecarCheckerType)
-	serviceHosts := kubernetes.ServiceEntryHostnames(append(s.ServiceEntries, s.ExportedServiceEntries...))
+	key, rrValidation := EmptyValidValidation(policyName, sidecar.Namespace, kubernetes.Sidecars, s.Cluster)
+	serviceHosts := kubernetes.ServiceEntryHostnames(s.ServiceEntries)
 	selectorLabels := make(map[string]string)
 	if sidecar.Spec.WorkloadSelector != nil {
 		selectorLabels = sidecar.Spec.WorkloadSelector.Labels
 	}
 
 	enabledCheckers := []Checker{
-		common.WorkloadSelectorNoWorkloadFoundChecker(SidecarCheckerType, selectorLabels, s.WorkloadList),
-		sidecars.EgressHostChecker{Sidecar: sidecar, ServiceList: s.ServiceList, ServiceEntries: serviceHosts},
+		common.WorkloadSelectorNoWorkloadFoundChecker(kubernetes.Sidecars, selectorLabels, s.WorkloadsPerNamespace),
+		sidecars.EgressHostChecker{Sidecar: sidecar, ServiceEntries: serviceHosts, RegistryServices: s.RegistryServices},
 		sidecars.GlobalChecker{Sidecar: sidecar},
+		sidecars.OutboundTrafficPolicyModeChecker{Sidecar: sidecar},
 	}
 
 	for _, checker := range enabledCheckers {

@@ -24,12 +24,13 @@ set -u
 DEFAULT_CLIENT_EXE="kubectl"
 DEFAULT_DEX_ENABLED="false"
 DEFAULT_DEX_REPO="https://github.com/dexidp/dex"
-DEFAULT_DEX_VERSION="v2.24.0"
+DEFAULT_DEX_VERSION="v2.30.2"
 DEFAULT_DEX_USER_NAMESPACES="bookinfo"
 DEFAULT_INSECURE_REGISTRY_IP=""
+DEFAULT_K8S_CNI="auto"
 DEFAULT_K8S_CPU="4"
 DEFAULT_K8S_DISK="40g"
-DEFAULT_K8S_DRIVER="virtualbox"
+DEFAULT_K8S_DRIVER="kvm2"
 DEFAULT_K8S_MEMORY="8g"
 DEFAULT_K8S_VERSION="stable"
 DEFAULT_LB_ADDRESSES="" # example: "'192.168.99.70-192.168.99.84'"
@@ -160,18 +161,19 @@ EOF
   # Patch dex file
   rm -rf ${DEX_VERSION_PATH}/examples/k8s/dex.kiali.yaml
   patch -i - -o ${DEX_VERSION_PATH}/examples/k8s/dex.kiali.yaml ${DEX_VERSION_PATH}/examples/k8s/dex.yaml << EOF
-1c1
-< apiVersion: extensions/v1beta1
+15c15
+<   replicas: 3
 ---
-> apiVersion: apps/v1
-8a9,11
->   selector:
->     matchLabels:
->       app: dex
-30,40d32
-<         env:
+>   replicas: 1
+26c26
+<       - image: dexidp/dex:v2.27.0 #or quay.io/dexidp/dex:v2.26.0
+---
+>       - image: docker.io/dexidp/dex:${DEX_VERSION}
+41c41
 <         - name: GITHUB_CLIENT_ID
-<           valueFrom:
+---
+>         - name: KUBERNETES_POD_NAMESPACE
+43,50c43,44
 <             secretKeyRef:
 <               name: github-client
 <               key: client-id
@@ -180,11 +182,14 @@ EOF
 <             secretKeyRef:
 <               name: github-client
 <               key: client-secret
-58c50
+---
+>             fieldRef:
+>               fieldPath: metadata.namespace
+75c69
 <     issuer: https://dex.example.com:32000
 ---
 >     issuer: https://${KUBE_HOSTNAME}:32000
-68,75d59
+85,92d78
 <     - type: github
 <       id: github
 <       name: GitHub
@@ -193,19 +198,15 @@ EOF
 <         clientSecret: \$GITHUB_CLIENT_SECRET
 <         redirectURI: https://dex.example.com:32000/callback
 <         org: kubernetes
-77a62
+94a81
 >       responseTypes: ["code", "id_token"]
-84a70,75
+96a84,89
 >     - id: kiali-app
 >       redirectURIs:
 >       - 'http://${MINIKUBE_IP}/kiali'
 >       - 'http://kiali-proxy.${MINIKUBE_IP}.nip.io:30805/oauth2/callback'
 >       name: 'Kiali'
->       secret: notNeeded
-139c129
-<   namespace: default  # The namespace dex is running in
----
->   namespace: dex      # The namespace dex is running in
+>       secret: dontTellAnyone
 EOF
     [ "$?" != "0" ] && echo "ERROR: Failed to patch dex file" && exit 1
 
@@ -235,7 +236,7 @@ data:
     pass_authorization_header = true
     set_authorization_header = true
     ssl_insecure_skip_verify = true
-    client_secret="notNeeded"
+    client_secret="dontTellAnyone"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -259,8 +260,14 @@ spec:
         - --config
         - /etc/oauthproxy/oauth2-proxy.conf
         env: []
-        image: quay.io/oauth2-proxy/oauth2-proxy:latest
+        image: quay.io/oauth2-proxy/oauth2-proxy:v7.6.0
         imagePullPolicy: Always
+        livenessProbe:
+          httpGet:
+            path: /ping
+            port: 4180
+          initialDelaySeconds: 10
+          periodSeconds: 20
         name: oauth2-proxy
         ports:
         - containerPort: 4180
@@ -296,11 +303,13 @@ EOF
   echo "Deploying dex..."
   ${MINIKUBE_EXEC_WITH_PROFILE} kubectl -- create namespace dex
   ${MINIKUBE_EXEC_WITH_PROFILE} kubectl -- create secret tls dex.example.com.tls --cert=${CERTS_PATH}/cert.pem --key=${CERTS_PATH}/key.pem -n dex
+
   ${MINIKUBE_EXEC_WITH_PROFILE} kubectl -- apply -n dex -f ${DEX_VERSION_PATH}/examples/k8s/dex.kiali.yaml
   [ "$?" != "0" ] && echo "ERROR: Failed to install dex" && exit 1
   echo "Deploying oauth2 proxy..."
   ${MINIKUBE_EXEC_WITH_PROFILE} kubectl -- create -f ${DEX_VERSION_PATH}/examples/k8s/oauth2.proxy
   [ "$?" != "0" ] && echo "ERROR: Failed to deploy oauth2 proxy" && exit 1
+
   # Restart minikube
   echo "Restarting minikube with proper flags for API server and the autodetected registry IP..."
   ${MINIKUBE_EXEC_WITH_PROFILE} stop
@@ -308,6 +317,7 @@ EOF
     ${MINIKUBE_START_FLAGS} \
     ${INSECURE_REGISTRY_START_ARG} \
     --insecure-registry ${MINIKUBE_IP}:5000 \
+    --cni=${K8S_CNI} \
     --cpus=${K8S_CPU} \
     --memory=${K8S_MEMORY} \
     --disk-size=${K8S_DISK} \
@@ -319,6 +329,10 @@ EOF
     --extra-config=apiserver.oidc-client-id=kiali-app \
     --extra-config=apiserver.oidc-groups-claim=groups
   [ "$?" != "0" ] && echo "ERROR: Failed to restart minikube in preparation for dex" && exit 1
+
+  echo "Need to create the OpenID secret now - assuming Kiali will eventually be installed in istio-system"
+  ${MINIKUBE_EXEC_WITH_PROFILE} kubectl -- create namespace istio-system
+  ${MINIKUBE_EXEC_WITH_PROFILE} kubectl -- create secret generic kiali --from-literal="oidc-secret=dontTellAnyone" -n istio-system
 
   echo "Minikube should now be configured with OpenID connect. Just wait for all pods to start."
   cat <<EOF
@@ -340,6 +354,10 @@ OpenID user is:
   Password: password
 
 Kiali reverse proxy URL: http://kiali-proxy.${MINIKUBE_IP}.nip.io:30805
+
+The Kiali OIDC secret named 'kiali' has been created in istio-system namespace.
+If you need to recreate this OIDC secret, run this command:
+  ${MINIKUBE_EXEC_WITH_PROFILE} kubectl -- create secret generic kiali --from-literal="oidc-secret=dontTellAnyone" -n istio-system
 
 EOF
 
@@ -422,6 +440,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     resetclock) _CMD="resetclock"; shift ;;
+    olm) _CMD="olm"; shift ;;
     -ce|--client-exe) CLIENT_EXE="$2"; shift;shift ;;
     -de|--dex-enabled) DEX_ENABLED="$2"; shift;shift ;;
     -dr|--dex-repo) DEX_REPO="$2"; shift;shift ;;
@@ -429,6 +448,7 @@ while [[ $# -gt 0 ]]; do
     -dv|--dex-version) DEX_VERSION="$2"; shift;shift ;;
     -iri|--insecure-registry-ip) INSECURE_REGISTRY_IP="$2"; shift;shift ;;
     -kc|--kubernetes-cpu) K8S_CPU="$2"; shift;shift ;;
+    -kcni|--kubernetes-cni) K8S_CNI="$2"; shift;shift ;;
     -kd|--kubernetes-disk) K8S_DISK="$2"; shift;shift ;;
     -kdr|--kubernetes-driver) K8S_DRIVER="$2"; shift;shift ;;
     -km|--kubernetes-memory) K8S_MEMORY="$2"; shift;shift ;;
@@ -487,6 +507,10 @@ Valid options:
       The number of CPUs to give to Kubernetes at startup.
       Only used for the 'start' command.
       Default: ${DEFAULT_K8S_CPU}
+  -kcni|--kubernetes-cni
+      The CNI implementation used by minikube. See 'minikube start --help' for the --cni options.
+      Only used for the 'start' command.
+      Default: ${DEFAULT_K8S_CNI}
   -kd|--kubernetes-disk
       The amount of disk space to give to Kubernetes at startup.
       Only used for the 'start' command.
@@ -553,6 +577,7 @@ The command must be either:
                 displays the Ingress Gateway URL. If a port name is given, the gateway port is also shown.
                 If the port name is "all" then all the URLs for all known ports are shown.
   resetclock:   If the VM's clock gets skewed (e.g. by sleeping) run this to reset it to the current time.
+  olm:          Install OLM.
 HELPMSG
       exit 1
       ;;
@@ -570,6 +595,7 @@ done
 : ${DEX_USER_NAMESPACES:=${DEFAULT_DEX_USER_NAMESPACES}}
 : ${DEX_VERSION:=${DEFAULT_DEX_VERSION}}
 : ${INSECURE_REGISTRY_IP:=${DEFAULT_INSECURE_REGISTRY_IP}}
+: ${K8S_CNI:=${DEFAULT_K8S_CNI}}
 : ${K8S_CPU:=${DEFAULT_K8S_CPU}}
 : ${K8S_DISK:=${DEFAULT_K8S_DISK}}
 : ${K8S_DRIVER:=${DEFAULT_K8S_DRIVER}}
@@ -598,6 +624,7 @@ debug "DEX_USER_NAMESPACES=$DEX_USER_NAMESPACES"
 debug "DEX_VERSION=$DEX_VERSION"
 debug "INSECURE_REGISTRY_IP=$INSECURE_REGISTRY_IP"
 debug "INSECURE_REGISTRY_START_ARG=$INSECURE_REGISTRY_START_ARG"
+debug "K8S_CNI=$K8S_CNI"
 debug "K8S_CPU=$K8S_CPU"
 debug "K8S_DISK=$K8S_DISK"
 debug "K8S_DRIVER=$K8S_DRIVER"
@@ -622,9 +649,29 @@ debug "minikube is located at $(which ${MINIKUBE_EXE})"
 
 if [ "$_CMD" = "start" ]; then
   echo 'Starting minikube...'
+
+  # Check if no-kubernetes flag is present. If so, we shouldn't try to provide a kube version,
+  # start addons, or apply additional yaml
+  if grep -q 'no-kubernetes' <<< "${MINIKUBE_START_FLAGS}"
+  then
+    ${MINIKUBE_EXEC_WITH_PROFILE} start \
+      ${MINIKUBE_START_FLAGS} \
+      ${INSECURE_REGISTRY_START_ARG} \
+      --cni=${K8S_CNI} \
+      --cpus=${K8S_CPU} \
+      --memory=${K8S_MEMORY} \
+      --disk-size=${K8S_DISK} \
+      --driver=${K8S_DRIVER}
+
+    [ "$?" != "0" ] && echo "ERROR: Failed to start minikube" && exit 1
+
+    exit 0
+  fi
+
   ${MINIKUBE_EXEC_WITH_PROFILE} start \
     ${MINIKUBE_START_FLAGS} \
     ${INSECURE_REGISTRY_START_ARG} \
+    --cni=${K8S_CNI} \
     --cpus=${K8S_CPU} \
     --memory=${K8S_MEMORY} \
     --disk-size=${K8S_DISK} \
@@ -741,6 +788,10 @@ elif [ "$_CMD" = "resetclock" ]; then
   ensure_minikube_is_running
   echo "Resetting the clock in the minikube VM"
   ${MINIKUBE_EXEC_WITH_PROFILE} ssh -- sudo date -u $(date -u +%m%d%H%M%Y.%S)
+
+elif [ "$_CMD" = "olm" ]; then
+  ensure_minikube_is_running
+  install_olm
 
 else
   echo "ERROR: Missing required command"

@@ -7,24 +7,24 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/kiali/kiali/business"
+	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/graph"
 )
 
 func TestNamespacesGraphWithServiceInjection(t *testing.T) {
 	assert := assert.New(t)
 
-	q0 := `round(sum(rate(istio_requests_total{reporter="destination",source_workload_namespace!="bookinfo",destination_service_namespace="bookinfo",request_operation!="unknown"}[60s])) by (source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags,request_operation) > 0,0.001)`
+	q0 := `round(sum(rate(istio_requests_total{reporter=~"destination|waypoint",source_workload_namespace!="bookinfo",destination_service_namespace="bookinfo",request_operation!="unknown"}[60s])) by (source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags,request_operation) > 0,0.001)`
 	v0 := model.Vector{}
 
-	q1 := `round(sum(rate(istio_requests_total{reporter="destination",source_workload_namespace="bookinfo",request_operation!="unknown"}[60s])) by (source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags,request_operation) > 0,0.001)`
+	q1 := `round(sum(rate(istio_requests_total{reporter=~"destination|waypoint",source_workload_namespace="bookinfo",request_operation!="unknown"}[60s])) by (source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags,request_operation) > 0,0.001)`
 	q1m0 := model.Metric{
-		"source_cluster":                 business.DefaultClusterID,
+		"source_cluster":                 config.DefaultClusterID,
 		"source_workload_namespace":      "bookinfo",
 		"source_workload":                "productpage-v1",
 		"source_canonical_service":       "productpage",
 		"source_canonical_revision":      "v1",
-		"destination_cluster":            business.DefaultClusterID,
+		"destination_cluster":            config.DefaultClusterID,
 		"destination_service_namespace":  "bookinfo",
 		"destination_service":            "reviews.bookinfo.svc.cluster.local",
 		"destination_service_name":       "reviews",
@@ -37,12 +37,12 @@ func TestNamespacesGraphWithServiceInjection(t *testing.T) {
 		"request_protocol":               "http",
 		"request_operation":              "Top"}
 	q1m1 := model.Metric{
-		"source_cluster":                 business.DefaultClusterID,
+		"source_cluster":                 config.DefaultClusterID,
 		"source_workload_namespace":      "bookinfo",
 		"source_workload":                "productpage-v1",
 		"source_canonical_service":       "productpage",
 		"source_canonical_revision":      "v1",
-		"destination_cluster":            business.DefaultClusterID,
+		"destination_cluster":            config.DefaultClusterID,
 		"destination_service_namespace":  "bookinfo",
 		"destination_service":            "reviews.bookinfo.svc.cluster.local",
 		"destination_service_name":       "reviews",
@@ -71,7 +71,7 @@ func TestNamespacesGraphWithServiceInjection(t *testing.T) {
 	mockQuery(api, q1, &v1)
 
 	trafficMap := aggregateNodeTestTraffic(true)
-	ppID, _ := graph.Id(business.DefaultClusterID, "bookinfo", "productpage", "bookinfo", "productpage-v1", "productpage", "v1", graph.GraphTypeVersionedApp)
+	ppID, _, _ := graph.Id(config.DefaultClusterID, "bookinfo", "productpage", "bookinfo", "productpage-v1", "productpage", "v1", graph.GraphTypeVersionedApp)
 	pp, ok := trafficMap[ppID]
 	assert.Equal(true, ok)
 	assert.Equal(1, len(pp.Edges))
@@ -90,9 +90,10 @@ func TestNamespacesGraphWithServiceInjection(t *testing.T) {
 		},
 		QueryTime: time.Now().Unix(),
 		Rates: graph.RequestedRates{
-			Grpc: graph.RateRequests,
-			Http: graph.RateRequests,
-			Tcp:  graph.RateTotal,
+			Ambient: graph.AmbientTrafficTotal,
+			Grpc:    graph.RateRequests,
+			Http:    graph.RateRequests,
+			Tcp:     graph.RateTotal,
 		},
 	}
 
@@ -141,17 +142,17 @@ func TestNamespacesGraphWithServiceInjection(t *testing.T) {
 func TestNamespacesGraphNoServiceInjection(t *testing.T) {
 	assert := assert.New(t)
 
-	q0 := `round(sum(rate(istio_requests_total{reporter="destination",source_workload_namespace!="bookinfo",destination_service_namespace="bookinfo",request_operation!="unknown"}[60s])) by (source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags,request_operation) > 0,0.001)`
+	q0 := `round(sum(rate(istio_requests_total{reporter=~"destination|waypoint",source_workload_namespace!="bookinfo",destination_service_namespace="bookinfo",request_operation!="unknown"}[60s])) by (source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags,request_operation) > 0,0.001)`
 	v0 := model.Vector{}
 
-	q1 := `round(sum(rate(istio_requests_total{reporter="destination",source_workload_namespace="bookinfo",request_operation!="unknown"}[60s])) by (source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags,request_operation) > 0,0.001)`
+	q1 := `round(sum(rate(istio_requests_total{reporter=~"destination|waypoint",source_workload_namespace="bookinfo",request_operation!="unknown"}[60s])) by (source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags,request_operation) > 0,0.001)`
 	q1m0 := model.Metric{
-		"source_cluster":                 business.DefaultClusterID,
+		"source_cluster":                 config.DefaultClusterID,
 		"source_workload_namespace":      "bookinfo",
 		"source_workload":                "productpage-v1",
 		"source_canonical_service":       "productpage",
 		"source_canonical_revision":      "v1",
-		"destination_cluster":            business.DefaultClusterID,
+		"destination_cluster":            config.DefaultClusterID,
 		"destination_service_namespace":  "bookinfo",
 		"destination_service":            "reviews.bookinfo.svc.cluster.local",
 		"destination_service_name":       "reviews",
@@ -164,12 +165,12 @@ func TestNamespacesGraphNoServiceInjection(t *testing.T) {
 		"request_protocol":               "http",
 		"request_operation":              "Top"}
 	q1m1 := model.Metric{
-		"source_cluster":                 business.DefaultClusterID,
+		"source_cluster":                 config.DefaultClusterID,
 		"source_workload_namespace":      "bookinfo",
 		"source_workload":                "productpage-v1",
 		"source_canonical_service":       "productpage",
 		"source_canonical_revision":      "v1",
-		"destination_cluster":            business.DefaultClusterID,
+		"destination_cluster":            config.DefaultClusterID,
 		"destination_service_namespace":  "bookinfo",
 		"destination_service":            "reviews.bookinfo.svc.cluster.local",
 		"destination_service_name":       "reviews",
@@ -198,7 +199,7 @@ func TestNamespacesGraphNoServiceInjection(t *testing.T) {
 	mockQuery(api, q1, &v1)
 
 	trafficMap := aggregateNodeTestTraffic(false)
-	ppID, _ := graph.Id(business.DefaultClusterID, "bookinfo", "productpage", "bookinfo", "productpage-v1", "productpage", "v1", graph.GraphTypeVersionedApp)
+	ppID, _, _ := graph.Id(config.DefaultClusterID, "bookinfo", "productpage", "bookinfo", "productpage-v1", "productpage", "v1", graph.GraphTypeVersionedApp)
 	pp, ok := trafficMap[ppID]
 	assert.Equal(true, ok)
 	assert.Equal(1, len(pp.Edges))
@@ -217,9 +218,10 @@ func TestNamespacesGraphNoServiceInjection(t *testing.T) {
 		},
 		QueryTime: time.Now().Unix(),
 		Rates: graph.RequestedRates{
-			Grpc: graph.RateRequests,
-			Http: graph.RateRequests,
-			Tcp:  graph.RateTotal,
+			Ambient: graph.AmbientTrafficTotal,
+			Grpc:    graph.RateRequests,
+			Http:    graph.RateRequests,
+			Tcp:     graph.RateTotal,
 		}}
 
 	appender.appendGraph(trafficMap, "bookinfo", client)
@@ -261,14 +263,14 @@ func TestNamespacesGraphNoServiceInjection(t *testing.T) {
 func TestNodeGraphWithServiceInjection(t *testing.T) {
 	assert := assert.New(t)
 
-	q0 := `round(sum(rate(istio_requests_total{reporter="destination",destination_service_namespace="bookinfo",request_operation="Top",destination_service_name="reviews"}[60s])) by (source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags,request_operation) > 0,0.001)`
+	q0 := `round(sum(rate(istio_requests_total{reporter=~"destination|waypoint",destination_service_namespace="bookinfo",request_operation="Top",destination_service_name="reviews"}[60s])) by (source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags,request_operation) > 0,0.001)`
 	q0m0 := model.Metric{
-		"source_cluster":                 business.DefaultClusterID,
+		"source_cluster":                 config.DefaultClusterID,
 		"source_workload_namespace":      "bookinfo",
 		"source_workload":                "productpage-v1",
 		"source_canonical_service":       "productpage",
 		"source_canonical_revision":      "v1",
-		"destination_cluster":            business.DefaultClusterID,
+		"destination_cluster":            config.DefaultClusterID,
 		"destination_service_namespace":  "bookinfo",
 		"destination_service":            "reviews.bookinfo.svc.cluster.local",
 		"destination_service_name":       "reviews",
@@ -293,7 +295,7 @@ func TestNodeGraphWithServiceInjection(t *testing.T) {
 	mockQuery(api, q0, &v0)
 
 	trafficMap := aggregateNodeTestTraffic(true)
-	ppID, _ := graph.Id(business.DefaultClusterID, "bookinfo", "productpage", "bookinfo", "productpage-v1", "productpage", "v1", graph.GraphTypeVersionedApp)
+	ppID, _, _ := graph.Id(config.DefaultClusterID, "bookinfo", "productpage", "bookinfo", "productpage-v1", "productpage", "v1", graph.GraphTypeVersionedApp)
 	pp, ok := trafficMap[ppID]
 	assert.Equal(true, ok)
 	assert.Equal(1, len(pp.Edges))
@@ -313,9 +315,10 @@ func TestNodeGraphWithServiceInjection(t *testing.T) {
 		},
 		QueryTime: time.Now().Unix(),
 		Rates: graph.RequestedRates{
-			Grpc: graph.RateRequests,
-			Http: graph.RateRequests,
-			Tcp:  graph.RateTotal,
+			Ambient: graph.AmbientTrafficTotal,
+			Grpc:    graph.RateRequests,
+			Http:    graph.RateRequests,
+			Tcp:     graph.RateTotal,
 		},
 		Service: "reviews",
 	}
@@ -348,17 +351,17 @@ func TestNodeGraphWithServiceInjection(t *testing.T) {
 func TestNamespacesGraphWithServiceInjectionSkipRates(t *testing.T) {
 	assert := assert.New(t)
 
-	q0 := `round(sum(rate(istio_requests_total{reporter="destination",source_workload_namespace!="bookinfo",destination_service_namespace="bookinfo",request_operation!="unknown"}[60s])) by (source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags,request_operation) > 0,0.001)`
+	q0 := `round(sum(rate(istio_requests_total{reporter=~"destination|waypoint",source_workload_namespace!="bookinfo",destination_service_namespace="bookinfo",request_operation!="unknown"}[60s])) by (source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags,request_operation) > 0,0.001)`
 	v0 := model.Vector{}
 
-	q1 := `round(sum(rate(istio_requests_total{reporter="destination",source_workload_namespace="bookinfo",request_operation!="unknown"}[60s])) by (source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags,request_operation) > 0,0.001)`
+	q1 := `round(sum(rate(istio_requests_total{reporter=~"destination|waypoint",source_workload_namespace="bookinfo",request_operation!="unknown"}[60s])) by (source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags,request_operation) > 0,0.001)`
 	q1m0 := model.Metric{
-		"source_cluster":                 business.DefaultClusterID,
+		"source_cluster":                 config.DefaultClusterID,
 		"source_workload_namespace":      "bookinfo",
 		"source_workload":                "productpage-v1",
 		"source_canonical_service":       "productpage",
 		"source_canonical_revision":      "v1",
-		"destination_cluster":            business.DefaultClusterID,
+		"destination_cluster":            config.DefaultClusterID,
 		"destination_service_namespace":  "bookinfo",
 		"destination_service":            "reviews.bookinfo.svc.cluster.local",
 		"destination_service_name":       "reviews",
@@ -371,12 +374,12 @@ func TestNamespacesGraphWithServiceInjectionSkipRates(t *testing.T) {
 		"request_protocol":               "http",
 		"request_operation":              "Top"}
 	q1m1 := model.Metric{
-		"source_cluster":                 business.DefaultClusterID,
+		"source_cluster":                 config.DefaultClusterID,
 		"source_workload_namespace":      "bookinfo",
 		"source_workload":                "productpage-v1",
 		"source_canonical_service":       "productpage",
 		"source_canonical_revision":      "v1",
-		"destination_cluster":            business.DefaultClusterID,
+		"destination_cluster":            config.DefaultClusterID,
 		"destination_service_namespace":  "bookinfo",
 		"destination_service":            "reviews.bookinfo.svc.cluster.local",
 		"destination_service_name":       "reviews",
@@ -405,7 +408,7 @@ func TestNamespacesGraphWithServiceInjectionSkipRates(t *testing.T) {
 	mockQuery(api, q1, &v1)
 
 	trafficMap := aggregateNodeTestTraffic(true)
-	ppID, _ := graph.Id(business.DefaultClusterID, "bookinfo", "productpage", "bookinfo", "productpage-v1", "productpage", "v1", graph.GraphTypeVersionedApp)
+	ppID, _, _ := graph.Id(config.DefaultClusterID, "bookinfo", "productpage", "bookinfo", "productpage-v1", "productpage", "v1", graph.GraphTypeVersionedApp)
 	pp, ok := trafficMap[ppID]
 	assert.Equal(true, ok)
 	assert.Equal(1, len(pp.Edges))
@@ -424,9 +427,10 @@ func TestNamespacesGraphWithServiceInjectionSkipRates(t *testing.T) {
 		},
 		QueryTime: time.Now().Unix(),
 		Rates: graph.RequestedRates{
-			Grpc: graph.RateRequests,
-			Http: graph.RateNone,
-			Tcp:  graph.RateTotal,
+			Ambient: graph.AmbientTrafficTotal,
+			Grpc:    graph.RateRequests,
+			Http:    graph.RateNone,
+			Tcp:     graph.RateTotal,
 		},
 	}
 
@@ -450,14 +454,14 @@ func TestNamespacesGraphWithServiceInjectionSkipRates(t *testing.T) {
 func TestNodeGraphNoServiceInjection(t *testing.T) {
 	assert := assert.New(t)
 
-	q0 := `round(sum(rate(istio_requests_total{reporter="destination",destination_service_namespace="bookinfo",request_operation="Top"}[60s])) by (source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags,request_operation) > 0,0.001)`
+	q0 := `round(sum(rate(istio_requests_total{reporter=~"destination|waypoint",destination_service_namespace="bookinfo",request_operation="Top"}[60s])) by (source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags,request_operation) > 0,0.001)`
 	q0m0 := model.Metric{
-		"source_cluster":                 business.DefaultClusterID,
+		"source_cluster":                 config.DefaultClusterID,
 		"source_workload_namespace":      "bookinfo",
 		"source_workload":                "productpage-v1",
 		"source_canonical_service":       "productpage",
 		"source_canonical_revision":      "v1",
-		"destination_cluster":            business.DefaultClusterID,
+		"destination_cluster":            config.DefaultClusterID,
 		"destination_service_namespace":  "bookinfo",
 		"destination_service":            "reviews.bookinfo.svc.cluster.local",
 		"destination_service_name":       "reviews",
@@ -482,7 +486,7 @@ func TestNodeGraphNoServiceInjection(t *testing.T) {
 	mockQuery(api, q0, &v0)
 
 	trafficMap := aggregateNodeTestTraffic(false)
-	ppID, _ := graph.Id(business.DefaultClusterID, "bookinfo", "productpage", "bookinfo", "productpage-v1", "productpage", "v1", graph.GraphTypeVersionedApp)
+	ppID, _, _ := graph.Id(config.DefaultClusterID, "bookinfo", "productpage", "bookinfo", "productpage-v1", "productpage", "v1", graph.GraphTypeVersionedApp)
 	pp, ok := trafficMap[ppID]
 	assert.Equal(true, ok)
 	assert.Equal(1, len(pp.Edges))
@@ -502,9 +506,10 @@ func TestNodeGraphNoServiceInjection(t *testing.T) {
 		},
 		QueryTime: time.Now().Unix(),
 		Rates: graph.RequestedRates{
-			Grpc: graph.RateRequests,
-			Http: graph.RateRequests,
-			Tcp:  graph.RateTotal,
+			Ambient: graph.AmbientTrafficTotal,
+			Grpc:    graph.RateRequests,
+			Http:    graph.RateRequests,
+			Tcp:     graph.RateTotal,
 		},
 	}
 
@@ -531,14 +536,14 @@ func TestNodeGraphNoServiceInjection(t *testing.T) {
 func TestNodeGraphWithServiceInjectionSkipRates(t *testing.T) {
 	assert := assert.New(t)
 
-	q0 := `round(sum(rate(istio_requests_total{reporter="destination",destination_service_namespace="bookinfo",request_operation="Top",destination_service_name="reviews"}[60s])) by (source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags,request_operation) > 0,0.001)`
+	q0 := `round(sum(rate(istio_requests_total{reporter=~"destination|waypoint",destination_service_namespace="bookinfo",request_operation="Top",destination_service_name="reviews"}[60s])) by (source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags,request_operation) > 0,0.001)`
 	q0m0 := model.Metric{
-		"source_cluster":                 business.DefaultClusterID,
+		"source_cluster":                 config.DefaultClusterID,
 		"source_workload_namespace":      "bookinfo",
 		"source_workload":                "productpage-v1",
 		"source_canonical_service":       "productpage",
 		"source_canonical_revision":      "v1",
-		"destination_cluster":            business.DefaultClusterID,
+		"destination_cluster":            config.DefaultClusterID,
 		"destination_service_namespace":  "bookinfo",
 		"destination_service":            "reviews.bookinfo.svc.cluster.local",
 		"destination_service_name":       "reviews",
@@ -563,7 +568,7 @@ func TestNodeGraphWithServiceInjectionSkipRates(t *testing.T) {
 	mockQuery(api, q0, &v0)
 
 	trafficMap := aggregateNodeTestTraffic(true)
-	ppID, _ := graph.Id(business.DefaultClusterID, "bookinfo", "productpage", "bookinfo", "productpage-v1", "productpage", "v1", graph.GraphTypeVersionedApp)
+	ppID, _, _ := graph.Id(config.DefaultClusterID, "bookinfo", "productpage", "bookinfo", "productpage-v1", "productpage", "v1", graph.GraphTypeVersionedApp)
 	pp, ok := trafficMap[ppID]
 	assert.Equal(true, ok)
 	assert.Equal(1, len(pp.Edges))
@@ -583,9 +588,10 @@ func TestNodeGraphWithServiceInjectionSkipRates(t *testing.T) {
 		},
 		QueryTime: time.Now().Unix(),
 		Rates: graph.RequestedRates{
-			Grpc: graph.RateRequests,
-			Http: graph.RateNone,
-			Tcp:  graph.RateTotal,
+			Ambient: graph.AmbientTrafficTotal,
+			Grpc:    graph.RateRequests,
+			Http:    graph.RateNone,
+			Tcp:     graph.RateTotal,
 		},
 		Service: "reviews",
 	}
@@ -608,19 +614,19 @@ func TestNodeGraphWithServiceInjectionSkipRates(t *testing.T) {
 }
 
 func aggregateNodeTestTraffic(injectServices bool) graph.TrafficMap {
-	productpage := graph.NewNode(business.DefaultClusterID, "bookinfo", "productpage", "bookinfo", "productpage-v1", "productpage", "v1", graph.GraphTypeVersionedApp)
-	reviews := graph.NewNode(business.DefaultClusterID, "bookinfo", "reviews", "bookinfo", "reviews-v1", "reviews", "v1", graph.GraphTypeVersionedApp)
-	reviewsService := graph.NewNode(business.DefaultClusterID, "bookinfo", "reviews", "", "", "", "", graph.GraphTypeVersionedApp)
+	productpage, _ := graph.NewNode(config.DefaultClusterID, "bookinfo", "productpage", "bookinfo", "productpage-v1", "productpage", "v1", graph.GraphTypeVersionedApp)
+	reviews, _ := graph.NewNode(config.DefaultClusterID, "bookinfo", "reviews", "bookinfo", "reviews-v1", "reviews", "v1", graph.GraphTypeVersionedApp)
+	reviewsService, _ := graph.NewNode(config.DefaultClusterID, "bookinfo", "reviews", "", "", "", "", graph.GraphTypeVersionedApp)
 
 	trafficMap := graph.NewTrafficMap()
-	trafficMap[productpage.ID] = &productpage
-	trafficMap[reviews.ID] = &reviews
+	trafficMap[productpage.ID] = productpage
+	trafficMap[reviews.ID] = reviews
 	if injectServices {
-		trafficMap[reviewsService.ID] = &reviewsService
-		productpage.AddEdge(&reviewsService)
-		reviewsService.AddEdge(&reviews)
+		trafficMap[reviewsService.ID] = reviewsService
+		productpage.AddEdge(reviewsService)
+		reviewsService.AddEdge(reviews)
 	} else {
-		productpage.AddEdge(&reviews)
+		productpage.AddEdge(reviews)
 	}
 
 	return trafficMap

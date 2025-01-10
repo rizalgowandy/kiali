@@ -1,11 +1,13 @@
 package handlers
 
 import (
-	"io/ioutil"
+	"io"
 	"net/http"
+	"strings"
 
 	"github.com/gorilla/mux"
 
+	"github.com/kiali/kiali/istio"
 	"github.com/kiali/kiali/log"
 	"github.com/kiali/kiali/models"
 )
@@ -18,7 +20,7 @@ func NamespaceList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	namespaces, err := business.Namespace.GetNamespaces()
+	namespaces, err := business.Namespace.GetNamespaces(r.Context())
 	if err != nil {
 		log.Error(err)
 		RespondWithError(w, http.StatusInternalServerError, err.Error())
@@ -28,11 +30,11 @@ func NamespaceList(w http.ResponseWriter, r *http.Request) {
 	RespondWithJSON(w, http.StatusOK, namespaces)
 }
 
-// NamespaceValidationSummary is the API handler to fetch validations summary to be displayed.
-// It is related to all the Istio Objects within the namespace
-func NamespaceValidationSummary(w http.ResponseWriter, r *http.Request) {
+func NamespaceInfo(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
 	vars := mux.Vars(r)
 	namespace := vars["namespace"]
+	cluster := clusterNameFromQuery(query)
 
 	business, err := getBusiness(r)
 	if err != nil {
@@ -41,17 +43,99 @@ func NamespaceValidationSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var validationSummary models.IstioValidationSummary
-
-	istioConfigValidationResults, errValidations := business.Validations.GetValidations(namespace, "")
-	if errValidations != nil {
-		log.Error(errValidations)
-		RespondWithError(w, http.StatusInternalServerError, errValidations.Error())
-	} else {
-		validationSummary = istioConfigValidationResults.SummarizeValidation(namespace)
+	namespaceInfo, err := business.Namespace.GetClusterNamespace(r.Context(), namespace, cluster)
+	if err != nil {
+		log.Error(err)
+		RespondWithError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 
-	RespondWithJSON(w, http.StatusOK, validationSummary)
+	RespondWithJSON(w, http.StatusOK, namespaceInfo)
+}
+
+// NamespaceValidationSummary is the API handler to fetch validations summary to be displayed.
+// It is related to all the Istio Objects within the namespace
+func NamespaceValidationSummary(discovery *istio.Discovery) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		vars := mux.Vars(r)
+		namespace := vars["namespace"]
+
+		cluster := clusterNameFromQuery(query)
+
+		business, err := getBusiness(r)
+		if err != nil {
+			log.Error(err)
+			RespondWithError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		var validationSummary models.IstioValidationSummary
+		istioConfigValidationResults := models.IstioValidations{}
+		var errValidations error
+
+		// If cluster is not set, is because we need a unified validations view (E.g. in the Summary graph)
+		clusters, _ := discovery.Clusters()
+		if len(clusters) == 1 {
+			istioConfigValidationResults, errValidations = business.Validations.GetValidationsForNamespace(r.Context(), cluster, namespace)
+		} else {
+			for _, cl := range clusters {
+				_, errNs := business.Namespace.GetClusterNamespace(r.Context(), namespace, cl.Name)
+				if errNs == nil {
+					clusterIstioConfigValidationResults, _ := business.Validations.GetValidationsForNamespace(r.Context(), cl.Name, namespace)
+					istioConfigValidationResults = istioConfigValidationResults.MergeValidations(clusterIstioConfigValidationResults)
+				}
+			}
+		}
+
+		if errValidations != nil {
+			log.Error(errValidations)
+			RespondWithError(w, http.StatusInternalServerError, errValidations.Error())
+		} else {
+			validationSummary = *istioConfigValidationResults.SummarizeValidation(namespace, cluster)
+		}
+
+		RespondWithJSON(w, http.StatusOK, validationSummary)
+	}
+}
+
+// ConfigValidationSummary is the API handler to fetch validations summary to be displayed.
+// It is related to all the Istio Objects within given namespaces
+func ConfigValidationSummary(w http.ResponseWriter, r *http.Request) {
+	params := r.URL.Query()
+	namespaces := params.Get("namespaces") // csl of namespaces
+	nss := []string{}
+	if len(namespaces) > 0 {
+		nss = strings.Split(namespaces, ",")
+	}
+	cluster := clusterNameFromQuery(params)
+
+	business, err := getBusiness(r)
+	if err != nil {
+		log.Error(err)
+		RespondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if len(nss) == 0 {
+		loadedNamespaces, _ := business.Namespace.GetClusterNamespaces(r.Context(), cluster)
+		for _, ns := range loadedNamespaces {
+			nss = append(nss, ns.Name)
+		}
+	}
+
+	validationSummaries := []models.IstioValidationSummary{}
+	for _, ns := range nss {
+		istioConfigValidationResults, errValidations := business.Validations.GetValidationsForNamespace(r.Context(), cluster, ns)
+		if errValidations != nil {
+			log.Error(errValidations)
+			RespondWithError(w, http.StatusInternalServerError, errValidations.Error())
+			return
+		}
+		validationSummaries = append(validationSummaries, *istioConfigValidationResults.SummarizeValidation(ns, cluster))
+	}
+
+	RespondWithJSON(w, http.StatusOK, validationSummaries)
 }
 
 // NamespaceUpdate is the API to perform a patch on a Namespace configuration
@@ -63,13 +147,16 @@ func NamespaceUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	namespace := params["namespace"]
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		RespondWithError(w, http.StatusBadRequest, "Update request with bad update patch: "+err.Error())
 	}
 	jsonPatch := string(body)
 
-	ns, err := business.Namespace.UpdateNamespace(namespace, jsonPatch)
+	query := r.URL.Query()
+	cluster := clusterNameFromQuery(query)
+
+	ns, err := business.Namespace.UpdateNamespace(r.Context(), namespace, jsonPatch, cluster)
 	if err != nil {
 		handleErrorResponse(w, err)
 		return

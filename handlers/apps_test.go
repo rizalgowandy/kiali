@@ -1,9 +1,8 @@
 package handlers
 
 import (
-	"context"
 	"errors"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,27 +11,31 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
-	osapps_v1 "github.com/openshift/api/apps/v1"
 	osproject_v1 "github.com/openshift/api/project/v1"
 	prom_v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
-	apps_v1 "k8s.io/api/apps/v1"
-	batch_v1 "k8s.io/api/batch/v1"
-	batch_v1beta1 "k8s.io/api/batch/v1beta1"
+	"github.com/stretchr/testify/require"
 	core_v1 "k8s.io/api/core/v1"
+	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kiali/kiali/business"
 	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/handlers/authentication"
+	"github.com/kiali/kiali/kubernetes"
+	"github.com/kiali/kiali/kubernetes/cache"
 	"github.com/kiali/kiali/kubernetes/kubetest"
+	"github.com/kiali/kiali/models"
 	"github.com/kiali/kiali/prometheus"
 	"github.com/kiali/kiali/prometheus/prometheustest"
 )
 
 func TestAppMetricsDefault(t *testing.T) {
-	ts, api, _ := setupAppMetricsEndpoint(t)
-	defer ts.Close()
+	ts, api, k8s := setupAppMetricsEndpoint(t)
+	cache := cache.NewTestingCache(t, k8s, *config.NewConfig())
+	business.WithKialiCache(cache)
 
 	url := ts.URL + "/api/namespaces/ns/apps/my_app/metrics"
 	now := time.Now()
@@ -58,7 +61,7 @@ func TestAppMetricsDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	actual, _ := ioutil.ReadAll(resp.Body)
+	actual, _ := io.ReadAll(resp.Body)
 
 	assert.NotEmpty(t, actual)
 	assert.Equal(t, 200, resp.StatusCode, string(actual))
@@ -67,8 +70,10 @@ func TestAppMetricsDefault(t *testing.T) {
 }
 
 func TestAppMetricsWithParams(t *testing.T) {
-	ts, api, _ := setupAppMetricsEndpoint(t)
-	defer ts.Close()
+	ts, api, k8s := setupAppMetricsEndpoint(t)
+
+	cache := cache.NewTestingCache(t, k8s, *config.NewConfig())
+	business.WithKialiCache(cache)
 
 	req, err := http.NewRequest("GET", ts.URL+"/api/namespaces/ns/apps/my-app/metrics", nil)
 	if err != nil {
@@ -116,7 +121,7 @@ func TestAppMetricsWithParams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actual, _ := ioutil.ReadAll(resp.Body)
+	actual, _ := io.ReadAll(resp.Body)
 
 	assert.NotEmpty(t, actual)
 	assert.Equal(t, 200, resp.StatusCode, string(actual))
@@ -125,14 +130,31 @@ func TestAppMetricsWithParams(t *testing.T) {
 	assert.NotZero(t, gaugeSentinel)
 }
 
+type cacheNoPrivileges struct {
+	cache.KialiCache
+}
+
+func (c *cacheNoPrivileges) GetNamespace(token string, namespace string, cluster string) (models.Namespace, bool) {
+	return models.Namespace{}, false
+}
+
+type clientNoPrivileges struct {
+	kubernetes.ClientInterface
+}
+
+func (c *clientNoPrivileges) GetNamespace(namespace string) (*core_v1.Namespace, error) {
+	if namespace == "my_namespace" {
+		return nil, errors.New("No privileges")
+	}
+	return c.ClientInterface.GetNamespace(namespace)
+}
+
 func TestAppMetricsInaccessibleNamespace(t *testing.T) {
 	ts, _, k8s := setupAppMetricsEndpoint(t)
-	defer ts.Close()
+	cache := &cacheNoPrivileges{cache.NewTestingCache(t, k8s, *config.NewConfig())}
+	business.WithKialiCache(cache)
 
 	url := ts.URL + "/api/namespaces/my_namespace/apps/my_app/metrics"
-
-	var nsNil *core_v1.Namespace
-	k8s.On("GetNamespace", "my_namespace").Return(nsNil, errors.New("no privileges"))
 
 	resp, err := http.Get(url)
 	if err != nil {
@@ -140,128 +162,144 @@ func TestAppMetricsInaccessibleNamespace(t *testing.T) {
 	}
 
 	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
-	k8s.AssertCalled(t, "GetNamespace", "my_namespace")
 }
 
-func setupAppMetricsEndpoint(t *testing.T) (*httptest.Server, *prometheustest.PromAPIMock, *kubetest.K8SClientMock) {
-	conf := config.NewConfig()
-	conf.KubernetesConfig.CacheEnabled = false
-	config.Set(conf)
+func setupAppMetricsEndpoint(t *testing.T) (*httptest.Server, *prometheustest.PromAPIMock, kubernetes.ClientInterface) {
+	old := config.Get()
+	t.Cleanup(func() {
+		config.Set(old)
+	})
+	config.Set(config.NewConfig())
 	xapi := new(prometheustest.PromAPIMock)
-	k8s := new(kubetest.K8SClientMock)
 	prom, err := prometheus.NewClient()
 	if err != nil {
 		t.Fatal(err)
 	}
 	prom.Inject(xapi)
-	k8s.On("IsOpenShift").Return(false)
-	k8s.On("GetNamespace", "ns").Return(&core_v1.Namespace{}, nil)
-
+	k8s := &clientNoPrivileges{kubetest.NewFakeK8sClient(kubetest.FakeNamespace("ns"))}
 	mr := mux.NewRouter()
 
-	authInfo := &api.AuthInfo{Token: "test"}
+	authInfo := map[string]*api.AuthInfo{config.Get().KubernetesConfig.ClusterName: {Token: "test"}}
 
 	mr.HandleFunc("/api/namespaces/{namespace}/apps/{app}/metrics", http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
-			context := context.WithValue(r.Context(), "authInfo", authInfo)
+			context := authentication.SetAuthInfoContext(r.Context(), authInfo)
 			getAppMetrics(w, r.WithContext(context), func() (*prometheus.Client, error) {
 				return prom, nil
 			})
 		}))
 
 	ts := httptest.NewServer(mr)
+	t.Cleanup(ts.Close)
 
-	mockClientFactory := kubetest.NewK8SClientFactoryMock(k8s)
-	business.SetWithBackends(mockClientFactory, prom)
+	business.SetupBusinessLayer(t, k8s, *config.Get())
+	business.WithProm(prom)
 
 	return ts, xapi, k8s
 }
 
-func setupAppListEndpoint() (*httptest.Server, *kubetest.K8SClientMock, *prometheustest.PromClientMock) {
-	conf := config.NewConfig()
-	conf.KubernetesConfig.CacheEnabled = false
-	config.Set(conf)
-	k8s := kubetest.NewK8SClientMock()
-	prom := new(prometheustest.PromClientMock)
-
-	mockClientFactory := kubetest.NewK8SClientFactoryMock(k8s)
-	business.SetWithBackends(mockClientFactory, prom)
+func setupAppListEndpoint(t *testing.T, k8s kubernetes.ClientInterface, conf config.Config) *httptest.Server {
+	business.SetupBusinessLayer(t, k8s, conf)
+	promMock := new(prometheustest.PromAPIMock)
+	promMock.SpyArgumentsAndReturnEmpty(func(mock.Arguments) {})
+	prom, err := prometheus.NewClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prom.Inject(promMock)
+	business.WithProm(prom)
 
 	mr := mux.NewRouter()
-	mr.HandleFunc("/api/namespaces/{namespace}/apps", http.HandlerFunc(
+	mr.HandleFunc("/api/clusters/apps", http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
-			context := context.WithValue(r.Context(), "authInfo", &api.AuthInfo{Token: "test"})
-			AppList(w, r.WithContext(context))
+			context := authentication.SetAuthInfoContext(r.Context(), map[string]*api.AuthInfo{config.Get().KubernetesConfig.ClusterName: {Token: "test"}})
+			ClustersApps(w, r.WithContext(context))
 		}))
 
 	mr.HandleFunc("/api/namespaces/{namespace}/apps/{app}", http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
-			context := context.WithValue(r.Context(), "authInfo", &api.AuthInfo{Token: "test"})
+			context := authentication.SetAuthInfoContext(r.Context(), map[string]*api.AuthInfo{config.Get().KubernetesConfig.ClusterName: {Token: "test"}})
 			AppDetails(w, r.WithContext(context))
 		}))
 
 	ts := httptest.NewServer(mr)
-	return ts, k8s, prom
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+func newProject() *osproject_v1.Project {
+	return &osproject_v1.Project{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name: "ns",
+		},
+	}
 }
 
 func TestAppsEndpoint(t *testing.T) {
-	ts, k8s, _ := setupAppListEndpoint()
-	k8s.MockIstio()
-	defer ts.Close()
+	assert := assert.New(t)
 
-	k8s.On("GetProject", mock.AnythingOfType("string")).Return(&osproject_v1.Project{}, nil)
-	k8s.On("GetDeployments", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return(business.FakeDeployments(), nil)
-	k8s.On("GetReplicaSets", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]apps_v1.ReplicaSet{}, nil)
-	k8s.On("GetDeploymentConfigs", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]osapps_v1.DeploymentConfig{}, nil)
-	k8s.On("GetReplicationControllers", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]core_v1.ReplicationController{}, nil)
-	k8s.On("GetStatefulSets", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]apps_v1.StatefulSet{}, nil)
-	k8s.On("GetDaemonSets", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]apps_v1.DaemonSet{}, nil)
-	k8s.On("GetJobs", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]batch_v1.Job{}, nil)
-	k8s.On("GetCronJobs", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]batch_v1beta1.CronJob{}, nil)
-	k8s.On("GetPods", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]core_v1.Pod{}, nil)
-	k8s.On("GetServices", mock.AnythingOfType("string"), mock.AnythingOfType("map[string]string")).Return([]core_v1.Service{}, nil)
+	cfg := config.NewConfig()
+	cfg.ExternalServices.Istio.IstioAPIEnabled = false
+	config.Set(cfg)
 
-	url := ts.URL + "/api/namespaces/ns/apps"
+	mockClock()
+	proj := newProject()
+	proj.Name = "Namespace"
+	kubeObjects := []runtime.Object{proj}
+	for _, obj := range business.FakeDeployments(*cfg) {
+		o := obj
+		kubeObjects = append(kubeObjects, &o)
+	}
+	k8s := kubetest.NewFakeK8sClient(kubeObjects...)
+	k8s.OpenShift = true
+	ts := setupAppListEndpoint(t, k8s, *cfg)
+
+	url := ts.URL + "/api/clusters/apps"
 
 	resp, err := http.Get(url)
 	if err != nil {
 		t.Fatal(err)
 	}
-	actual, _ := ioutil.ReadAll(resp.Body)
+	actual, _ := io.ReadAll(resp.Body)
 
-	assert.NotEmpty(t, actual)
-	assert.Equal(t, 200, resp.StatusCode, string(actual))
-	k8s.AssertNumberOfCalls(t, "GetDeployments", 1)
-	k8s.AssertNumberOfCalls(t, "GetPods", 1)
+	assert.NotEmpty(actual)
+	assert.Equal(200, resp.StatusCode, string(actual))
 }
 
 func TestAppDetailsEndpoint(t *testing.T) {
-	ts, k8s, _ := setupAppListEndpoint()
-	defer ts.Close()
+	assert := assert.New(t)
+	require := require.New(t)
 
-	k8s.On("GetProject", mock.AnythingOfType("string")).Return(&osproject_v1.Project{}, nil)
-	k8s.On("GetDeployments", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return(business.FakeDeployments(), nil)
-	k8s.On("GetReplicaSets", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]apps_v1.ReplicaSet{}, nil)
-	k8s.On("GetDeploymentConfigs", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]osapps_v1.DeploymentConfig{}, nil)
-	k8s.On("GetReplicationControllers", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]core_v1.ReplicationController{}, nil)
-	k8s.On("GetStatefulSets", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]apps_v1.StatefulSet{}, nil)
-	k8s.On("GetDaemonSets", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]apps_v1.DaemonSet{}, nil)
-	k8s.On("GetPods", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]core_v1.Pod{}, nil)
-	k8s.On("GetJobs", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]batch_v1.Job{}, nil)
-	k8s.On("GetCronJobs", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return([]batch_v1beta1.CronJob{}, nil)
-	k8s.On("GetServices", mock.AnythingOfType("string"), mock.AnythingOfType("map[string]string")).Return(business.FakeServices(), nil)
+	// Disabling CustomDashboards on testing
+	// otherwise this adds 10s to the test due to an http timeout.
+	conf := config.NewConfig()
+	conf.ExternalServices.CustomDashboards.Enabled = false
+	conf.ExternalServices.Istio.IstioAPIEnabled = false
+	kubernetes.SetConfig(t, *conf)
 
-	url := ts.URL + "/api/namespaces/ns/apps/httpbin"
+	mockClock()
+	proj := newProject()
+	proj.Name = "Namespace"
+	kubeObjects := []runtime.Object{proj}
+	for _, obj := range business.FakeDeployments(*conf) {
+		o := obj
+		kubeObjects = append(kubeObjects, &o)
+	}
+	for _, obj := range business.FakeServices() {
+		o := obj
+		kubeObjects = append(kubeObjects, &o)
+	}
+	k8s := kubetest.NewFakeK8sClient(kubeObjects...)
+	k8s.OpenShift = true
+	ts := setupAppListEndpoint(t, k8s, *conf)
+
+	url := ts.URL + "/api/namespaces/Namespace/apps/httpbin"
 
 	resp, err := http.Get(url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	actual, _ := ioutil.ReadAll(resp.Body)
+	require.NoError(err)
 
-	assert.NotEmpty(t, actual)
-	assert.Equal(t, 200, resp.StatusCode, string(actual))
-	k8s.AssertNumberOfCalls(t, "GetDeployments", 1)
-	k8s.AssertNumberOfCalls(t, "GetPods", 1)
-	k8s.AssertNumberOfCalls(t, "GetServices", 1)
+	actual, _ := io.ReadAll(resp.Body)
+
+	require.NotEmpty(actual)
+	assert.Equal(200, resp.StatusCode, string(actual))
 }

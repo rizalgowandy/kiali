@@ -4,24 +4,24 @@ import (
 	"fmt"
 	"strings"
 
-	networking_v1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
 
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
 )
 
 type NoHostChecker struct {
-	Namespace         string
 	Namespaces        models.Namespaces
-	ServiceNames      []string
-	VirtualService    networking_v1alpha3.VirtualService
+	VirtualService    *networking_v1.VirtualService
 	ServiceEntryHosts map[string][]string
-	RegistryStatus    []*kubernetes.RegistryStatus
+	RegistryServices  []*kubernetes.RegistryService
+	PolicyAllowAny    bool
 }
 
 func (n NoHostChecker) Check() ([]*models.IstioCheck, bool) {
 	validations := make([]*models.IstioCheck, 0)
 	valid := true
+	namespace := n.VirtualService.Namespace
 
 	for k, httpRoute := range n.VirtualService.Spec.Http {
 		if httpRoute != nil {
@@ -31,17 +31,15 @@ func (n NoHostChecker) Check() ([]*models.IstioCheck, bool) {
 					if host == "" {
 						continue
 					}
-					if !n.checkDestination(host) {
-						fqdn := kubernetes.GetHost(host, n.VirtualService.Namespace, n.VirtualService.ClusterName, n.Namespaces.GetNames())
+					fqdn := kubernetes.GetHost(host, namespace, n.Namespaces.GetNames())
+					if !n.checkDestination(fqdn.String(), namespace) {
 						path := fmt.Sprintf("spec/http[%d]/route[%d]/destination/host", k, i)
-						if fqdn.Namespace != n.VirtualService.Namespace && fqdn.CompleteInput {
-							validation := models.Build("validation.unable.cross-namespace", path)
-							validations = append(validations, &validation)
-						} else {
-							validation := models.Build("virtualservices.nohost.hostnotfound", path)
-							validations = append(validations, &validation)
-							valid = false
+						validation := models.Build("virtualservices.nohost.hostnotfound", path)
+						if n.PolicyAllowAny {
+							validation.Severity = models.WarningSeverity
 						}
+						validations = append(validations, &validation)
+						valid = false
 					}
 				}
 			}
@@ -56,17 +54,15 @@ func (n NoHostChecker) Check() ([]*models.IstioCheck, bool) {
 					if host == "" {
 						continue
 					}
-					if !n.checkDestination(host) {
-						fqdn := kubernetes.GetHost(host, n.VirtualService.Namespace, n.VirtualService.ClusterName, n.Namespaces.GetNames())
+					fqdn := kubernetes.GetHost(host, namespace, n.Namespaces.GetNames())
+					if !n.checkDestination(fqdn.String(), namespace) {
 						path := fmt.Sprintf("spec/tcp[%d]/route[%d]/destination/host", k, i)
-						if fqdn.Namespace != n.VirtualService.Namespace && fqdn.CompleteInput {
-							validation := models.Build("validation.unable.cross-namespace", path)
-							validations = append(validations, &validation)
-						} else {
-							validation := models.Build("virtualservices.nohost.hostnotfound", path)
-							validations = append(validations, &validation)
-							valid = false
+						validation := models.Build("virtualservices.nohost.hostnotfound", path)
+						if n.PolicyAllowAny {
+							validation.Severity = models.WarningSeverity
 						}
+						validations = append(validations, &validation)
+						valid = false
 					}
 				}
 			}
@@ -81,41 +77,25 @@ func (n NoHostChecker) Check() ([]*models.IstioCheck, bool) {
 					if host == "" {
 						continue
 					}
-					if !n.checkDestination(host) {
-						fqdn := kubernetes.GetHost(host, n.VirtualService.Namespace, n.VirtualService.ClusterName, n.Namespaces.GetNames())
+					fqdn := kubernetes.GetHost(host, namespace, n.Namespaces.GetNames())
+					if !n.checkDestination(fqdn.String(), namespace) {
 						path := fmt.Sprintf("spec/tls[%d]/route[%d]/destination/host", k, i)
-						if fqdn.Namespace != n.VirtualService.Namespace && fqdn.CompleteInput {
-							validation := models.Build("validation.unable.cross-namespace", path)
-							validations = append(validations, &validation)
-						} else {
-							validation := models.Build("virtualservices.nohost.hostnotfound", path)
-							validations = append(validations, &validation)
-							valid = false
+						validation := models.Build("virtualservices.nohost.hostnotfound", path)
+						if n.PolicyAllowAny {
+							validation.Severity = models.WarningSeverity
 						}
+						validations = append(validations, &validation)
+						valid = false
 					}
 				}
 			}
 		}
 	}
 
-	if len(n.VirtualService.Spec.Http) == 0 && len(n.VirtualService.Spec.Tcp) == 0 && len(n.VirtualService.Spec.Tls) == 0 {
-		validation := models.Build("virtualservices.nohost.invalidprotocol", "")
-		validations = append(validations, &validation)
-		valid = false
-	}
 	return validations, valid
 }
 
-func (n NoHostChecker) checkDestination(sHost string) bool {
-	fqdn := kubernetes.GetHost(sHost, n.VirtualService.Namespace, n.VirtualService.ClusterName, n.Namespaces.GetNames())
-	if fqdn.Namespace == n.VirtualService.Namespace {
-		// We need to check for namespace equivalent so that two services from different namespaces do not collide
-		for _, service := range n.ServiceNames {
-			if kubernetes.FilterByHost(sHost, service, n.Namespace) {
-				return true
-			}
-		}
-	}
+func (n NoHostChecker) checkDestination(sHost string, itemNamespace string) bool {
 	// Check ServiceEntries
 	for k := range n.ServiceEntryHosts {
 		hostKey := k
@@ -127,7 +107,7 @@ func (n NoHostChecker) checkDestination(sHost string) bool {
 		}
 	}
 
-	// Use RegistryStatus to check destinations that may not be covered with previous check
+	// Use RegistryService to check destinations that may not be covered with previous check
 	// i.e. Multi-cluster or Federation validations
-	return kubernetes.HasMatchingRegistryStatus(sHost, n.RegistryStatus)
+	return kubernetes.HasMatchingRegistryService(itemNamespace, sHost, n.RegistryServices)
 }

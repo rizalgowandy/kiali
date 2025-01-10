@@ -118,6 +118,12 @@ func Fatalf(format string, args ...interface{}) {
 	log.Fatal().Msgf(format, args...)
 }
 
+// Return log level
+// Used to get debug info
+func GetLogLevel() string {
+	return zerolog.GlobalLevel().String()
+}
+
 // Resolves the environment settings for the log level. Considers the verbose_mode from server version <=1.25.
 func resolveLogLevelFromEnv() zerolog.Level {
 	logLevel, isDefined := os.LookupEnv("LOG_LEVEL")
@@ -126,27 +132,12 @@ func resolveLogLevelFromEnv() zerolog.Level {
 		return zerolog.InfoLevel
 	}
 
-	switch logLevel {
-	case "0":
-		return zerolog.FatalLevel
-	case "1":
-		return zerolog.ErrorLevel
-	case "2":
-		return zerolog.WarnLevel
-	case "3":
+	logLevelFromString, err := zerolog.ParseLevel(strings.ToLower(logLevel))
+	if err != nil {
+		log.Warn().Msgf("Provided LOG_LEVEL [%s] is invalid. Falling back to 'info'.", os.Getenv("LOG_LEVEL"))
 		return zerolog.InfoLevel
-	case "4":
-		return zerolog.DebugLevel
-	case "5":
-		return zerolog.TraceLevel
-	default:
-		logLevelFromString, err := zerolog.ParseLevel(strings.ToLower(logLevel))
-		if err != nil {
-			log.Warn().Msgf("Provided LOG_LEVEL %s is invalid. Fallback to info.", os.Getenv("LOG_LEVEL"))
-			return zerolog.InfoLevel
-		}
-		return logLevelFromString
 	}
+	return logLevelFromString
 }
 
 // Resolves and validates the log format. FallbackLogFormat is used as a default.

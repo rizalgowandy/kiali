@@ -1,9 +1,7 @@
 package handlers
 
 import (
-	"context"
-	"errors"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,6 +14,7 @@ import (
 	prom_v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kiali/kiali/business"
@@ -27,7 +26,7 @@ import (
 
 // TestServiceMetricsDefault is unit test (testing request handling, not the prometheus client behaviour)
 func TestServiceMetricsDefault(t *testing.T) {
-	ts, api, _ := setupServiceMetricsEndpoint(t)
+	ts, api := setupServiceMetricsEndpoint(t)
 	defer ts.Close()
 
 	req, err := http.NewRequest("GET", ts.URL+"/api/namespaces/ns/services/svc/metrics", nil)
@@ -60,7 +59,7 @@ func TestServiceMetricsDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actual, _ := ioutil.ReadAll(resp.Body)
+	actual, _ := io.ReadAll(resp.Body)
 
 	assert.NotEmpty(t, actual)
 	assert.Equal(t, 200, resp.StatusCode, string(actual))
@@ -69,7 +68,7 @@ func TestServiceMetricsDefault(t *testing.T) {
 }
 
 func TestServiceMetricsWithParams(t *testing.T) {
-	ts, api, _ := setupServiceMetricsEndpoint(t)
+	ts, api := setupServiceMetricsEndpoint(t)
 	defer ts.Close()
 
 	req, err := http.NewRequest("GET", ts.URL+"/api/namespaces/ns/services/svc/metrics", nil)
@@ -121,7 +120,7 @@ func TestServiceMetricsWithParams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actual, _ := ioutil.ReadAll(resp.Body)
+	actual, _ := io.ReadAll(resp.Body)
 
 	assert.NotEmpty(t, actual)
 	assert.Equal(t, 200, resp.StatusCode, string(actual))
@@ -131,7 +130,7 @@ func TestServiceMetricsWithParams(t *testing.T) {
 }
 
 func TestServiceMetricsBadQueryTime(t *testing.T) {
-	ts, api, _ := setupServiceMetricsEndpoint(t)
+	ts, api := setupServiceMetricsEndpoint(t)
 	defer ts.Close()
 
 	req, err := http.NewRequest("GET", ts.URL+"/api/namespaces/ns/services/svc/metrics", nil)
@@ -155,14 +154,14 @@ func TestServiceMetricsBadQueryTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actual, _ := ioutil.ReadAll(resp.Body)
+	actual, _ := io.ReadAll(resp.Body)
 
 	assert.Equal(t, 400, resp.StatusCode)
 	assert.Contains(t, string(actual), "cannot parse query parameter 'queryTime'")
 }
 
 func TestServiceMetricsBadDuration(t *testing.T) {
-	ts, api, _ := setupServiceMetricsEndpoint(t)
+	ts, api := setupServiceMetricsEndpoint(t)
 	defer ts.Close()
 
 	req, err := http.NewRequest("GET", ts.URL+"/api/namespaces/ns/services/svc/metrics", nil)
@@ -185,15 +184,14 @@ func TestServiceMetricsBadDuration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actual, _ := ioutil.ReadAll(resp.Body)
+	actual, _ := io.ReadAll(resp.Body)
 
 	assert.Equal(t, 400, resp.StatusCode)
 	assert.Contains(t, string(actual), "cannot parse query parameter 'duration'")
 }
 
 func TestServiceMetricsCantParseQuantiles(t *testing.T) {
-	ts, api, _ := setupServiceMetricsEndpoint(t)
-	defer ts.Close()
+	ts, api := setupServiceMetricsEndpoint(t)
 
 	req, err := http.NewRequest("GET", ts.URL+"/api/namespaces/ns/services/svc/metrics", nil)
 	if err != nil {
@@ -216,15 +214,14 @@ func TestServiceMetricsCantParseQuantiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actual, _ := ioutil.ReadAll(resp.Body)
+	actual, _ := io.ReadAll(resp.Body)
 
 	assert.Equal(t, 400, resp.StatusCode)
 	assert.Contains(t, string(actual), "cannot parse query parameter 'quantiles'")
 }
 
 func TestServiceMetricsBadQuantiles(t *testing.T) {
-	ts, api, _ := setupServiceMetricsEndpoint(t)
-	defer ts.Close()
+	ts, api := setupServiceMetricsEndpoint(t)
 
 	req, err := http.NewRequest("GET", ts.URL+"/api/namespaces/ns/services/svc/metrics", nil)
 	if err != nil {
@@ -247,15 +244,14 @@ func TestServiceMetricsBadQuantiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actual, _ := ioutil.ReadAll(resp.Body)
+	actual, _ := io.ReadAll(resp.Body)
 
 	assert.Equal(t, 400, resp.StatusCode)
 	assert.Contains(t, string(actual), "invalid quantile(s)")
 }
 
 func TestServiceMetricsBadStep(t *testing.T) {
-	ts, api, _ := setupServiceMetricsEndpoint(t)
-	defer ts.Close()
+	ts, api := setupServiceMetricsEndpoint(t)
 
 	req, err := http.NewRequest("GET", ts.URL+"/api/namespaces/ns/services/svc/metrics", nil)
 	if err != nil {
@@ -277,15 +273,14 @@ func TestServiceMetricsBadStep(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actual, _ := ioutil.ReadAll(resp.Body)
+	actual, _ := io.ReadAll(resp.Body)
 
 	assert.Equal(t, 400, resp.StatusCode)
 	assert.Contains(t, string(actual), "cannot parse query parameter 'step'")
 }
 
 func TestServiceMetricsBadRateFunc(t *testing.T) {
-	ts, api, _ := setupServiceMetricsEndpoint(t)
-	defer ts.Close()
+	ts, api := setupServiceMetricsEndpoint(t)
 
 	req, err := http.NewRequest("GET", ts.URL+"/api/namespaces/ns/services/svc/metrics", nil)
 	if err != nil {
@@ -306,20 +301,20 @@ func TestServiceMetricsBadRateFunc(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actual, _ := ioutil.ReadAll(resp.Body)
+	actual, _ := io.ReadAll(resp.Body)
 
 	assert.Equal(t, 400, resp.StatusCode)
 	assert.Contains(t, string(actual), "query parameter 'rateFunc' must be either 'rate' or 'irate'")
 }
 
 func TestServiceMetricsInaccessibleNamespace(t *testing.T) {
-	ts, _, k8s := setupServiceMetricsEndpoint(t)
-	defer ts.Close()
+	ts, _ := setupServiceMetricsEndpoint(t)
+	k := kubetest.NewFakeK8sClient(&osproject_v1.Project{ObjectMeta: meta_v1.ObjectMeta{Name: "ns"}})
+	k.OpenShift = true
+
+	business.SetupBusinessLayer(t, &noPrivClient{ClientInterface: k}, *config.Get())
 
 	url := ts.URL + "/api/namespaces/my_namespace/services/svc/metrics"
-
-	var nsNil *osproject_v1.Project
-	k8s.On("GetProject", "my_namespace").Return(nsNil, errors.New("no privileges"))
 
 	resp, err := http.Get(url)
 	if err != nil {
@@ -327,14 +322,15 @@ func TestServiceMetricsInaccessibleNamespace(t *testing.T) {
 	}
 
 	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
-	k8s.AssertCalled(t, "GetProject", "my_namespace")
 }
 
-func setupServiceMetricsEndpoint(t *testing.T) (*httptest.Server, *prometheustest.PromAPIMock, *kubetest.K8SClientMock) {
+func setupServiceMetricsEndpoint(t *testing.T) (*httptest.Server, *prometheustest.PromAPIMock) {
 	conf := config.NewConfig()
-	conf.KubernetesConfig.CacheEnabled = false
 	config.Set(conf)
-	k8s := kubetest.NewK8SClientMock()
+	k := kubetest.NewFakeK8sClient(&osproject_v1.Project{ObjectMeta: meta_v1.ObjectMeta{Name: "ns"}},
+		kubetest.FakeNamespace("my_namespace"),
+		kubetest.FakeNamespace("ns"))
+	k.OpenShift = true
 
 	xapi := new(prometheustest.PromAPIMock)
 	prom, err := prometheus.NewClient()
@@ -342,21 +338,21 @@ func setupServiceMetricsEndpoint(t *testing.T) (*httptest.Server, *prometheustes
 		t.Fatal(err)
 	}
 	prom.Inject(xapi)
-	k8s.On("GetProject", "ns").Return(&osproject_v1.Project{}, nil)
 
 	mr := mux.NewRouter()
+	authInfo := map[string]*api.AuthInfo{config.Get().KubernetesConfig.ClusterName: {Token: "test"}}
 	mr.HandleFunc("/api/namespaces/{namespace}/services/{service}/metrics", http.HandlerFunc(
-		func(w http.ResponseWriter, r *http.Request) {
-			context := context.WithValue(r.Context(), "authInfo", &api.AuthInfo{Token: "test"})
-			getServiceMetrics(w, r.WithContext(context), func() (*prometheus.Client, error) {
+		WithAuthInfo(authInfo, func(w http.ResponseWriter, r *http.Request) {
+			getServiceMetrics(w, r, func() (*prometheus.Client, error) {
 				return prom, nil
 			})
-		}))
+		})),
+	)
 
 	ts := httptest.NewServer(mr)
+	t.Cleanup(ts.Close)
 
-	mockClientFactory := kubetest.NewK8SClientFactoryMock(k8s)
-	business.SetWithBackends(mockClientFactory, prom)
+	business.SetupBusinessLayer(t, k, *conf)
 
-	return ts, xapi, k8s
+	return ts, xapi
 }

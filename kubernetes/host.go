@@ -4,9 +4,10 @@ import (
 	"fmt"
 	"strings"
 
-	networking_v1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
 	core_v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	k8s_networking_v1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
 	"github.com/kiali/kiali/config"
 )
@@ -23,10 +24,8 @@ type Host struct {
 }
 
 // ParseHost takes as an input a hostname (simple or full FQDN), namespace and clusterName and returns a parsed Host struct
-func ParseHost(hostName, namespace, cluster string) Host {
-	if cluster == "" {
-		cluster = config.Get().ExternalServices.Istio.IstioIdentityDomain
-	}
+func ParseHost(hostName, namespace string) Host {
+	cluster := config.Get().ExternalServices.Istio.IstioIdentityDomain
 
 	domainParts := strings.Split(hostName, ".")
 	host := Host{
@@ -60,7 +59,9 @@ func ParseHost(hostName, namespace, cluster string) Host {
 
 // GetHost parses hostName and returns a Host struct. It considers Namespaces in the cluster to be more accurate
 // when deciding if the hostName is a ServiceEntry or a service.namespace host definition.
-func GetHost(hostName, namespace, cluster string, clusterNamespaces []string) Host {
+func GetHost(hostName, namespace string, clusterNamespaces []string) Host {
+	cluster := config.Get().ExternalServices.Istio.IstioIdentityDomain
+
 	hParts := strings.Split(hostName, ".")
 	// It might be a service entry or a 2-format host specification
 	if len(hParts) == 2 {
@@ -76,7 +77,17 @@ func GetHost(hostName, namespace, cluster string, clusterNamespaces []string) Ho
 		}
 	}
 
-	return ParseHost(hostName, namespace, cluster)
+	// Case where it's a short name with the format <service>.<namespace>.svc
+	if len(hParts) == 3 && hParts[2] == "svc" {
+		return Host{
+			Service:       hParts[0],
+			Namespace:     hParts[1],
+			Cluster:       cluster,
+			CompleteInput: true,
+		}
+	}
+
+	return ParseHost(hostName, namespace)
 }
 
 func includes(nss []string, namespace string) bool {
@@ -159,7 +170,7 @@ func HasMatchingServiceEntries(service string, serviceEntries map[string][]strin
 	return false
 }
 
-func HasMatchingVirtualServices(host Host, virtualServices []networking_v1alpha3.VirtualService) bool {
+func HasMatchingVirtualServices(host Host, virtualServices []*networking_v1.VirtualService) bool {
 	for _, vs := range virtualServices {
 		for hostIdx := 0; hostIdx < len(vs.Spec.Hosts); hostIdx++ {
 			vHost := vs.Spec.Hosts[hostIdx]
@@ -190,7 +201,7 @@ func HasMatchingVirtualServices(host Host, virtualServices []networking_v1alpha3
 			}
 
 			// Non-internal service name
-			hostS := ParseHost(vHost, vs.Namespace, vs.ClusterName)
+			hostS := ParseHost(vHost, vs.Namespace)
 			if hostS.Service == host.Service && hostS.CompleteInput == host.CompleteInput && !hostS.CompleteInput {
 				return true
 			}
@@ -205,13 +216,27 @@ func HasMatchingVirtualServices(host Host, virtualServices []networking_v1alpha3
 	return false
 }
 
-// HasMatchingRegistryStatus returns true when the FDQN of the host param matches
-// with one registry status of the registryStatus param.
-func HasMatchingRegistryStatus(host string, registryStatus []*RegistryStatus) bool {
-	for _, rStatus := range registryStatus {
+// HasMatchingRegistryService returns true when the FDQN of the host (from given namespace) param matches
+// with one registry service of the registryServices param.
+func HasMatchingRegistryService(namespace string, host string, registryServices []*RegistryService) bool {
+	for _, rStatus := range registryServices {
 		// We assume that on these cases the host.Service is provided in FQDN
 		// i.e. ratings.mesh2-bookinfo.svc.mesh1-imports.local
-		if FilterByRegistryStatus(host, rStatus) {
+		if FilterByRegistryService(namespace, host, rStatus) {
+			return true
+		}
+	}
+	return false
+}
+
+// HasMatchingReferenceGrant returns true when the From matches to given fromNamespace and fromKind and To matched given toNamespace and toKind.
+func HasMatchingReferenceGrant(fromNamespace string, toNamespace string, fromKind string, toKind string, referenceGrants []*k8s_networking_v1beta1.ReferenceGrant) bool {
+	for _, rGrant := range referenceGrants {
+		if len(rGrant.Spec.From) > 0 && len(rGrant.Spec.To) > 0 &&
+			string(rGrant.Spec.From[0].Namespace) == fromNamespace &&
+			rGrant.Namespace == toNamespace &&
+			string(rGrant.Spec.From[0].Kind) == fromKind &&
+			string(rGrant.Spec.To[0].Kind) == toKind {
 			return true
 		}
 	}
@@ -226,7 +251,9 @@ func HostWithinWildcardHost(subdomain, wildcardDomain string) bool {
 	return len(wildcardDomain) > 2 && strings.HasSuffix(subdomain, wildcardDomain[2:])
 }
 
-func ParseGatewayAsHost(gateway, currentNamespace, currentCluster string) Host {
+func ParseGatewayAsHost(gateway, currentNamespace string) Host {
+	currentCluster := config.Get().ExternalServices.Istio.IstioIdentityDomain
+
 	host := Host{
 		Service:       gateway,
 		Namespace:     currentNamespace,
