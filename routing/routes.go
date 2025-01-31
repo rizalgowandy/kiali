@@ -3,7 +3,18 @@ package routing
 import (
 	"net/http"
 
+	"golang.org/x/exp/maps"
+
+	"github.com/kiali/kiali/business"
+	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/grafana"
 	"github.com/kiali/kiali/handlers"
+	"github.com/kiali/kiali/handlers/authentication"
+	"github.com/kiali/kiali/istio"
+	"github.com/kiali/kiali/kubernetes"
+	"github.com/kiali/kiali/kubernetes/cache"
+	"github.com/kiali/kiali/prometheus"
+	"github.com/kiali/kiali/tracing"
 )
 
 // Route describes a single route
@@ -22,7 +33,17 @@ type Routes struct {
 }
 
 // NewRoutes creates and returns all the API routes
-func NewRoutes() (r *Routes) {
+func NewRoutes(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	cpm business.ControlPlaneMonitor,
+	prom prometheus.ClientInterface,
+	traceClientLoader func() tracing.ClientInterface,
+	authController authentication.AuthController,
+	grafana *grafana.Service,
+	discovery *istio.Discovery,
+) (r *Routes) {
 	r = new(Routes)
 
 	r.Routes = []Route{
@@ -59,8 +80,8 @@ func NewRoutes() (r *Routes) {
 			"Root",
 			"GET",
 			"/api",
-			handlers.Root,
-			false,
+			handlers.Root(conf, clientFactory, kialiCache, grafana),
+			conf.Server.RequireAuth,
 		},
 		// swagger:route GET /authenticate auth authenticate
 		// ---
@@ -76,12 +97,12 @@ func NewRoutes() (r *Routes) {
 		//
 		// responses:
 		//      500: internalError
-		//      200: tokenResponse
+		//      200: userSessionData
 		{
 			"Authenticate",
 			"GET",
 			"/api/authenticate",
-			handlers.Authenticate,
+			handlers.Authenticate(conf, authController),
 			false,
 		},
 		// swagger:route POST /authenticate auth openshiftCheckToken
@@ -95,12 +116,12 @@ func NewRoutes() (r *Routes) {
 		//
 		// responses:
 		//      500: internalError
-		//      200: tokenResponse
+		//      200: userSessionData
 		{
 			"OpenshiftCheckToken",
 			"POST",
 			"/api/authenticate",
-			handlers.Authenticate,
+			handlers.Authenticate(conf, authController),
 			false,
 		},
 		// swagger:route GET /logout auth logout
@@ -115,7 +136,7 @@ func NewRoutes() (r *Routes) {
 			"Logout",
 			"GET",
 			"/api/logout",
-			handlers.Logout,
+			handlers.Logout(conf, authController),
 			false,
 		},
 		// swagger:route GET /auth/info auth authenticationInfo
@@ -138,30 +159,7 @@ func NewRoutes() (r *Routes) {
 			"AuthenticationInfo",
 			"GET",
 			"/api/auth/info",
-			handlers.AuthenticationInfo,
-			false,
-		},
-		// swagger:route GET /auth/openid_redirect auth openidRedirect
-		// ---
-		// Endpoint to redirect the browser of the user to the authentication
-		// endpoint of the configured OpenId provider.
-		//
-		//     Consumes:
-		//     - application/json
-		//
-		//     Produces:
-		//     - application/html
-		//
-		//     Schemes: http, https
-		//
-		// responses:
-		//      500: internalError
-		//      200: noContent
-		{
-			"AuthenticationInfo",
-			"GET",
-			"/api/auth/openid_redirect",
-			handlers.OpenIdRedirect,
+			handlers.AuthenticationInfo(conf, authController, maps.Keys(clientFactory.GetSAClients())),
 			false,
 		},
 		// swagger:route GET /status status getStatus
@@ -180,7 +178,7 @@ func NewRoutes() (r *Routes) {
 			"Status",
 			"GET",
 			"/api/status",
-			handlers.Root,
+			handlers.Root(conf, clientFactory, kialiCache, grafana),
 			true,
 		},
 		// swagger:route GET /config kiali getConfig
@@ -199,7 +197,26 @@ func NewRoutes() (r *Routes) {
 			"Config",
 			"GET",
 			"/api/config",
-			handlers.Config,
+			handlers.Config(conf, discovery),
+			true,
+		},
+		// swagger:route GET /crippled kiali getCrippledFeatures
+		// ---
+		// Endpoint to get the crippled features of Kiali
+		//
+		//     Produces:
+		//     - application/json
+		//
+		//     Schemes: http, https
+		//
+		// responses:
+		//      500: internalError
+		//      200: statusInfo
+		{
+			"Crippled",
+			"GET",
+			"/api/crippled",
+			handlers.CrippledFeatures,
 			true,
 		},
 		// swagger:route GET /istio/permissions config getPermissions
@@ -241,7 +258,27 @@ func NewRoutes() (r *Routes) {
 			handlers.IstioConfigList,
 			true,
 		},
-		// swagger:route GET /namespaces/{namespace}/istio/{object_type}/{object} config istioConfigDetails
+		// swagger:route GET /istio config istioConfigListAll
+		// ---
+		// Endpoint to get the list of Istio Config of all namespaces
+		//
+		//     Produces:
+		//     - application/json
+		//
+		//     Schemes: http, https
+		//
+		// responses:
+		//      500: internalError
+		//      200: istioConfigList
+		//
+		{
+			"IstioConfigListAll",
+			"GET",
+			"/api/istio/config",
+			handlers.IstioConfigList,
+			true,
+		},
+		// swagger:route GET /namespaces/{namespace}/istio/{group}/{version}/{kind}/{object} config istioConfigDetails
 		// ---
 		// Endpoint to get the Istio Config of an Istio object
 		//
@@ -259,11 +296,11 @@ func NewRoutes() (r *Routes) {
 		{
 			"IstioConfigDetails",
 			"GET",
-			"/api/namespaces/{namespace}/istio/{object_type}/{object}",
+			"/api/namespaces/{namespace}/istio/{group}/{version}/{kind}/{object}",
 			handlers.IstioConfigDetails,
 			true,
 		},
-		// swagger:route DELETE /namespaces/{namespace}/istio/{object_type}/{object} config istioConfigDelete
+		// swagger:route DELETE /namespaces/{namespace}/istio/{group}/{version}/{kind}/{object} config istioConfigDelete
 		// ---
 		// Endpoint to delete the Istio Config of an (arbitrary) Istio object
 		//
@@ -280,11 +317,11 @@ func NewRoutes() (r *Routes) {
 		{
 			"IstioConfigDelete",
 			"DELETE",
-			"/api/namespaces/{namespace}/istio/{object_type}/{object}",
+			"/api/namespaces/{namespace}/istio/{group}/{version}/{kind}/{object}",
 			handlers.IstioConfigDelete,
 			true,
 		},
-		// swagger:route PATCH /namespaces/{namespace}/istio/{object_type}/{object} config istioConfigUpdate
+		// swagger:route PATCH /namespaces/{namespace}/istio/{group}/{version}/{kind}/{object} config istioConfigUpdate
 		// ---
 		// Endpoint to update the Istio Config of an Istio object used for templates and adapters using Json Merge Patch strategy.
 		//
@@ -305,11 +342,11 @@ func NewRoutes() (r *Routes) {
 		{
 			"IstioConfigUpdate",
 			"PATCH",
-			"/api/namespaces/{namespace}/istio/{object_type}/{object}",
+			"/api/namespaces/{namespace}/istio/{group}/{version}/{kind}/{object}",
 			handlers.IstioConfigUpdate,
 			true,
 		},
-		// swagger:route POST /namespaces/{namespace}/istio/{object_type} config istioConfigCreate
+		// swagger:route POST /namespaces/{namespace}/istio/{group}/{version}/{kind} config istioConfigCreate
 		// ---
 		// Endpoint to create an Istio object by using an Istio Config item
 		//
@@ -328,13 +365,13 @@ func NewRoutes() (r *Routes) {
 		{
 			"IstioConfigCreate",
 			"POST",
-			"/api/namespaces/{namespace}/istio/{object_type}",
+			"/api/namespaces/{namespace}/istio/{group}/{version}/{kind}",
 			handlers.IstioConfigCreate,
 			true,
 		},
-		// swagger:route GET /namespaces/{namespace}/services services serviceList
+		// swagger:route GET /clusters/services services serviceList
 		// ---
-		// Endpoint to get the details of a given service
+		// Endpoint to get the list of services for a given cluster
 		//
 		//     Produces:
 		//     - application/json
@@ -346,10 +383,10 @@ func NewRoutes() (r *Routes) {
 		//      200: serviceListResponse
 		//
 		{
-			"ServiceList",
+			"ClustersServices",
 			"GET",
-			"/api/namespaces/{namespace}/services",
-			handlers.ServiceList,
+			"/api/clusters/services",
+			handlers.ClustersServices,
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/services/{service} services serviceDetails
@@ -400,7 +437,7 @@ func NewRoutes() (r *Routes) {
 		},
 		// swagger:route GET /namespaces/{namespace}/apps/{app}/spans traces appSpans
 		// ---
-		// Endpoint to get Jaeger spans for a given app
+		// Endpoint to get Tracing spans for a given app
 		//
 		//		Produces:
 		//		- application/json
@@ -419,7 +456,7 @@ func NewRoutes() (r *Routes) {
 		},
 		// swagger:route GET /namespaces/{namespace}/workloads/{workload}/spans traces workloadSpans
 		// ---
-		// Endpoint to get Jaeger spans for a given workload
+		// Endpoint to get Tracing spans for a given workload
 		//
 		//		Produces:
 		//		- application/json
@@ -438,7 +475,7 @@ func NewRoutes() (r *Routes) {
 		},
 		// swagger:route GET /namespaces/{namespace}/services/{service}/spans traces serviceSpans
 		// ---
-		// Endpoint to get Jaeger spans for a given service
+		// Endpoint to get Tracing spans for a given service
 		//
 		//		Produces:
 		//		- application/json
@@ -560,9 +597,9 @@ func NewRoutes() (r *Routes) {
 			handlers.TraceDetails,
 			true,
 		},
-		// swagger:route GET /namespaces/{namespace}/workloads workloads workloadList
+		// swagger:route GET /clusters/workloads workloads workloadList
 		// ---
-		// Endpoint to get the list of workloads for a namespace
+		// Endpoint to get the list of workloads for a cluster
 		//
 		//     Produces:
 		//     - application/json
@@ -574,10 +611,10 @@ func NewRoutes() (r *Routes) {
 		//      200: workloadListResponse
 		//
 		{
-			"WorkloadList",
+			"ClustersWorkloads",
 			"GET",
-			"/api/namespaces/{namespace}/workloads",
-			handlers.WorkloadList,
+			"/api/clusters/workloads",
+			handlers.ClustersWorkloads,
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/workloads/{workload} workloads workloadDetails
@@ -626,9 +663,9 @@ func NewRoutes() (r *Routes) {
 			handlers.WorkloadUpdate,
 			true,
 		},
-		// swagger:route GET /namespaces/{namespace}/apps apps appList
+		// swagger:route GET /clusters/apps apps appList
 		// ---
-		// Endpoint to get the list of apps for a namespace
+		// Endpoint to get the list of apps for a cluster
 		//
 		//     Produces:
 		//     - application/json
@@ -640,10 +677,10 @@ func NewRoutes() (r *Routes) {
 		//      200: appListResponse
 		//
 		{
-			"AppList",
+			"ClustersApps",
 			"GET",
-			"/api/namespaces/{namespace}/apps",
-			handlers.AppList,
+			"/api/clusters/apps",
+			handlers.ClustersApps,
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/apps/{app} apps appDetails
@@ -710,6 +747,26 @@ func NewRoutes() (r *Routes) {
 			"PATCH",
 			"/api/namespaces/{namespace}",
 			handlers.NamespaceUpdate,
+			true,
+		},
+		// swagger:route GET /namespaces/{namespace}/info namespaces namespaceInfo
+		// ---
+		// Endpoint to get info about a single namespace
+		//
+		//     Produces:
+		//     - application/json
+		//
+		//     Schemes: http, https
+		//
+		// responses:
+		//      500: internalError
+		//      200: namespaceList
+		//
+		{
+			"NamespaceInfo",
+			"GET",
+			"/api/namespaces/{namespace}/info",
+			handlers.NamespaceInfo,
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/services/{service}/metrics services serviceMetrics
@@ -796,6 +853,27 @@ func NewRoutes() (r *Routes) {
 			handlers.WorkloadMetrics,
 			true,
 		},
+		// swagger:route GET /namespaces/{namespace}/controlplanes/{controlplane}/metrics controlplanes controlPlaneMetrics
+		// ---
+		// Endpoint to fetch metrics to be displayed, related to a single control plane
+		//
+		//     Produces:
+		//     - application/json
+		//
+		//     Schemes: http, https
+		//
+		// responses:
+		//      400: badRequestError
+		//      503: serviceUnavailableError
+		//      200: metricsResponse
+		//
+		{
+			"ControlPlaneMetrics",
+			"GET",
+			"/api/namespaces/{namespace}/controlplanes/{controlplane}/metrics",
+			handlers.ControlPlaneMetrics(handlers.DefaultPromClientSupplier),
+			true,
+		},
 		// swagger:route GET /namespaces/{namespace}/services/{service}/dashboard services serviceDashboard
 		// ---
 		// Endpoint to fetch dashboard to be displayed, related to a single service
@@ -814,7 +892,7 @@ func NewRoutes() (r *Routes) {
 			"ServiceDashboard",
 			"GET",
 			"/api/namespaces/{namespace}/services/{service}/dashboard",
-			handlers.ServiceDashboard,
+			handlers.ServiceDashboard(conf, grafana),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/apps/{app}/dashboard apps appDashboard
@@ -835,7 +913,7 @@ func NewRoutes() (r *Routes) {
 			"AppDashboard",
 			"GET",
 			"/api/namespaces/{namespace}/apps/{app}/dashboard",
-			handlers.AppDashboard,
+			handlers.AppDashboard(conf, grafana),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/workloads/{workload}/dashboard workloads workloadDashboard
@@ -856,7 +934,7 @@ func NewRoutes() (r *Routes) {
 			"WorkloadDashboard",
 			"GET",
 			"/api/namespaces/{namespace}/workloads/{workload}/dashboard",
-			handlers.WorkloadDashboard,
+			handlers.WorkloadDashboard(conf, grafana),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/customdashboard/{dashboard} dashboards customDashboard
@@ -877,70 +955,7 @@ func NewRoutes() (r *Routes) {
 			"CustomDashboard",
 			"GET",
 			"/api/namespaces/{namespace}/customdashboard/{dashboard}",
-			handlers.CustomDashboard,
-			true,
-		},
-		// swagger:route GET /namespaces/{namespace}/services/{service}/health services serviceHealth
-		// ---
-		// Get health associated to the given service
-		//
-		//     Produces:
-		//     - application/json
-		//
-		//     Schemes: http, https
-		//
-		// responses:
-		//      200: serviceHealthResponse
-		//      404: notFoundError
-		//      500: internalError
-		//
-		{
-			"ServiceHealth",
-			"GET",
-			"/api/namespaces/{namespace}/services/{service}/health",
-			handlers.ServiceHealth,
-			true,
-		},
-		// swagger:route GET /namespaces/{namespace}/apps/{app}/health apps appHealth
-		// ---
-		// Get health associated to the given app
-		//
-		//     Produces:
-		//     - application/json
-		//
-		//     Schemes: http, https
-		//
-		// responses:
-		//      200: appHealthResponse
-		//      404: notFoundError
-		//      500: internalError
-		//
-		{
-			"AppHealth",
-			"GET",
-			"/api/namespaces/{namespace}/apps/{app}/health",
-			handlers.AppHealth,
-			true,
-		},
-		// swagger:route GET /namespaces/{namespace}/workloads/{workload}/health workloads workloadHealth
-		// ---
-		// Get health associated to the given workload
-		//
-		//     Produces:
-		//     - application/json
-		//
-		//     Schemes: http, https
-		//
-		// responses:
-		//      200: workloadHealthResponse
-		//      404: notFoundError
-		//      500: internalError
-		//
-		{
-			"WorkloadHealth",
-			"GET",
-			"/api/namespaces/{namespace}/workloads/{workload}/health",
-			handlers.WorkloadHealth,
+			handlers.CustomDashboard(conf, grafana),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/metrics namespaces namespaceMetrics
@@ -961,12 +976,12 @@ func NewRoutes() (r *Routes) {
 			"NamespaceMetrics",
 			"GET",
 			"/api/namespaces/{namespace}/metrics",
-			handlers.NamespaceMetrics,
+			handlers.NamespaceMetrics(handlers.DefaultPromClientSupplier),
 			true,
 		},
-		// swagger:route GET /namespaces/{namespace}/health namespaces namespaceHealth
+		// swagger:route GET /clusters/health cluster namespaces Health
 		// ---
-		// Get health for all objects in the given namespace
+		// Get health for all objects in namespaces of the given cluster
 		//
 		//     Produces:
 		//     - application/json
@@ -974,15 +989,15 @@ func NewRoutes() (r *Routes) {
 		//     Schemes: http, https
 		//
 		// responses:
-		//      200: namespaceAppHealthResponse
+		//      200: clustersNamespaceHealthResponse
 		//      400: badRequestError
 		//      500: internalError
 		//
 		{
-			"NamespaceHealth",
+			"ClustersHealth",
 			"GET",
-			"/api/namespaces/{namespace}/health",
-			handlers.NamespaceHealth,
+			"/api/clusters/health",
+			handlers.ClustersHealth,
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/validations namespaces namespaceValidations
@@ -1003,7 +1018,28 @@ func NewRoutes() (r *Routes) {
 			"NamespaceValidationSummary",
 			"GET",
 			"/api/namespaces/{namespace}/validations",
-			handlers.NamespaceValidationSummary,
+			handlers.NamespaceValidationSummary(discovery),
+			true,
+		},
+		// swagger:route GET /istio/validations namespaces namespacesValidations
+		// ---
+		// Get validation summary for all objects in the given namespaces
+		//
+		//     Produces:
+		//     - application/json
+		//
+		//     Schemes: http, https
+		//
+		// responses:
+		//      200: namespaceValidationSummaryResponse
+		//      400: badRequestError
+		//      500: internalError
+		//
+		{
+			"ConfigValidationSummary",
+			"GET",
+			"/api/istio/validations",
+			handlers.ConfigValidationSummary,
 			true,
 		},
 		// swagger:route GET /mesh/tls tls meshTls
@@ -1048,6 +1084,27 @@ func NewRoutes() (r *Routes) {
 			handlers.NamespaceTls,
 			true,
 		},
+		// swagger:route GET /clusters/tls tls ClustersTls
+		// ---
+		// Get TLS statuses for given namespaces of the given cluster
+		//
+		//     Produces:
+		//     - application/json
+		//
+		//     Schemes: http, https
+		//
+		// responses:
+		//      200: clusterTlsResponse
+		//      400: badRequestError
+		//      500: internalError
+		//
+		{
+			"ClusterTls",
+			"GET",
+			"/api/clusters/tls",
+			handlers.ClustersTls,
+			true,
+		},
 		// swagger:route GET /istio/status status istioStatus
 		// ---
 		// Get the status of each components needed in the control plane
@@ -1069,26 +1126,6 @@ func NewRoutes() (r *Routes) {
 			handlers.IstioStatus,
 			true,
 		},
-		// swagger:route GET /istio/certs certs istioCerts
-		// ---
-		// Get certificates (internal) information used by Istio
-		//
-		//     Produces:
-		//     - application/json
-		//
-		//     Schemes: http, https
-		//
-		// responses:
-		//      200: certsInfoResponse
-		//      500: internalError
-		//
-		{
-			"IstioCerts",
-			"GET",
-			"/api/istio/certs",
-			handlers.IstioCerts,
-			true,
-		},
 		// swagger:route GET /namespaces/graph graphs graphNamespaces
 		// ---
 		// The backing JSON for a namespaces graph.
@@ -1107,7 +1144,7 @@ func NewRoutes() (r *Routes) {
 			"GraphNamespaces",
 			"GET",
 			"/api/namespaces/graph",
-			handlers.GraphNamespaces,
+			handlers.GraphNamespaces(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/aggregates/{aggregate}/{aggregateValue}/graph graphs graphAggregate
@@ -1125,11 +1162,10 @@ func NewRoutes() (r *Routes) {
 		//      200: graphResponse
 		//
 		{
-
 			"GraphAggregate",
 			"GET",
 			"/api/namespaces/{namespace}/aggregates/{aggregate}/{aggregateValue}/graph",
-			handlers.GraphNode,
+			handlers.GraphNode(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/aggregates/{aggregate}/{aggregateValue}/{service}/graph graphs graphAggregateByService
@@ -1147,11 +1183,10 @@ func NewRoutes() (r *Routes) {
 		//      200: graphResponse
 		//
 		{
-
 			"GraphAggregateByService",
 			"GET",
 			"/api/namespaces/{namespace}/aggregates/{aggregate}/{aggregateValue}/{service}/graph",
-			handlers.GraphNode,
+			handlers.GraphNode(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/applications/{app}/versions/{version}/graph graphs graphAppVersion
@@ -1169,11 +1204,10 @@ func NewRoutes() (r *Routes) {
 		//      200: graphResponse
 		//
 		{
-
 			"GraphAppVersion",
 			"GET",
 			"/api/namespaces/{namespace}/applications/{app}/versions/{version}/graph",
-			handlers.GraphNode,
+			handlers.GraphNode(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/applications/{app}/graph graphs graphApp
@@ -1194,7 +1228,7 @@ func NewRoutes() (r *Routes) {
 			"GraphApp",
 			"GET",
 			"/api/namespaces/{namespace}/applications/{app}/graph",
-			handlers.GraphNode,
+			handlers.GraphNode(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/services/{service}/graph graphs graphService
@@ -1215,7 +1249,7 @@ func NewRoutes() (r *Routes) {
 			"GraphService",
 			"GET",
 			"/api/namespaces/{namespace}/services/{service}/graph",
-			handlers.GraphNode,
+			handlers.GraphNode(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/workloads/{workload}/graph graphs graphWorkload
@@ -1236,7 +1270,49 @@ func NewRoutes() (r *Routes) {
 			"GraphWorkload",
 			"GET",
 			"/api/namespaces/{namespace}/workloads/{workload}/graph",
-			handlers.GraphNode,
+			handlers.GraphNode(conf, kialiCache, clientFactory, prom, cpm, traceClientLoader, grafana, discovery),
+			true,
+		},
+		// swagger:route GET /mesh/graph meshGraph
+		// ---
+		// The backing JSON for a mesh graph
+		//
+		//     Produces:
+		//     - application/json
+		//
+		//     Schemes: http, https
+		//
+		// responses:
+		//      400: badRequestError
+		//      500: internalError
+		//      200: graphResponse
+		//
+		{
+			"MeshGraph",
+			"GET",
+			"/api/mesh/graph",
+			handlers.MeshGraph(conf, clientFactory, kialiCache, grafana, prom, traceClientLoader, discovery, cpm),
+			true,
+		},
+		// swagger:route GET /mesh/controlplanes controlplanes
+		// ---
+		// The backing JSON for mesh controlplanes
+		//
+		//     Produces:
+		//     - application/json
+		//
+		//     Schemes: http, https
+		//
+		// responses:
+		//      400: badRequestError
+		//      500: internalError
+		//      200: graphResponse
+		//
+		{
+			"MeshControlPlanes",
+			"GET",
+			"/api/mesh/controlplanes",
+			handlers.ControlPlanes(kialiCache, clientFactory, conf, discovery),
 			true,
 		},
 		// swagger:route GET /grafana integrations grafanaInfo
@@ -1258,12 +1334,12 @@ func NewRoutes() (r *Routes) {
 			"GrafanaURL",
 			"GET",
 			"/api/grafana",
-			handlers.GetGrafanaInfo,
+			handlers.GetGrafanaInfo(conf, grafana),
 			true,
 		},
-		// swagger:route GET /jaeger integrations jaegerInfo
+		// swagger:route GET /tracing integrations tracingInfo
 		// ---
-		// Get the jaeger URL and other descriptors
+		// Get the tracing URL and other descriptors
 		//
 		//     Produces:
 		//     - application/json
@@ -1273,13 +1349,13 @@ func NewRoutes() (r *Routes) {
 		// responses:
 		//      404: notFoundError
 		//      406: notAcceptableError
-		//      200: jaegerInfoResponse
+		//      200: tracingInfoResponse
 		//
 		{
-			"JaegerURL",
+			"TracingURL",
 			"GET",
-			"/api/jaeger",
-			handlers.GetJaegerInfo,
+			"/api/tracing",
+			handlers.GetTracingInfo,
 			true,
 		},
 		// swagger:route GET /namespaces/{namespace}/pods/{pod} pods podDetails
@@ -1366,6 +1442,27 @@ func NewRoutes() (r *Routes) {
 			handlers.ConfigDumpResourceEntries,
 			true,
 		},
+		// swagger:route GET /api/namespaces/{namespace}/pods/{pod}/config_dump_ztunnel
+		// ---
+		// Endpoint to get ztunnel pod config dump
+		//
+		//     Produces:
+		//     - application/json
+		//
+		//     Schemes: http, https
+		//
+		// responses:
+		//      500: internalError
+		//      404: notFoundError
+		//      200: ZtunnelConfigDump
+		//
+		{
+			"ZtunnelConfigDump",
+			"GET",
+			"/api/namespaces/{namespace}/pods/{pod}/config_dump_ztunnel",
+			handlers.ConfigDumpZtunnel,
+			true,
+		},
 		// swagger:route POST /namespaces/{namespace}/pods/{pod}/logging pods podProxyLogging
 		// ---
 		// Endpoint to set pod proxy log level
@@ -1388,161 +1485,27 @@ func NewRoutes() (r *Routes) {
 			handlers.LoggingUpdate,
 			true,
 		},
-		// swagger:route GET /iter8
+		// swagger:route GET /clusters/metrics clusterName namespaces clustersMetrics
 		// ---
-		// Endpoint to check if iter8 adapter is present in the cluster and if user can write adapter config
+		// Endpoint to fetch metrics to be displayed, related to all provided namespaces of provided cluster
 		//
-		//		Produces:
-		//		- application/json
+		//     Produces:
+		//     - application/json
 		//
-		//		Schemes: http, https
+		//     Schemes: http, https
 		//
 		// responses:
-		//		500: internalError
-		//		200: iter8StatusResponse
+		//      400: badRequestError
+		//      503: serviceUnavailableError
+		//      200: metricsResponse
+		//
 		{
-			"Iter8Info",
+			"ClustersMetrics",
 			"GET",
-			"/api/iter8",
-			handlers.Iter8Status,
+			"/api/clusters/metrics",
+			handlers.ClustersMetrics(handlers.DefaultPromClientSupplier),
 			true,
 		},
-		// swagger:route GET /iter8/namespaces/{namespace}/experiments/{name} iter8 getIter8Experiments
-		// ---
-		// Endpoint to fetch iter8 experiments by namespace and name
-		//
-		// 		Produces:
-		//		- application/json
-		//
-		//		Schemes: http, https
-		//
-		// responses:
-		//		500: internalError
-		//		200: iter8ExperimentGetDetailResponse
-		{
-			"Iter8ExperimentsByNamespaceAndName",
-			"GET",
-			"/api/iter8/namespaces/{namespace}/experiments/{name}",
-			handlers.Iter8ExperimentGet,
-			true,
-		},
-		// swagger:route GET /iter8/experiments iter8 iter8Experiments
-		// ---
-		// Endpoint to fetch iter8 experiments for all namespaces user have access.
-		// User can define a comman separated list of namespaces.
-		//
-		// 		Produces:
-		//		- application/json
-		//
-		//		Schemes: http, https
-		//
-		// responses:
-		//		500: internalError
-		//		200: iter8ExperimentsResponse
-		{
-			"Iter8Experiments",
-			"GET",
-			"/api/iter8/experiments",
-			handlers.Iter8Experiments,
-			true,
-		},
-
-		// swagger:route POST /iter8/namespaces/{namespace}/experiments iter8 postIter8Experiments
-		// ---
-		// Endpoint to create new iter8 experiments for a given namespace.
-		//
-		// 		Produces:
-		//		- application/json
-		//
-		//		Schemes: http, https
-		//
-		// responses:
-		//		500: internalError
-		//		200: iter8ExperimentGetDetailResponse
-		{
-			Name:          "Iter8ExperimentCreate",
-			Method:        "POST",
-			Pattern:       "/api/iter8/namespaces/{namespace}/experiments",
-			HandlerFunc:   handlers.Iter8ExperimentCreate,
-			Authenticated: true,
-		},
-		// swagger:route PATCH /iter8/experiments/{namespace}/name/{name} iter8 patchIter8Experiments
-		// ---
-		// Endpoint to update new iter8 experiment (for abort purpose)
-		//
-		// 		Produces:
-		//		- application/json
-		//
-		//		Schemes: http, https
-		//
-		// responses:
-		//		500: internalError
-		//		200: iter8ExperimentGetDetailResponse
-		{
-			Name:          "Iter8ExperimentsUpdate",
-			Method:        "PATCH",
-			Pattern:       "/api/iter8/namespaces/{namespace}/experiments/{name}",
-			HandlerFunc:   handlers.Iter8ExperimentUpdate,
-			Authenticated: true,
-		},
-		// swagger:route DELETE /iter8/experiments/namespaces/{namespace}/name/{name} iter8 deleteIter8Experiments
-		// ---
-		// Endpoint to delete   iter8 experiments
-		//
-		// 		Produces:
-		//		- application/json
-		//
-		//		Schemes: http, https
-		//
-		// responses:
-		//		500: internalError
-		//		200: iter8StatusResponse
-		{
-			Name:          "Iter8ExperimentDelete",
-			Method:        "DELETE",
-			Pattern:       "/api/iter8/namespaces/{namespace}/experiments/{name}",
-			HandlerFunc:   handlers.Iter8ExperimentDelete,
-			Authenticated: true,
-		},
-		// swagger:route GET /iter8/metrics
-		// ---
-		// Endpoint to get the analytics metrics
-		//
-		//              Produces:
-		//              - application/json
-		//
-		//              Schemes: http, https
-		//
-		// responses:
-		//              500: internalError
-		//              200: iter8StatusResponse
-		{
-			"Iter8Metrics",
-			"GET",
-			"/api/iter8/metrics",
-			handlers.Iter8Metrics,
-			true,
-		},
-		// swagger:route GET /api/iter8/namespaces/{namespace}/experiments/{name}/yaml
-		// ---
-		// Endpoint to get the analytics metrics
-		//
-		//              Produces:
-		//              - application/json
-		//
-		//              Schemes: http, https
-		//
-		// responses:
-		//              500: internalError
-		//              200: iter8StatusResponse
-		{
-			"Iter8ExperimentGetYaml",
-			"GET",
-			"/api/iter8/namespaces/{namespace}/experiments/{name}/yaml",
-			handlers.Iter8ExperimentGetYaml,
-			true,
-		},
-
 		// swagger:route POST /stats/metrics stats metricsStats
 		// ---
 		// Produces metrics statistics
@@ -1564,25 +1527,6 @@ func NewRoutes() (r *Routes) {
 			HandlerFunc:   handlers.MetricsStats,
 			Authenticated: true,
 		},
-		// swagger:route GET /api/clusters
-		// ---
-		// Endpoint to get the list of the clusters that are hosting the service mesh.
-		//              Produces:
-		//              - application/json
-		//
-		//              Schemes: http, https
-		//
-		// responses:
-		//              500: internalError
-		//              200: clustersResponse
-		{
-			"GetClusters",
-			"GET",
-			"/api/clusters",
-			handlers.GetClusters,
-			true,
-		},
 	}
-
 	return
 }

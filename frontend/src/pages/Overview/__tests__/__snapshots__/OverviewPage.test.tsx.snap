@@ -1,0 +1,39 @@
+// Jest Snapshot v1, https://goo.gl/fbAQLP
+
+exports[`Overview page renders initial layout 1`] = `
+<Fragment>
+  <Connect(OverviewToolbarComponent)
+    displayMode={1}
+    onError={[Function]}
+    onRefresh={[Function]}
+    setDisplayMode={[Function]}
+    sort={[Function]}
+    statefulFilterRef={
+      Object {
+        "current": null,
+      }
+    }
+  />
+  <EmptyState
+    className="kiali_f1grtvu0"
+    variant="full"
+  >
+    <EmptyStateHeader
+      headingLevel="h5"
+      titleText="No unfiltered namespaces"
+    />
+    <EmptyStateBody>
+      Either all namespaces are being filtered or the user has no permission to access namespaces.
+    </EmptyStateBody>
+  </EmptyState>
+  <OverviewTrafficPolicies
+    duration={600}
+    hideConfirmModal={[Function]}
+    isOpen={false}
+    kind=""
+    load={[Function]}
+    nsTarget=""
+    opTarget=""
+  />
+</Fragment>
+`;

@@ -43,16 +43,16 @@ func TestGetServiceMetrics(t *testing.T) {
 	q.Quantiles = []string{"0.99"}
 
 	labels := `reporter="source",destination_service_name="productpage",destination_service_namespace="bookinfo"`
-	api.MockRangeRounded("sum(rate(istio_requests_total{"+labels+"}[5m]))", 2.5)
-	api.MockRangeErrRounded("sum(rate(istio_requests_total{"+labels+`,response_code=~"^0$|^[4-5]\\d\\d$"}[5m])) OR sum(rate(istio_requests_total{`+labels+`,grpc_response_status=~"^[1-9]$|^1[0-6]$",response_code!~"^0$|^[4-5]\\d\\d$"}[5m]))`, 4.5)
-	api.MockRangeRounded("sum(rate(istio_request_bytes_sum{"+labels+"}[5m]))", 1000)
-	api.MockRangeRounded("sum(rate(istio_response_bytes_sum{"+labels+"}[5m]))", 1001)
-	api.MockRangeRounded("sum(rate(istio_request_messages_total{"+labels+"}[5m]))", 10)
-	api.MockRangeRounded("sum(rate(istio_response_messages_total{"+labels+"}[5m]))", 20)
-	api.MockRangeRounded("sum(rate(istio_tcp_received_bytes_total{"+labels+"}[5m]))", 11)
-	api.MockRangeRounded("sum(rate(istio_tcp_sent_bytes_total{"+labels+"}[5m]))", 13)
-	api.MockRangeRounded("sum(rate(istio_tcp_connections_closed_total{"+labels+"}[5m]))", 31)
-	api.MockRangeRounded("sum(rate(istio_tcp_connections_opened_total{"+labels+"}[5m]))", 32)
+	api.MockRange("sum(rate(istio_requests_total{"+labels+"}[5m]))", 2.5)
+	api.MockRangeErr("sum(rate(istio_requests_total{"+labels+`,response_code=~"^0$|^[4-5]\\d\\d$"}[5m])) OR sum(rate(istio_requests_total{`+labels+`,grpc_response_status=~"^[1-9]$|^1[0-6]$",response_code!~"^0$|^[4-5]\\d\\d$"}[5m]))`, 4.5)
+	api.MockRange("sum(rate(istio_request_bytes_sum{"+labels+"}[5m]))", 1000)
+	api.MockRange("sum(rate(istio_response_bytes_sum{"+labels+"}[5m]))", 1001)
+	api.MockRange("sum(rate(istio_request_messages_total{"+labels+"}[5m]))", 10)
+	api.MockRange("sum(rate(istio_response_messages_total{"+labels+"}[5m]))", 20)
+	api.MockRange("sum(rate(istio_tcp_received_bytes_total{"+labels+"}[5m]))", 11)
+	api.MockRange("sum(rate(istio_tcp_sent_bytes_total{"+labels+"}[5m]))", 13)
+	api.MockRange("sum(rate(istio_tcp_connections_closed_total{"+labels+"}[5m]))", 31)
+	api.MockRange("sum(rate(istio_tcp_connections_opened_total{"+labels+"}[5m]))", 32)
 	api.MockHistoRange("istio_request_bytes", "{"+labels+"}[5m]", 0.35, 0.2, 0.3, 0.7)
 	api.MockHistoRange("istio_request_duration_seconds", "{"+labels+"}[5m]", 0.35, 0.2, 0.3, 0.8)
 	api.MockHistoRange("istio_request_duration_milliseconds", "{"+labels+"}[5m]", 0.35, 0.2, 0.3, 0.8)
@@ -95,8 +95,8 @@ func TestGetServiceMetrics(t *testing.T) {
 	assertHisto(assert, rqSizeIn, "0.99", 0.7)
 	assertHisto(assert, rqDurationMillisIn, "0.99", 0.8)
 	assertHisto(assert, rsSizeIn, "0.99", 0.9)
-	assert.Equal(11.0, float64(tcpRecIn[0].Datapoints[0].Value))
-	assert.Equal(13.0, float64(tcpSentIn[0].Datapoints[0].Value))
+	assert.Equal(13.0, float64(tcpRecIn[0].Datapoints[0].Value))  // L4 Telemetry is backwards
+	assert.Equal(11.0, float64(tcpSentIn[0].Datapoints[0].Value)) // L4 Telemetry is backwards
 }
 
 func assertHisto(assert *assert.Assertions, metrics []models.Metric, stat string, expected float64) {
@@ -127,16 +127,16 @@ func TestGetAppMetrics(t *testing.T) {
 		return
 	}
 	labels := `reporter="source",source_workload_namespace="bookinfo",source_canonical_service="productpage"`
-	api.MockRangeRounded("sum(rate(istio_requests_total{"+labels+"}[5m]))", 1.5)
-	api.MockRangeErrRounded("sum(rate(istio_requests_total{"+labels+`,response_code=~"^0$|^[4-5]\\d\\d$"}[5m])) OR sum(rate(istio_requests_total{`+labels+`,grpc_response_status=~"^[1-9]$|^1[0-6]$",response_code!~"^0$|^[4-5]\\d\\d$"}[5m]))`, 3.5)
-	api.MockRangeRounded("sum(rate(istio_request_bytes_sum{"+labels+"}[5m]))", 1000)
-	api.MockRangeRounded("sum(rate(istio_response_bytes_sum{"+labels+"}[5m]))", 1001)
-	api.MockRangeRounded("sum(rate(istio_request_messages_total{"+labels+"}[5m]))", 10)
-	api.MockRangeRounded("sum(rate(istio_response_messages_total{"+labels+"}[5m]))", 20)
-	api.MockRangeRounded("sum(rate(istio_tcp_received_bytes_total{"+labels+"}[5m]))", 10)
-	api.MockRangeRounded("sum(rate(istio_tcp_sent_bytes_total{"+labels+"}[5m]))", 12)
-	api.MockRangeRounded("sum(rate(istio_tcp_connections_closed_total{"+labels+"}[5m]))", 31)
-	api.MockRangeRounded("sum(rate(istio_tcp_connections_opened_total{"+labels+"}[5m]))", 32)
+	api.MockRange("sum(rate(istio_requests_total{"+labels+"}[5m]))", 1.5)
+	api.MockRangeErr("sum(rate(istio_requests_total{"+labels+`,response_code=~"^0$|^[4-5]\\d\\d$"}[5m])) OR sum(rate(istio_requests_total{`+labels+`,grpc_response_status=~"^[1-9]$|^1[0-6]$",response_code!~"^0$|^[4-5]\\d\\d$"}[5m]))`, 3.5)
+	api.MockRange("sum(rate(istio_request_bytes_sum{"+labels+"}[5m]))", 1000)
+	api.MockRange("sum(rate(istio_response_bytes_sum{"+labels+"}[5m]))", 1001)
+	api.MockRange("sum(rate(istio_request_messages_total{"+labels+"}[5m]))", 10)
+	api.MockRange("sum(rate(istio_response_messages_total{"+labels+"}[5m]))", 20)
+	api.MockRange("sum(rate(istio_tcp_received_bytes_total{"+labels+"}[5m]))", 10)
+	api.MockRange("sum(rate(istio_tcp_sent_bytes_total{"+labels+"}[5m]))", 12)
+	api.MockRange("sum(rate(istio_tcp_connections_closed_total{"+labels+"}[5m]))", 31)
+	api.MockRange("sum(rate(istio_tcp_connections_opened_total{"+labels+"}[5m]))", 32)
 	api.MockHistoRange("istio_request_bytes", "{"+labels+"}[5m]", 0.35, 0.2, 0.3, 0.4)
 	api.MockHistoRange("istio_request_duration_seconds", "{"+labels+"}[5m]", 0.35, 0.2, 0.3, 0.5)
 	api.MockHistoRange("istio_request_duration_milliseconds", "{"+labels+"}[5m]", 0.35, 0.2, 0.3, 0.5)
@@ -188,8 +188,8 @@ func TestGetAppMetrics(t *testing.T) {
 	assertHisto(assert, rqSizeIn, "0.99", 0.4)
 	assertHisto(assert, rqDurationMillisIn, "0.99", 0.5)
 	assertHisto(assert, rsSizeIn, "0.99", 0.6)
-	assert.Equal(10.0, float64(tcpRecIn[0].Datapoints[0].Value))
-	assert.Equal(12.0, float64(tcpSentIn[0].Datapoints[0].Value))
+	assert.Equal(12.0, float64(tcpRecIn[0].Datapoints[0].Value))  // L4 Telemetry is backwards
+	assert.Equal(10.0, float64(tcpSentIn[0].Datapoints[0].Value)) // L4 Telemetry is backwards
 }
 
 func TestGetFilteredAppMetrics(t *testing.T) {
@@ -199,7 +199,7 @@ func TestGetFilteredAppMetrics(t *testing.T) {
 		t.Error(err)
 		return
 	}
-	api.MockRangeRounded(`sum(rate(istio_requests_total{reporter="source",source_workload_namespace="bookinfo",source_canonical_service="productpage"}[5m]))`, 1.5)
+	api.MockRange(`sum(rate(istio_requests_total{reporter="source",source_workload_namespace="bookinfo",source_canonical_service="productpage"}[5m]))`, 1.5)
 	api.MockHistoRange("istio_request_bytes", `{reporter="source",source_workload_namespace="bookinfo",source_canonical_service="productpage"}[5m]`, 0.35, 0.2, 0.3, 0.4)
 	q := models.IstioMetricsQuery{
 		Namespace: "bookinfo",
@@ -225,7 +225,7 @@ func TestGetAppMetricsInstantRates(t *testing.T) {
 		t.Error(err)
 		return
 	}
-	api.MockRangeRounded(`sum(irate(istio_requests_total{reporter="source",source_workload_namespace="bookinfo",source_canonical_service="productpage"}[1m]))`, 1.5)
+	api.MockRange(`sum(irate(istio_requests_total{reporter="source",source_workload_namespace="bookinfo",source_canonical_service="productpage"}[1m]))`, 1.5)
 	q := models.IstioMetricsQuery{
 		Namespace: "bookinfo",
 		App:       "productpage",
@@ -249,7 +249,7 @@ func TestGetAppMetricsUnavailable(t *testing.T) {
 		return
 	}
 	// Mock everything to return empty data
-	api.MockEmptyRangeRounded(`sum(rate(istio_requests_total{reporter="source",source_workload_namespace="bookinfo",source_canonical_service="productpage"}[5m]))`)
+	api.MockEmptyRange(`sum(rate(istio_requests_total{reporter="source",source_workload_namespace="bookinfo",source_canonical_service="productpage"}[5m]))`)
 	api.MockEmptyHistoRange("istio_request_bytes", `{reporter="source",source_workload_namespace="bookinfo",source_canonical_service="productpage"}[5m]`)
 	q := models.IstioMetricsQuery{
 		Namespace: "bookinfo",
@@ -284,16 +284,16 @@ func TestGetNamespaceMetrics(t *testing.T) {
 		return
 	}
 	labels := `reporter="source",source_workload_namespace="bookinfo"`
-	api.MockRangeRounded("sum(rate(istio_requests_total{"+labels+"}[5m]))", 1.5)
-	api.MockRangeErrRounded("sum(rate(istio_requests_total{"+labels+`,response_code=~"^0$|^[4-5]\\d\\d$"}[5m])) OR sum(rate(istio_requests_total{`+labels+`,grpc_response_status=~"^[1-9]$|^1[0-6]$",response_code!~"^0$|^[4-5]\\d\\d$"}[5m]))`, 3.5)
-	api.MockRangeRounded("sum(rate(istio_request_bytes_sum{"+labels+"}[5m]))", 1000)
-	api.MockRangeRounded("sum(rate(istio_response_bytes_sum{"+labels+"}[5m]))", 1001)
-	api.MockRangeRounded("sum(rate(istio_request_messages_total{"+labels+"}[5m]))", 10)
-	api.MockRangeRounded("sum(rate(istio_response_messages_total{"+labels+"}[5m]))", 20)
-	api.MockRangeRounded("sum(rate(istio_tcp_received_bytes_total{"+labels+"}[5m]))", 10)
-	api.MockRangeRounded("sum(rate(istio_tcp_sent_bytes_total{"+labels+"}[5m]))", 12)
-	api.MockRangeRounded("sum(rate(istio_tcp_connections_closed_total{"+labels+"}[5m]))", 31)
-	api.MockRangeRounded("sum(rate(istio_tcp_connections_opened_total{"+labels+"}[5m]))", 32)
+	api.MockRange("sum(rate(istio_requests_total{"+labels+"}[5m]))", 1.5)
+	api.MockRangeErr("sum(rate(istio_requests_total{"+labels+`,response_code=~"^0$|^[4-5]\\d\\d$"}[5m])) OR sum(rate(istio_requests_total{`+labels+`,grpc_response_status=~"^[1-9]$|^1[0-6]$",response_code!~"^0$|^[4-5]\\d\\d$"}[5m]))`, 3.5)
+	api.MockRange("sum(rate(istio_request_bytes_sum{"+labels+"}[5m]))", 1000)
+	api.MockRange("sum(rate(istio_response_bytes_sum{"+labels+"}[5m]))", 1001)
+	api.MockRange("sum(rate(istio_request_messages_total{"+labels+"}[5m]))", 10)
+	api.MockRange("sum(rate(istio_response_messages_total{"+labels+"}[5m]))", 20)
+	api.MockRange("sum(rate(istio_tcp_received_bytes_total{"+labels+"}[5m]))", 10)
+	api.MockRange("sum(rate(istio_tcp_sent_bytes_total{"+labels+"}[5m]))", 12)
+	api.MockRange("sum(rate(istio_tcp_connections_closed_total{"+labels+"}[5m]))", 31)
+	api.MockRange("sum(rate(istio_tcp_connections_opened_total{"+labels+"}[5m]))", 32)
 	api.MockHistoRange("istio_request_bytes", "{"+labels+"}[5m]", 0.35, 0.2, 0.3, 0.4)
 	api.MockHistoRange("istio_request_duration_seconds", "{"+labels+"}[5m]", 0.35, 0.2, 0.3, 0.5)
 	api.MockHistoRange("istio_request_duration_milliseconds", "{"+labels+"}[5m]", 0.35, 0.2, 0.3, 0.5)
@@ -344,8 +344,8 @@ func TestGetNamespaceMetrics(t *testing.T) {
 	assertHisto(assert, rqSizeOut, "0.99", 0.4)
 	assertHisto(assert, rqDurationMillisOut, "0.99", 0.5)
 	assertHisto(assert, rsSizeOut, "0.99", 0.6)
-	assert.Equal(10.0, float64(tcpRecOut[0].Datapoints[0].Value))
-	assert.Equal(12.0, float64(tcpSentOut[0].Datapoints[0].Value))
+	assert.Equal(12.0, float64(tcpRecOut[0].Datapoints[0].Value))  // L4 Telemetry is backwards
+	assert.Equal(10.0, float64(tcpSentOut[0].Datapoints[0].Value)) // L4 Telemetry is backwards
 }
 
 func TestCreateMetricsLabelsBuilder(t *testing.T) {

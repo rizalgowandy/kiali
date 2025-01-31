@@ -3,8 +3,11 @@ package models
 import (
 	"encoding/json"
 
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
 	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/log"
+	"github.com/kiali/kiali/util"
 )
 
 // NamespaceValidations represents a set of IstioValidations grouped by namespace
@@ -12,9 +15,10 @@ type NamespaceValidations map[string]IstioValidations
 
 // IstioValidationKey is the key value composed of an Istio ObjectType and Name.
 type IstioValidationKey struct {
-	ObjectType string `json:"objectType"`
-	Name       string `json:"name"`
-	Namespace  string `json:"namespace"`
+	ObjectGVK schema.GroupVersionKind `json:"objectGVK"`
+	Name      string                  `json:"name"`
+	Namespace string                  `json:"namespace"`
+	Cluster   string                  `json:"cluster"`
 }
 
 // IstioValidationSummary represents the number of errors/warnings of a set of Istio Validations.
@@ -31,7 +35,18 @@ type IstioValidationSummary struct {
 	// required: true
 	// example: 4
 	Warnings int `json:"warnings"`
+	// Namespace of the Istio Objects.
+	// required: true
+	// example: bookinfo
+	Namespace string `json:"namespace"`
+	// Cluster of the Istio Objects.
+	// required: true
+	// example: east
+	Cluster string `json:"cluster"`
 }
+
+// ValidationSummaries holds a map of IstioValidationSummary per cluster and namespace
+type ValidationSummaries map[string]map[string]*IstioValidationSummary
 
 // IstioValidations represents a set of IstioValidation grouped by IstioValidationKey.
 type IstioValidations map[IstioValidationKey]*IstioValidation
@@ -44,10 +59,20 @@ type IstioValidation struct {
 	// example: reviews
 	Name string `json:"name"`
 
+	// Namespace of the object
+	// required: true
+	// example: bookinfo
+	Namespace string `json:"namespace"`
+
+	// Cluster of the object
+	// required: true
+	// example: east
+	Cluster string `json:"cluster"`
+
 	// Type of the object
 	// required: true
-	// example: virtualservice
-	ObjectType string `json:"objectType"`
+	// example: group=networking.istio.io, version=v1, kind=Gateway
+	ObjectGVK schema.GroupVersionKind `json:"objectGVK"`
 
 	// Represents validity of the object: in case of warning, validity remains as true
 	// required: true
@@ -92,28 +117,20 @@ const (
 	Unknown         SeverityLevel = "unknown"
 )
 
-var ObjectTypeSingular = map[string]string{
-	"gateways":               "gateway",
-	"virtualservices":        "virtualservice",
-	"destinationrules":       "destinationrule",
-	"serviceentries":         "serviceentry",
-	"rules":                  "rule",
-	"quotaspecs":             "quotaspec",
-	"quotaspecbindings":      "quotaspecbinding",
-	"policies":               "policy",
-	"serviceroles":           "servicerole",
-	"servicerolebindings":    "servicerolebinding",
-	"clusterrbacconfigs":     "clusterrbacconfig",
-	"authorizationpolicies":  "authorizationpolicy",
-	"sidecars":               "sidecar",
-	"peerauthentications":    "peerauthentication",
-	"requestauthentications": "requestauthentication",
-}
-
 var checkDescriptors = map[string]IstioCheck{
 	"authorizationpolicy.source.namespacenotfound": {
 		Code:     "KIA0101",
 		Message:  "Namespace not found for this rule",
+		Severity: WarningSeverity,
+	},
+	"authorizationpolicy.source.principalnotfound": {
+		Code:     "KIA0106",
+		Message:  "Service Account not found for this principal",
+		Severity: ErrorSeverity,
+	},
+	"authorizationpolicy.source.principalremote": {
+		Code:     "KIA0107",
+		Message:  "Service Account for this principal is on remote cluster",
 		Severity: WarningSeverity,
 	},
 	"authorizationpolicy.to.wrongmethod": {
@@ -206,6 +223,41 @@ var checkDescriptors = map[string]IstioCheck{
 		Message:  "No matching workload found for the selector in this namespace",
 		Severity: WarningSeverity,
 	},
+	"k8sgateways.gatewayclassnotfound": {
+		Code:     "KIA1504",
+		Message:  "Gateway API Class not found in Kiali configuration",
+		Severity: ErrorSeverity,
+	},
+	"k8sgateways.multimatch.listener": {
+		Code:     "KIA1501",
+		Message:  "More than one K8s Gateway for the same host port combination",
+		Severity: WarningSeverity,
+	},
+	"k8sgateways.multimatch.ip": {
+		Code:     "KIA1502",
+		Message:  "More than one K8s Gateway for the same address and type combination",
+		Severity: WarningSeverity,
+	},
+	"k8sgateways.unique.listener": {
+		Code:     "KIA1503",
+		Message:  "Each listener must have a unique combination of Hostname, Port, and Protocol",
+		Severity: ErrorSeverity,
+	},
+	"k8sreferencegrants.from.namespacenotfound": {
+		Code:     "KIA1601",
+		Message:  "Namespace is not found or is not accessible",
+		Severity: ErrorSeverity,
+	},
+	"k8sroutes.nohost.namenotfound": {
+		Code:     "KIA1402",
+		Message:  "Reference doesn't have a valid service (Service name not found)",
+		Severity: ErrorSeverity,
+	},
+	"k8sroutes.nok8sgateway": {
+		Code:     "KIA1401",
+		Message:  "Route is pointing to a non-existent or inaccessible K8s gateway",
+		Severity: ErrorSeverity,
+	},
 	"peerauthentication.mtls.destinationrulemissing": {
 		Code:     "KIA0401",
 		Message:  "Mesh-wide Destination Rule enabling mTLS is missing",
@@ -226,6 +278,11 @@ var checkDescriptors = map[string]IstioCheck{
 		Message:  "Destination Rule disabling mesh-wide mTLS is missing",
 		Severity: ErrorSeverity,
 	},
+	"port.appprotocol.mismatch": {
+		Code:     "KIA0602",
+		Message:  "Port appProtocol must follow <protocol> form",
+		Severity: ErrorSeverity,
+	},
 	"port.name.mismatch": {
 		Code:     "KIA0601",
 		Message:  "Port name must follow <protocol>[-suffix] form",
@@ -236,25 +293,10 @@ var checkDescriptors = map[string]IstioCheck{
 		Message:  "Deployment exposing same port as Service not found",
 		Severity: WarningSeverity,
 	},
-	"servicerole.invalid.services": {
-		Code:     "KIA0901",
-		Message:  "Unable to find all the defined services",
-		Severity: ErrorSeverity,
-	},
-	"servicerole.invalid.namespace": {
-		Code:     "KIA0902",
-		Message:  "ServiceRole can only point to current namespace",
-		Severity: ErrorSeverity,
-	},
-	"servicerolebinding.invalid.role": {
-		Code:     "KIA0903",
-		Message:  "ServiceRole does not exists in this namespace",
-		Severity: ErrorSeverity,
-	},
-	"sidecar.egress.invalidhostformat": {
-		Code:     "KIA1003",
-		Message:  "Invalid host format. 'namespace/dnsName' format expected",
-		Severity: ErrorSeverity,
+	"serviceentries.workloadentries.addressmatch": {
+		Code:     "KIA1201",
+		Message:  "Missing one or more addresses from matching WorkloadEntries",
+		Severity: WarningSeverity,
 	},
 	"sidecar.egress.servicenotfound": {
 		Code:     "KIA1004",
@@ -265,6 +307,11 @@ var checkDescriptors = map[string]IstioCheck{
 		Code:     "KIA1006",
 		Message:  "Global default sidecar should not have workloadSelector",
 		Severity: WarningSeverity,
+	},
+	"sidecar.outboundtrafficpolicy.mode.ambiguous": {
+		Code:     "KIA1007",
+		Message:  "OutboundTrafficPolicy with empty mode value is ambiguous due to an Istio limitation. This may indicate ALLOW_ANY or REGISTRY_ONLY. Inspect the value using other means.",
+		Severity: Unknown,
 	},
 	"virtualservices.gateway.oldnomenclature": {
 		Code:     "KIA1108",
@@ -281,11 +328,6 @@ var checkDescriptors = map[string]IstioCheck{
 		Message:  "VirtualService is pointing to a non-existent gateway",
 		Severity: ErrorSeverity,
 	},
-	"virtualservices.nohost.invalidprotocol": {
-		Code:     "KIA1103",
-		Message:  "VirtualService doesn't define any valid route protocol",
-		Severity: ErrorSeverity,
-	},
 	"virtualservices.route.singleweight": {
 		Code:     "KIA1104",
 		Message:  "The weight is assumed to be 100 because there is only one route destination",
@@ -293,7 +335,7 @@ var checkDescriptors = map[string]IstioCheck{
 	},
 	"virtualservices.route.repeatedsubset": {
 		Code:     "KIA1105",
-		Message:  "This subset is already referenced in another route destination",
+		Message:  "This host subset combination is already referenced in another route destination",
 		Severity: WarningSeverity,
 	},
 	"virtualservices.singlehost": {
@@ -306,10 +348,20 @@ var checkDescriptors = map[string]IstioCheck{
 		Message:  "Subset not found",
 		Severity: WarningSeverity,
 	},
-	"validation.unable.cross-namespace": {
-		Code:     "KIA0001",
-		Message:  "Unable to verify the validity, cross-namespace validation is not supported for this field",
-		Severity: Unknown,
+	"workload.authorizationpolicy.needstobecovered": {
+		Code:     "KIA1301",
+		Message:  "This workload is not covered by any authorization policy",
+		Severity: WarningSeverity,
+	},
+	"workloadgroup.labels.duplicate": {
+		Code:     "KIA1702",
+		Message:  "More than one Workload Group with duplicate labels found in the same namespace",
+		Severity: WarningSeverity,
+	},
+	"workloadgroup.template.serviceaccount.notfound": {
+		Code:     "KIA1701",
+		Message:  "Service Account not found in this namespace",
+		Severity: WarningSeverity,
 	},
 }
 
@@ -319,8 +371,8 @@ func Build(checkId string, path string) IstioCheck {
 	return check
 }
 
-func BuildKey(objectType, name, namespace string) IstioValidationKey {
-	return IstioValidationKey{ObjectType: objectType, Namespace: namespace, Name: name}
+func BuildKey(objectGVK schema.GroupVersionKind, name, namespace, cluster string) IstioValidationKey {
+	return IstioValidationKey{Cluster: cluster, ObjectGVK: objectGVK, Namespace: namespace, Name: name}
 }
 
 func CheckMessage(checkId string) string {
@@ -335,11 +387,11 @@ func (ic IstioCheck) GetFullMessage() string {
 	return ic.Code + " " + ic.Message
 }
 
-func (iv IstioValidations) FilterBySingleType(objectType, name string) IstioValidations {
+func (iv IstioValidations) FilterBySingleType(objectGVK schema.GroupVersionKind, name string) IstioValidations {
 	fiv := IstioValidations{}
 	for k, v := range iv {
 		// We don't want to filter other types
-		if k.ObjectType != objectType {
+		if k.ObjectGVK != objectGVK {
 			fiv[k] = v
 		} else {
 			// But for this exact type we're strict
@@ -352,10 +404,10 @@ func (iv IstioValidations) FilterBySingleType(objectType, name string) IstioVali
 	return fiv
 }
 
-func (iv IstioValidations) FilterByKey(objectType, name string) IstioValidations {
+func (iv IstioValidations) FilterByKey(objectGVK schema.GroupVersionKind, name string) IstioValidations {
 	fiv := IstioValidations{}
 	for k, v := range iv {
-		if k.Name == name && k.ObjectType == objectType {
+		if k.Name == name && k.ObjectGVK == objectGVK {
 			fiv[k] = v
 		}
 	}
@@ -367,11 +419,11 @@ func (iv IstioValidations) FilterByKey(objectType, name string) IstioValidations
 func (iv IstioValidations) FilterByTypes(objectTypes []string) IstioValidations {
 	types := make(map[string]bool, len(objectTypes))
 	for _, objectType := range objectTypes {
-		types[ObjectTypeSingular[objectType]] = true
+		types[objectType] = true
 	}
 	fiv := IstioValidations{}
 	for k, v := range iv {
-		if _, found := types[k.ObjectType]; found {
+		if _, found := types[k.ObjectGVK.String()]; found {
 			fiv[k] = v
 		}
 	}
@@ -424,14 +476,17 @@ func (iv IstioValidations) MergeReferences(validations IstioValidations) IstioVa
 	return iv
 }
 
-func (iv IstioValidations) SummarizeValidation(ns string) IstioValidationSummary {
-	ivs := IstioValidationSummary{}
+func (iv IstioValidations) SummarizeValidation(ns string, cluster string) *IstioValidationSummary {
+	ivs := IstioValidationSummary{
+		Namespace: ns,
+		Cluster:   cluster,
+	}
 	for k, v := range iv {
-		if k.Namespace == ns {
+		if k.Namespace == ns && k.Cluster == cluster && k.ObjectGVK.Kind != "workload" {
 			ivs.mergeSummaries(v.Checks)
 		}
 	}
-	return ivs
+	return &ivs
 }
 
 func (summary *IstioValidationSummary) mergeSummaries(cs []*IstioCheck) {
@@ -449,13 +504,51 @@ func (summary *IstioValidationSummary) mergeSummaries(cs []*IstioCheck) {
 func (iv IstioValidations) MarshalJSON() ([]byte, error) {
 	out := make(map[string]map[string]*IstioValidation)
 	for k, v := range iv {
-		_, ok := out[k.ObjectType]
-		if !ok {
-			out[k.ObjectType] = make(map[string]*IstioValidation)
+		key := k.ObjectGVK.String()
+		if k.ObjectGVK.Group == "" {
+			// wor workloads, apps and services
+			key = k.ObjectGVK.Kind
 		}
-		out[k.ObjectType][k.Name] = v
+		_, ok := out[key]
+		if !ok {
+			out[key] = make(map[string]*IstioValidation)
+		}
+		out[key][util.BuildNameNSKey(k.Name, k.Namespace)] = v
 	}
 	return json.Marshal(out)
+}
+
+func (iv *IstioValidations) UnmarshalJSON(data []byte) error {
+	temp := make(map[string]map[string]*IstioValidation)
+
+	if err := json.Unmarshal(data, &temp); err != nil {
+		return err
+	}
+
+	*iv = make(IstioValidations)
+	for gvkString, innerMap := range temp {
+		// Parse the GVK string back into a schema.GroupVersionKind
+		gvk, err := util.StringToGVK(gvkString)
+		if err != nil {
+			return err
+		}
+
+		for nameNs, validation := range innerMap {
+			// Split the Name.Namespace key into its components
+			name, namespace := util.ParseNameNSKey(nameNs)
+
+			validationKey := IstioValidationKey{
+				ObjectGVK: gvk,
+				Name:      name,
+				Namespace: namespace,
+				Cluster:   "", // @TODO multicluster validations
+			}
+
+			(*iv)[validationKey] = validation
+		}
+	}
+
+	return nil
 }
 
 func (iv *IstioValidations) StripIgnoredChecks() {
@@ -470,7 +563,7 @@ func (iv *IstioValidations) StripIgnoredChecks() {
 				for _, cti := range codesToIgnore {
 					if cti == curCheck.Code {
 						ignoreCheck = true
-						log.Infof("Ignoring validation failure [%+v] for object [%s:%s] in namespace [%s]", curCheck, curValidationKey.ObjectType, curValidationKey.Name, curValidationKey.Namespace)
+						log.Tracef("Ignoring validation failure [%+v] for object [%s:%s] in namespace [%s]", curCheck, curValidationKey.ObjectGVK.String(), curValidationKey.Name, curValidationKey.Namespace)
 						break
 					}
 				}

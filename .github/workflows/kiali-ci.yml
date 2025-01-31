@@ -1,46 +1,119 @@
-name: Kiali Go CI
+name: Kiali CI
 
 on:
+  # Run on master and release branches
   push:
-    branches: [ master ]
+    branches:
+    - master
+    - v*.*
+    paths-ignore:
+    - "design/**"
+    - "**/*.md"
+    - "**/*.adoc"
   pull_request:
-    branches: [ master ]
+    branches:
+    - master
+    - v*.*
+    paths-ignore:
+    - "design/**"
+    - "**/*.md"
+    - "**/*.adoc"
 
 jobs:
-
-  build:
-    name: Build
-    runs-on: ubuntu-20.04
+  initialize:
+    name: Initialize
+    runs-on: ubuntu-latest
+    outputs:
+      # This workflow can run on either a PR or release. GITHUB_BASE_REF is only
+      # set when this workflow is run against a PR. When run against a PR, we want
+      # to use the branch we are running against: GITHUB_BASE_REF. When run
+      # as a release, we want to use the current branch ref: GITHUB_REF_NAME.
+      target-branch: ${{ github.base_ref || github.ref_name }}
+      build-branch: ${{ env.branch-master || env.branch-pr }}
     steps:
+    # The initialize job gathers variables for later use in jobs.
+    # We are using this technique rather environment variables because at the moment, they won't work with reusable jobs.
+    # A positive side effect of this is that we can print all variables at start for debugging and troubleshooting.
+    - run: echo "target-branch -> ${{ github.base_ref || github.ref_name }}"
+    # For the building branch, if we are running agains a PR, we need to indicate in the branch that is coming from a PR
+    - run: |
+        echo "branch-version=${{ github.ref_name }}" >> $GITHUB_ENV
+        echo "build-branch -> ${{ github.ref_name }}"
+      id: branch-master
+      if: ${{ !github.base_ref }}
+    - run: |
+        echo "branch-pr=refs/pull/${{ github.ref_name }}" >> $GITHUB_ENV
+        echo "build-branch -> ${{ github.base_ref }}"
+      id: branch-pr
+      if: ${{ github.base_ref }}
 
-      - name: Set up Go
-        uses: actions/setup-go@v2
-        with:
-          go-version: 1.16.2
+  build_backend:
+    name: Build backend
+    uses: ./.github/workflows/build-backend.yml
+    needs: [initialize]
+    with:
+      build_branch: ${{ needs.initialize.outputs.build-branch }}
 
-      - name: Check out code into the Go module directory
-        uses: actions/checkout@v2
+  build_frontend:
+    name: Build frontend
+    uses: ./.github/workflows/build-frontend.yml
+    needs: [initialize]
+    with:
+      target_branch: ${{ needs.initialize.outputs.target-branch }}
+      build_branch: ${{ needs.initialize.outputs.build-branch }}
 
-      - name: Swagger Install
-        run: make swagger-install
+  integration_tests_backend:
+    name: Run backend integration tests
+    uses: ./.github/workflows/integration-tests-backend.yml
+    needs: [initialize, build_backend, build_frontend]
+    with:
+      target_branch: ${{ needs.initialize.outputs.target-branch }}
+      build_branch: ${{ needs.initialize.outputs.build-branch }}
 
-      - name: Lint Install
-        run: make lint-install
+  integration_tests_backend_multicluster_external_controlplane:
+    name: Run backend multicluster external-controlplane integration tests
+    uses: ./.github/workflows/integration-tests-backend-multicluster-external-controlplane.yml
+    needs: [initialize, build_backend, build_frontend]
+    with:
+      target_branch: ${{ needs.initialize.outputs.target-branch }}
+      build_branch: ${{ needs.initialize.outputs.build-branch }}
 
-      - name: Gofmt
-        run: |
-          GO_FILES=$(find . -iname '*.go' -type f | grep -v /vendor/) # All the .go files, excluding vendor/
-          if [ ! -z "$(gofmt -l ${GO_FILES})" ]; then echo "These files need to be formatted:" "$(gofmt -l ${GO_FILES})";echo "Diff files:"; gofmt -d ${GO_FILES}; exit 1; fi # Gofmt Linter
-          echo "Done gofmt"
+  integration_tests_frontend:
+    name: Run frontend integration tests
+    uses: ./.github/workflows/integration-tests-frontend.yml
+    needs: [initialize, build_backend, build_frontend]
+    with:
+      target_branch: ${{ needs.initialize.outputs.target-branch }}
+      build_branch: ${{ needs.initialize.outputs.build-branch }}
 
-      - name: Verify code linting
-        run: make lint
+  integration_tests_frontend_multicluster_primary_remote:
+    name: Run frontend multicluster primary-remote integration tests
+    uses: ./.github/workflows/integration-tests-frontend-multicluster-primary-remote.yml
+    needs: [initialize, build_backend, build_frontend]
+    with:
+      target_branch: ${{ needs.initialize.outputs.target-branch }}
+      build_branch: ${{ needs.initialize.outputs.build-branch }}
 
-      - name: Verify swagger file
-        run: make swagger-ci
+  integration_tests_frontend_multicluster_multi_primary:
+    name: Run frontend multicluster multi-primary integration tests
+    uses: ./.github/workflows/integration-tests-frontend-multicluster-multi-primary.yml
+    needs: [initialize, build_backend, build_frontend]
+    with:
+      target_branch: ${{ needs.initialize.outputs.target-branch }}
+      build_branch: ${{ needs.initialize.outputs.build-branch }}
 
-      - name: Build
-        run: make clean build
+  integration_tests_frontend_ambient:
+    name: Run Ambient frontend integration tests
+    uses: ./.github/workflows/integration-tests-frontend-ambient.yml
+    needs: [initialize, build_backend, build_frontend]
+    with:
+      target_branch: ${{ needs.initialize.outputs.target-branch }}
+      build_branch: ${{ needs.initialize.outputs.build-branch }}
 
-      - name: Test
-        run: make test-race
+  integration_tests_frontend_tempo:
+    name: Run tracing frontend integration tests
+    uses: ./.github/workflows/integration-tests-frontend-tempo.yml
+    needs: [initialize, build_backend, build_frontend]
+    with:
+      target_branch: ${{ needs.initialize.outputs.target-branch }}
+      build_branch: ${{ needs.initialize.outputs.build-branch }}

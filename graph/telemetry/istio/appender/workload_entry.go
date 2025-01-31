@@ -1,6 +1,8 @@
 package appender
 
 import (
+	"context"
+
 	"github.com/kiali/kiali/business"
 	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/graph"
@@ -15,7 +17,7 @@ const WorkloadEntryAppenderName = "workloadEntry"
 // labels on both the trafficMap node and the WorkloadEntry object being equivalent.
 // A workload can have multiple matches.
 type WorkloadEntryAppender struct {
-	GraphType string
+	AccessibleNamespaces graph.AccessibleNamespaces
 }
 
 // Name implements Appender
@@ -23,8 +25,13 @@ func (a WorkloadEntryAppender) Name() string {
 	return WorkloadEntryAppenderName
 }
 
+// IsFinalizer implements Appender
+func (a WorkloadEntryAppender) IsFinalizer() bool {
+	return false
+}
+
 // AppendGraph implements Appender
-func (a WorkloadEntryAppender) AppendGraph(trafficMap graph.TrafficMap, globalInfo *graph.AppenderGlobalInfo, namespaceInfo *graph.AppenderNamespaceInfo) {
+func (a WorkloadEntryAppender) AppendGraph(trafficMap graph.TrafficMap, globalInfo *graph.GlobalInfo, namespaceInfo *graph.AppenderNamespaceInfo) {
 	if len(trafficMap) == 0 {
 		return
 	}
@@ -34,7 +41,7 @@ func (a WorkloadEntryAppender) AppendGraph(trafficMap graph.TrafficMap, globalIn
 	a.applyWorkloadEntries(trafficMap, globalInfo, namespaceInfo)
 }
 
-func (a WorkloadEntryAppender) applyWorkloadEntries(trafficMap graph.TrafficMap, globalInfo *graph.AppenderGlobalInfo, namespaceInfo *graph.AppenderNamespaceInfo) {
+func (a WorkloadEntryAppender) applyWorkloadEntries(trafficMap graph.TrafficMap, globalInfo *graph.GlobalInfo, namespaceInfo *graph.AppenderNamespaceInfo) {
 	appLabel := config.Get().IstioLabels.AppLabelName
 	versionLabel := config.Get().IstioLabels.VersionLabelName
 
@@ -49,9 +56,13 @@ func (a WorkloadEntryAppender) applyWorkloadEntries(trafficMap graph.TrafficMap,
 			continue
 		}
 
-		istioCfg, err := globalInfo.Business.IstioConfig.GetIstioConfigList(business.IstioConfigCriteria{
+		// Skip if the node is not accesible to the user, because we can't query for the config
+		if !a.isAccessible(n.Cluster, n.Namespace) {
+			continue
+		}
+
+		istioCfg, err := globalInfo.Business.IstioConfig.GetIstioConfigListForNamespace(context.TODO(), n.Cluster, n.Namespace, business.IstioConfigCriteria{
 			IncludeWorkloadEntries: true,
-			Namespace:              n.Namespace,
 		})
 		graph.CheckError(err)
 
@@ -71,4 +82,11 @@ func (a WorkloadEntryAppender) applyWorkloadEntries(trafficMap graph.TrafficMap,
 			}
 		}
 	}
+}
+
+// returns true if we have access to the cluster-specific namespace
+func (a *WorkloadEntryAppender) isAccessible(cluster, namespace string) bool {
+	key := graph.GetClusterSensitiveKey(cluster, namespace)
+	_, ok := a.AccessibleNamespaces[key]
+	return ok
 }

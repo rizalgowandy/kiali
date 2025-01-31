@@ -34,35 +34,66 @@ import (
 	"net/http"
 	"runtime/debug"
 
+	"github.com/kiali/kiali/business"
+	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/grafana"
 	"github.com/kiali/kiali/graph"
 	"github.com/kiali/kiali/graph/api"
+	"github.com/kiali/kiali/istio"
+	"github.com/kiali/kiali/kubernetes"
+	"github.com/kiali/kiali/kubernetes/cache"
 	"github.com/kiali/kiali/log"
+	"github.com/kiali/kiali/prometheus"
+	"github.com/kiali/kiali/tracing"
 )
 
 // GraphNamespaces is a REST http.HandlerFunc handling graph generation for 1 or more namespaces
-func GraphNamespaces(w http.ResponseWriter, r *http.Request) {
-	defer handlePanic(w)
 
-	o := graph.NewOptions(r)
+func GraphNamespaces(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	prom prometheus.ClientInterface,
+	cpm business.ControlPlaneMonitor,
+	traceClientLoader func() tracing.ClientInterface,
+	grafana *grafana.Service,
+	discovery *istio.Discovery,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		defer handlePanic(w)
 
-	business, err := getBusiness(r)
-	graph.CheckError(err)
+		business, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		graph.CheckError(err)
 
-	code, payload := api.GraphNamespaces(business, o)
-	respond(w, code, payload)
+		o := graph.NewOptions(r, &business.Namespace)
+
+		code, payload := api.GraphNamespaces(r.Context(), business, o)
+		respond(w, code, payload)
+	}
 }
 
 // GraphNode is a REST http.HandlerFunc handling node-detail graph config generation.
-func GraphNode(w http.ResponseWriter, r *http.Request) {
-	defer handlePanic(w)
+func GraphNode(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	prom prometheus.ClientInterface,
+	cpm business.ControlPlaneMonitor,
+	traceClientLoader func() tracing.ClientInterface,
+	grafana *grafana.Service,
+	discovery *istio.Discovery,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		defer handlePanic(w)
 
-	o := graph.NewOptions(r)
+		business, err := getLayer(r, conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, grafana, discovery)
+		graph.CheckError(err)
 
-	business, err := getBusiness(r)
-	graph.CheckError(err)
+		o := graph.NewOptions(r, &business.Namespace)
 
-	code, payload := api.GraphNode(business, o)
-	respond(w, code, payload)
+		code, payload := api.GraphNode(r.Context(), business, o)
+		respond(w, code, payload)
+	}
 }
 
 func handlePanic(w http.ResponseWriter) {
@@ -85,7 +116,7 @@ func handlePanic(w http.ResponseWriter) {
 		if code == http.StatusInternalServerError {
 			stack := debug.Stack()
 			log.Errorf("%s: %s", message, stack)
-			RespondWithDetailedError(w, code, message, string(stack))
+			RespondWithDetailedError(w, code, message, "Stack trace available in Kiali logs")
 			return
 		}
 		RespondWithError(w, code, message)
@@ -95,6 +126,14 @@ func handlePanic(w http.ResponseWriter) {
 func respond(w http.ResponseWriter, code int, payload interface{}) {
 	if code == http.StatusOK {
 		RespondWithJSONIndent(w, code, payload)
+		return
+	}
+	if code == http.StatusForbidden {
+		message := ""
+		if payload != nil {
+			message = payload.(string)
+		}
+		RespondWithJSON(w, code, message)
 		return
 	}
 	RespondWithError(w, code, payload.(string))

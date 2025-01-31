@@ -3,18 +3,16 @@ package virtualservices
 import (
 	"fmt"
 
-	networking_v1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
 
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
 )
 
 type SubsetPresenceChecker struct {
-	Namespace                string
-	Namespaces               []string
-	DestinationRules         []networking_v1alpha3.DestinationRule
-	ExportedDestinationRules []networking_v1alpha3.DestinationRule
-	VirtualService           networking_v1alpha3.VirtualService
+	Namespaces       []string
+	DestinationRules []*networking_v1.DestinationRule
+	VirtualService   *networking_v1.VirtualService
 }
 
 func (checker SubsetPresenceChecker) Check() ([]*models.IstioCheck, bool) {
@@ -110,17 +108,17 @@ func (checker SubsetPresenceChecker) subsetPresent(host string, subset string) b
 	return false
 }
 
-func (checker SubsetPresenceChecker) getDestinationRules(virtualServiceHost string) ([]networking_v1alpha3.DestinationRule, bool) {
-	drs := make([]networking_v1alpha3.DestinationRule, 0, len(checker.DestinationRules)+len(checker.ExportedDestinationRules))
+func (checker SubsetPresenceChecker) getDestinationRules(virtualServiceHost string) ([]*networking_v1.DestinationRule, bool) {
+	drs := make([]*networking_v1.DestinationRule, 0, len(checker.DestinationRules))
 
-	for _, destinationRule := range append(checker.DestinationRules, checker.ExportedDestinationRules...) {
+	for _, destinationRule := range checker.DestinationRules {
 		host := destinationRule.Spec.Host
 
-		drHost := kubernetes.GetHost(host, destinationRule.Namespace, destinationRule.ClusterName, checker.Namespaces)
-		vsHost := kubernetes.GetHost(virtualServiceHost, checker.Namespace, checker.VirtualService.ClusterName, checker.Namespaces)
+		drHost := kubernetes.GetHost(host, destinationRule.Namespace, checker.Namespaces)
+		vsHost := kubernetes.GetHost(virtualServiceHost, checker.VirtualService.Namespace, checker.Namespaces)
 
 		// TODO Host could be in another namespace (FQDN)
-		if kubernetes.FilterByHost(vsHost.String(), drHost.Service, drHost.Namespace) {
+		if kubernetes.FilterByHost(vsHost.String(), vsHost.Namespace, drHost.Service, drHost.Namespace) {
 			drs = append(drs, destinationRule)
 		}
 	}
@@ -128,7 +126,7 @@ func (checker SubsetPresenceChecker) getDestinationRules(virtualServiceHost stri
 	return drs, len(drs) > 0
 }
 
-func hasSubsetDefined(destinationRule networking_v1alpha3.DestinationRule, subsetTarget string) bool {
+func hasSubsetDefined(destinationRule *networking_v1.DestinationRule, subsetTarget string) bool {
 	for _, subset := range destinationRule.Spec.Subsets {
 		if subset == nil {
 			continue

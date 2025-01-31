@@ -1,14 +1,13 @@
 package main
 
 import (
-	jaegerModels "github.com/kiali/kiali/jaeger/model/json"
-
-	"github.com/kiali/kiali/business"
 	"github.com/kiali/kiali/graph/config/cytoscape"
-	"github.com/kiali/kiali/handlers"
-	"github.com/kiali/kiali/jaeger"
+	"github.com/kiali/kiali/handlers/authentication"
+	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
 	"github.com/kiali/kiali/status"
+	"github.com/kiali/kiali/tracing/jaeger/model"
+	jaegerModels "github.com/kiali/kiali/tracing/jaeger/model/json"
 )
 
 /////////////////////
@@ -79,8 +78,8 @@ type LoggingParam struct {
 	Level ProxyLogLevel `json:"level"`
 }
 
-// swagger:parameters istioConfigList workloadList workloadDetails workloadUpdate serviceDetails serviceUpdate appSpans serviceSpans workloadSpans appTraces serviceTraces workloadTraces errorTraces workloadValidations appList serviceMetrics aggregateMetrics appMetrics workloadMetrics istioConfigDetails istioConfigDetailsSubtype istioConfigDelete istioConfigDeleteSubtype istioConfigUpdate istioConfigUpdateSubtype serviceList appDetails graphAggregate graphAggregateByService graphApp graphAppVersion graphNamespace graphService graphWorkload namespaceMetrics customDashboard appDashboard serviceDashboard workloadDashboard istioConfigCreate istioConfigCreateSubtype namespaceUpdate namespaceTls podDetails podLogs namespaceValidations getIter8Experiments postIter8Experiments patchIter8Experiments deleteIter8Experiments podProxyDump podProxyResource podProxyLogging
-type NamespaceParam struct {
+// swagger:parameters istioConfigList workloadDetails workloadUpdate serviceDetails serviceUpdate appSpans serviceSpans workloadSpans appTraces serviceTraces workloadTraces errorTraces workloadValidations serviceMetrics aggregateMetrics appMetrics workloadMetrics istioConfigDetails istioConfigDetailsSubtype istioConfigDelete istioConfigDeleteSubtype istioConfigUpdate istioConfigUpdateSubtype appDetails graphAggregate graphAggregateByService graphApp graphAppVersion graphNamespace graphService graphWorkload namespaceMetrics customDashboard appDashboard serviceDashboard workloadDashboard istioConfigCreate istioConfigCreateSubtype namespaceUpdate namespaceTls podDetails podLogs namespaceValidations podProxyDump podProxyResource podProxyLogging namespaceInfo
+type NamespacePathParam struct {
 	// The namespace name.
 	//
 	// in: path
@@ -88,13 +87,13 @@ type NamespaceParam struct {
 	Name string `json:"namespace"`
 }
 
-// swagger:parameters getIter8Experiments patchIter8Experiments deleteIter8Experiments
-type NameParam struct {
-	// The name param
+// swagger:parameters serviceList appList workloadList
+type NamespaceQueryParam struct {
+	// The namespace name.
 	//
-	// in: path
+	// in: query
 	// required: true
-	Name string `json:"name"`
+	Name string `json:"namespace"`
 }
 
 // swagger:parameters istioConfigDetails istioConfigDetailsSubtype istioConfigDelete istioConfigDeleteSubtype istioConfigUpdate istioConfigUpdateSubtype
@@ -114,6 +113,15 @@ type ObjectTypeParam struct {
 	// required: true
 	// pattern: ^(gateways|virtualservices|destinationrules|serviceentries|rules|quotaspecs|quotaspecbindings)$
 	Name string `json:"object_type"`
+}
+
+// swagger:parameters istioConfigList istioConfigDetails serviceDetails serviceUpdate
+type ValidateParam struct {
+	// Enable validation or not
+	//
+	// in: query
+	// required: false
+	Name string `json:"validate"`
 }
 
 // swagger:parameters podDetails podLogs podProxyDump podProxyResource podProxyLogging
@@ -200,17 +208,16 @@ type AppendersParam struct {
 	//
 	// in: query
 	// required: false
-	// default: run all appenders
+	// default: aggregateNode,deadNode,healthConfig,idleNode,istio,responseTime,securityPolicy,serviceEntry,sidecarsCheck,throughput
 	Name string `json:"appenders"`
 }
 
 // swagger:parameters graphApp graphAppVersion graphNamespaces graphService graphWorkload
 type BoxByParam struct {
-	// Comma-separated list of desired node boxing. Available boxings: [app, cluster, namespace, none].
+	// Comma-separated list of desired node boxing. Available boxings: [app, cluster, namespace].
 	//
 	// in: query
 	// required: false
-	// default: none
 	Name string `json:"boxBy"`
 }
 
@@ -224,13 +231,22 @@ type DurationGraphParam struct {
 	Name string `json:"duration"`
 }
 
-// swagger:parameters graphApp graphAppVersion graphNamespaces graphService graphWorkload
+// swagger:parameters graphNamespaces graphService graphWorkload
 type GraphTypeParam struct {
 	// Graph type. Available graph types: [app, service, versionedApp, workload].
 	//
 	// in: query
 	// required: false
 	// default: workload
+	Name string `json:"graphType"`
+}
+
+// swagger:parameters graphApp graphAppVersion
+type AppGraphTypeParam struct {
+	// Graph type. Available graph types: [app, versionedApp].
+	//
+	// in: query
+	// required: true
 	Name string `json:"graphType"`
 }
 
@@ -542,7 +558,7 @@ type InternalError struct {
 // A Internal is the error message that means something has gone wrong
 //
 // swagger:response serviceUnavailableError
-type serviceUnavailableError struct {
+type ServiceUnavailableError struct {
 	// in: body
 	Body struct {
 		// HTTP status code
@@ -555,16 +571,16 @@ type serviceUnavailableError struct {
 
 // HTTP status code 200 and statusInfo model in data
 // swagger:response statusInfo
-type swaggStatusInfoResp struct {
+type SwaggStatusInfoResp struct {
 	// in:body
 	Body status.StatusInfo
 }
 
-// HTTP status code 200 and tokenGenerated model in data
-// swagger:response tokenResponse
-type swaggTokenGeneratedResp struct {
+// HTTP status code 200 and userGenerated model in data
+// swagger:response userSessionData
+type SwaggTokenGeneratedResp struct {
 	// in:body
-	Body handlers.TokenResponse
+	Body authentication.UserSessionData
 }
 
 // HTTP status code 200 and cytoscapejs Config in data
@@ -602,37 +618,16 @@ type AppListResponse struct {
 	Body models.AppList
 }
 
-// serviceHealthResponse contains aggregated health from various sources, for a given service
-// swagger:response serviceHealthResponse
-type serviceHealthResponse struct {
-	// in:body
-	Body models.ServiceHealth
-}
-
-// appHealthResponse contains aggregated health from various sources, for a given app
-// swagger:response appHealthResponse
-type appHealthResponse struct {
-	// in:body
-	Body models.AppHealth
-}
-
-// workloadHealthResponse contains aggregated health from various sources, for a given workload
-// swagger:response workloadHealthResponse
-type workloadHealthResponse struct {
-	// in:body
-	Body models.WorkloadHealth
-}
-
 // namespaceAppHealthResponse is a map of app name x health
 // swagger:response namespaceAppHealthResponse
-type namespaceAppHealthResponse struct {
+type NamespaceAppHealthResponse struct {
 	// in:body
 	Body models.NamespaceAppHealth
 }
 
 // namespaceResponse is a basic namespace
 // swagger:response namespaceResponse
-type namespaceResponse struct {
+type NamespaceResponse struct {
 	// in:body
 	Body models.Namespace
 }
@@ -662,7 +657,7 @@ type ErrorTracesResponse struct {
 // swagger:response spansResponse
 type SpansResponse struct {
 	// in:body
-	Body []jaeger.JaegerSpan
+	Body []model.TracingSpan
 }
 
 // Listing all the information related to a workload
@@ -714,11 +709,11 @@ type GrafanaInfoResponse struct {
 	Body models.GrafanaInfo
 }
 
-// Return all the descriptor data related to Jaeger
+// Return all the descriptor data related to Tracing
 // swagger:response jaegerInfoResponse
 type JaegerInfoResponse struct {
 	// in: body
-	Body models.JaegerInfo
+	Body models.TracingInfo
 }
 
 // Return the information necessary to handle login
@@ -777,37 +772,16 @@ type NameIstioValidation map[string]models.IstioValidation
 
 // Return caller permissions per namespace and Istio Config type
 // swagger:response istioConfigPermissions
-type swaggIstioConfigPermissions struct {
+type SwaggIstioConfigPermissions struct {
 	// in:body
 	Body models.IstioConfigPermissions
-}
-
-// Return Iter8 Info
-// swagger:response iter8StatusResponse
-type Iter8StatusResponse struct {
-	// in: body
-	Body models.Iter8Info
-}
-
-// Return a Iter8 Experiment detail
-// swagger:response iter8ExperimentGetDetailResponse
-type Iter8ExperimentsGetDetailResponse struct {
-	// in: body
-	Body models.Iter8ExperimentDetail
-}
-
-// Return a list of Iter8 Experiment Items
-// swagger:response iter8ExperimentsResponse
-type Iter8ExperimentsResponnse struct {
-	// in: body
-	Body []models.Iter8ExperimentItem
 }
 
 // Return a list of Istio components along its status
 // swagger:response istioStatusResponse
 type IstioStatusResponse struct {
 	// in: body
-	Body business.IstioComponentStatus
+	Body kubernetes.IstioComponentStatus
 }
 
 // Return a list of certificates information
@@ -831,11 +805,32 @@ type MetricsStatsResponse struct {
 	Body models.MetricsStats
 }
 
-// Return a list of Cluster items
-// swagger:response clustersResponse
-type ClustersResponse struct {
+// Response of the tracing info query
+// swagger:response tracingInfoResponse
+type TracingInfoResponse struct {
 	// in: body
-	Body []business.Cluster
+	Body models.TracingInfo
+}
+
+// Response of the cluster namespace health query
+// swagger:response clustersNamespaceHealthResponse
+type ClustersNamespaceHealthResponse struct {
+	// in: body
+	Body models.ClustersNamespaceHealth
+}
+
+// Response of the mesh query
+// swagger:response meshResponse
+type MeshResponse struct {
+	// in: body
+	Body models.Mesh
+}
+
+// Response of the cluster TLS query
+// swagger:response clusterTlsResponse
+type ClusterTlsResponse struct {
+	// in: body
+	Body models.MTLSStatus
 }
 
 // swagger:enum ProxyLogLevel

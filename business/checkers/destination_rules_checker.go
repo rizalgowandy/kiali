@@ -1,7 +1,7 @@
 package checkers
 
 import (
-	networking_v1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
 
 	"github.com/kiali/kiali/business/checkers/common"
 	"github.com/kiali/kiali/business/checkers/destinationrules"
@@ -9,15 +9,12 @@ import (
 	"github.com/kiali/kiali/models"
 )
 
-const DestinationRuleCheckerType = "destinationrule"
-
 type DestinationRulesChecker struct {
-	DestinationRules         []networking_v1alpha3.DestinationRule
-	ExportedDestinationRules []networking_v1alpha3.DestinationRule
-	MTLSDetails              kubernetes.MTLSDetails
-	ServiceEntries           []networking_v1alpha3.ServiceEntry
-	ExportedServiceEntries   []networking_v1alpha3.ServiceEntry
-	Namespaces               []models.Namespace
+	DestinationRules []*networking_v1.DestinationRule
+	MTLSDetails      kubernetes.MTLSDetails
+	ServiceEntries   []*networking_v1.ServiceEntry
+	Namespaces       models.Namespaces
+	Cluster          string
 }
 
 func (in DestinationRulesChecker) Check() models.IstioValidations {
@@ -32,16 +29,13 @@ func (in DestinationRulesChecker) Check() models.IstioValidations {
 func (in DestinationRulesChecker) runGroupChecks() models.IstioValidations {
 	validations := models.IstioValidations{}
 
-	seHosts := kubernetes.ServiceEntryHostnames(append(in.ServiceEntries, in.ExportedServiceEntries...))
+	seHosts := kubernetes.ServiceEntryHostnames(in.ServiceEntries)
 
 	enabledDRCheckers := []GroupChecker{
-		destinationrules.MultiMatchChecker{Namespaces: in.Namespaces, DestinationRules: in.DestinationRules, ServiceEntries: seHosts, ExportedDestinationRules: in.ExportedDestinationRules},
+		destinationrules.MultiMatchChecker{Namespaces: in.Namespaces, ServiceEntries: seHosts, DestinationRules: in.DestinationRules, Cluster: in.Cluster},
 	}
 
-	// Appending validations that only applies to non-autoMTLS meshes
-	if !in.MTLSDetails.EnabledAutoMtls {
-		enabledDRCheckers = append(enabledDRCheckers, destinationrules.TrafficPolicyChecker{DestinationRules: in.DestinationRules, ExportedDestinationRules: in.ExportedDestinationRules, MTLSDetails: in.MTLSDetails})
-	}
+	enabledDRCheckers = append(enabledDRCheckers, destinationrules.TrafficPolicyChecker{DestinationRules: in.DestinationRules, MTLSDetails: in.MTLSDetails, Cluster: in.Cluster})
 
 	for _, checker := range enabledDRCheckers {
 		validations = validations.MergeValidations(checker.Check())
@@ -60,21 +54,20 @@ func (in DestinationRulesChecker) runIndividualChecks() models.IstioValidations 
 	return validations
 }
 
-func (in DestinationRulesChecker) runChecks(destinationRule networking_v1alpha3.DestinationRule) models.IstioValidations {
+func (in DestinationRulesChecker) runChecks(destinationRule *networking_v1.DestinationRule) models.IstioValidations {
 	destinationRuleName := destinationRule.Name
-	key, rrValidation := EmptyValidValidation(destinationRuleName, destinationRule.Namespace, DestinationRuleCheckerType)
+	key, rrValidation := EmptyValidValidation(destinationRuleName, destinationRule.Namespace, kubernetes.DestinationRules, in.Cluster)
 
 	enabledCheckers := []Checker{
 		destinationrules.DisabledNamespaceWideMTLSChecker{DestinationRule: destinationRule, MTLSDetails: in.MTLSDetails},
 		destinationrules.DisabledMeshWideMTLSChecker{DestinationRule: destinationRule, MeshPeerAuthns: in.MTLSDetails.MeshPeerAuthentications},
-		common.ExportToNamespaceChecker{ExportTo: destinationRule.Spec.ExportTo, Namespaces: in.Namespaces},
+	}
+	if !in.Namespaces.IsNamespaceAmbient(destinationRule.Namespace, in.Cluster) {
+		enabledCheckers = append(enabledCheckers, common.ExportToNamespaceChecker{ExportTo: destinationRule.Spec.ExportTo, Namespaces: in.Namespaces})
 	}
 
-	// Appending validations that only applies to non-autoMTLS meshes
-	if !in.MTLSDetails.EnabledAutoMtls {
-		enabledCheckers = append(enabledCheckers, destinationrules.NamespaceWideMTLSChecker{DestinationRule: destinationRule, MTLSDetails: in.MTLSDetails})
-		enabledCheckers = append(enabledCheckers, destinationrules.MeshWideMTLSChecker{DestinationRule: destinationRule, MTLSDetails: in.MTLSDetails})
-	}
+	enabledCheckers = append(enabledCheckers, destinationrules.NamespaceWideMTLSChecker{DestinationRule: destinationRule, MTLSDetails: in.MTLSDetails})
+	enabledCheckers = append(enabledCheckers, destinationrules.MeshWideMTLSChecker{DestinationRule: destinationRule, MTLSDetails: in.MTLSDetails})
 
 	for _, checker := range enabledCheckers {
 		checks, validChecker := checker.Check()

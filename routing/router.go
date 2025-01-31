@@ -3,24 +3,41 @@ package routing
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
+	hpprof "net/http/pprof"
+	"os"
 	"path/filepath"
+	rpprof "runtime/pprof"
 	"strings"
 
 	"github.com/gorilla/mux"
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/kiali/kiali/business"
 	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/grafana"
 	"github.com/kiali/kiali/handlers"
+	"github.com/kiali/kiali/handlers/authentication"
+	"github.com/kiali/kiali/istio"
+	"github.com/kiali/kiali/kubernetes"
+	"github.com/kiali/kiali/kubernetes/cache"
 	"github.com/kiali/kiali/log"
+	kialiprometheus "github.com/kiali/kiali/prometheus"
 	"github.com/kiali/kiali/prometheus/internalmetrics"
+	"github.com/kiali/kiali/tracing"
 )
 
 // NewRouter creates the router with all API routes and the static files handler
-func NewRouter() *mux.Router {
-
-	conf := config.Get()
+func NewRouter(
+	conf *config.Config,
+	kialiCache cache.KialiCache,
+	clientFactory kubernetes.ClientFactory,
+	prom kialiprometheus.ClientInterface,
+	traceClientLoader func() tracing.ClientInterface,
+	cpm business.ControlPlaneMonitor,
+	grafana *grafana.Service,
+	discovery *istio.Discovery,
+) (*mux.Router, error) {
 	webRoot := conf.Server.WebRoot
 	webRootWithSlash := webRoot + "/"
 
@@ -69,10 +86,139 @@ func NewRouter() *mux.Router {
 
 	appRouter = appRouter.StrictSlash(true)
 
+	strategy := conf.Auth.Strategy
+
+	// Routes that are specific to different auth stragies like auth callbacks.
+	var authRoutes []Route
+	var authController authentication.AuthController
+	var authRedirectHandler http.Handler
+	if strategy == config.AuthStrategyToken {
+		tokenAuth, err := authentication.NewTokenAuthController(clientFactory, kialiCache, conf, discovery)
+		if err != nil {
+			log.Errorf("Error creating TokenAuthController: %v", err)
+			return nil, err
+		}
+		authController = tokenAuth
+	} else if strategy == config.AuthStrategyOpenId {
+		openIDAuth, err := authentication.NewOpenIdAuthController(kialiCache, clientFactory, conf, discovery)
+		if err != nil {
+			log.Errorf("Error creating OpenIdAuthController: %v", err)
+			return nil, err
+		}
+		authController = openIDAuth
+	} else if strategy == config.AuthStrategyOpenshift {
+		openshiftAuth, err := authentication.NewOpenshiftAuthController(conf, clientFactory)
+		if err != nil {
+			log.Errorf("Error creating OpenshiftAuthController: %v", err)
+			return nil, err
+		}
+
+		authController = openshiftAuth
+
+		authCallbacks := []Route{
+			{
+				Name:          "BaseAuthRedirect",
+				Method:        "GET",
+				Pattern:       "/api/auth/redirect",
+				HandlerFunc:   openshiftAuth.OpenshiftAuthRedirect,
+				Authenticated: false,
+			},
+			{
+				Name:          "ClusterAuthRedirect",
+				Method:        "GET",
+				Pattern:       "/api/auth/redirect/{cluster}",
+				HandlerFunc:   openshiftAuth.OpenshiftAuthRedirect,
+				Authenticated: false,
+			},
+			{
+				Name:          "BaseAuthCallback",
+				Method:        "GET",
+				Pattern:       "/api/auth/callback",
+				HandlerFunc:   openshiftAuth.OpenshiftAuthCallback,
+				Authenticated: false,
+			},
+			{
+				Name:          "ClusterAuthCallback",
+				Method:        "GET",
+				Pattern:       "/api/auth/callback/{cluster}",
+				HandlerFunc:   openshiftAuth.OpenshiftAuthCallback,
+				Authenticated: false,
+			},
+		}
+		authRoutes = append(authRoutes, authCallbacks...)
+		authRedirectHandler = http.HandlerFunc(openshiftAuth.OpenshiftAuthRedirect)
+	} else if strategy == config.AuthStrategyHeader {
+		headerAuth, err := authentication.NewHeaderAuthController(conf, clientFactory.GetSAHomeClusterClient())
+		if err != nil {
+			log.Errorf("Error creating HeaderAuthController: %v", err)
+			return nil, err
+		}
+		authController = headerAuth
+	}
+
 	// Build our API server routes and install them.
-	apiRoutes := NewRoutes()
-	authenticationHandler, _ := handlers.NewAuthenticationHandler()
-	for _, route := range apiRoutes.Routes {
+	apiRoutes := NewRoutes(conf, kialiCache, clientFactory, cpm, prom, traceClientLoader, authController, grafana, discovery)
+	// Add any auth routes to the app router.
+	apiRoutes.Routes = append(apiRoutes.Routes, authRoutes...)
+
+	authenticationHandler := handlers.NewAuthenticationHandler(conf, authController, clientFactory.GetSAHomeClusterClient(), authRedirectHandler, clientFactory.GetSAClients())
+
+	allRoutes := apiRoutes.Routes
+
+	// Add the Profiler handlers if enabled
+	if conf.Server.Profiler.Enabled {
+		log.Infof("Profiler is enabled")
+		allRoutes = append(allRoutes,
+			Route{
+				Method:        "GET",
+				Name:          "PProf Index",
+				Pattern:       "/debug/pprof/", // the ending slash is important
+				HandlerFunc:   hpprof.Index,
+				Authenticated: true,
+			},
+			Route{
+				Method:        "GET",
+				Name:          "PProf Cmdline",
+				Pattern:       "/debug/pprof/cmdline",
+				HandlerFunc:   hpprof.Cmdline,
+				Authenticated: true,
+			},
+			Route{
+				Method:        "GET",
+				Name:          "PProf Profile",
+				Pattern:       "/debug/pprof/profile",
+				HandlerFunc:   hpprof.Profile,
+				Authenticated: true,
+			},
+			Route{
+				Method:        "GET",
+				Name:          "PProf Symbol",
+				Pattern:       "/debug/pprof/symbol",
+				HandlerFunc:   hpprof.Symbol,
+				Authenticated: true,
+			},
+			Route{
+				Method:        "GET",
+				Name:          "PProf Trace",
+				Pattern:       "/debug/pprof/trace",
+				HandlerFunc:   hpprof.Trace,
+				Authenticated: true,
+			},
+		)
+		for _, p := range rpprof.Profiles() {
+			allRoutes = append(allRoutes,
+				Route{
+					Method:        "GET",
+					Name:          "PProf " + p.Name(),
+					Pattern:       "/debug/pprof/" + p.Name(),
+					HandlerFunc:   hpprof.Handler(p.Name()).ServeHTTP,
+					Authenticated: true,
+				},
+			)
+		}
+	}
+
+	for _, route := range allRoutes {
 		handlerFunction := metricHandler(route.HandlerFunc, route)
 		if route.Authenticated {
 			handlerFunction = authenticationHandler.Handle(handlerFunction)
@@ -86,25 +232,28 @@ func NewRouter() *mux.Router {
 			Handler(handlerFunction)
 	}
 
+	if authController != nil {
+		if ac, ok := authController.(*authentication.OpenIdAuthController); ok {
+			ac.PostRoutes(appRouter)
+		}
+	}
+
 	// All client-side routes are prefixed with /console.
 	// They are forwarded to index.html and will be handled by react-router.
 	appRouter.PathPrefix("/console").HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		serveIndexFile(w)
 	})
 
-	if conf.Auth.Strategy == config.AuthStrategyOpenId {
-		rootRouter.Methods("GET").Path(webRootWithSlash).HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !handlers.OpenIdCodeFlowHandler(w, r) {
-				// If the OpenID handler does not handle the request, pass the
-				// request to the file server.
-				fileServerHandler(w, r)
-			}
-		})
+	if authController != nil {
+		if ac, ok := authController.(*authentication.OpenIdAuthController); ok {
+			authCallback := ac.GetAuthCallbackHandler(http.HandlerFunc(fileServerHandler))
+			rootRouter.Methods("GET").Path(webRootWithSlash).Handler(authCallback)
+		}
 	}
 
 	rootRouter.PathPrefix(webRootWithSlash).HandlerFunc(fileServerHandler)
 
-	return rootRouter
+	return rootRouter, nil
 }
 
 // statusResponseWriter contains a ResponseWriter and a StatusCode to read in the metrics middleware
@@ -151,9 +300,7 @@ func serveEnvJsFile(w http.ResponseWriter) {
 		body += fmt.Sprintf("window.HISTORY_MODE='%s';", conf.Server.WebHistoryMode)
 	}
 
-	if webRoot := strings.TrimSuffix(config.Get().Server.WebRoot, "/"); len(webRoot) > 0 {
-		body += fmt.Sprintf("window.WEB_ROOT='%s';", webRoot)
-	}
+	body += "window.WEB_ROOT = document.getElementsByTagName('base')[0].getAttribute('href').replace(/^https?:\\/\\/[^#?\\/]+/g, '').replace(/\\/+$/g, '')"
 
 	w.Header().Set("content-type", "text/javascript")
 	_, err := io.WriteString(w, body)
@@ -169,7 +316,7 @@ func serveIndexFile(w http.ResponseWriter) {
 	webRootPath = strings.TrimSuffix(webRootPath, "/")
 
 	path, _ := filepath.Abs("./console/index.html")
-	b, err := ioutil.ReadFile(path)
+	b, err := os.ReadFile(path)
 	if err != nil {
 		log.Errorf("File I/O error [%v]", err.Error())
 		handlers.RespondWithDetailedError(w, http.StatusInternalServerError, "Unable to read index.html template file", err.Error())

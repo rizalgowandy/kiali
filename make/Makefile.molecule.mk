@@ -7,19 +7,21 @@
 # To run multiple scenarios sequentially: MOLECULE_SCENARIO="token-test roles-test" make molecule-test
 MOLECULE_SCENARIO ?= default
 
-# Defines what playbook version to test. This is the value to put in the tests' Kiali CR spec.version field.
+# Defines what playbook version to test. This is the value to put in the tests' CR spec.version fields.
 MOLECULE_KIALI_CR_SPEC_VERSION ?= default
+MOLECULE_OSSMCONSOLE_CR_SPEC_VERSION ?= default
 
-# Set MOLECULE_USE_DEV_IMAGES to true to use your local Kiali dev builds (not released images from quay.io).
-# To use this, you must have first pushed your local Kiali dev builds via the cluster-push target.
+# Set MOLECULE_USE_DEV_IMAGES to true to use your local Kiali and OSSMC plugin dev builds (not released images from quay.io).
+# To use this, you must have first pushed your local dev builds via the cluster-push target.
 #
 # If MOLECULE_USE_DEV_IMAGES is not set or set to 'false', that usually means you want to pick up the latest images
-# published on quay.io. However, if you want to test the default Kiali server image that the operator will install, you
-# can set MOLECULE_USE_DEFAULT_SERVER_IMAGE=true. When that is set (in conjunction with MOLECULE_USE_DEV_IMAGES=false),
+# published on quay.io. However, if you want to test the default Kiali server and plugin images that the operator
+# will install, you can set MOLECULE_USE_DEFAULT_IMAGES=true. When that is set (in conjunction with MOLECULE_USE_DEV_IMAGES=false),
 # the molecule tests will set the spec.deployment.image_version and spec.deployment.image_name override fields to an
-# empty string thus causing the Kiali server image to be the default image installed by the operator. This is useful
-# when you are installing Kiali via OLM and you want to test with a specific Kiali CR spec.version (MOLECULE_KIALI_CR_SPEC_VERSION)
-# and the default server that is installed by the operator for that spec.version.
+# empty string thus causing the Kiali server and plugin images to be the default image installed by the operator.
+# This is useful when you are installing Kiali via OLM and you want to test with a specific CR spec.version
+# (MOLECULE_KIALI_CR_SPEC_VERSION / MOLECULE_OSSMCONSOLE_CR_SPEC_VERSION)
+# and the default server and plugin that is installed by the operator for that spec.version.
 #
 # Note that you can override everything mentioned above in order to use your own image names/versions. You can do this by
 # setting MOLECULE_IMAGE_ENV_ARGS. This is useful if you want to test a specific released version or images found in a different repo.
@@ -29,29 +31,33 @@ MOLECULE_KIALI_CR_SPEC_VERSION ?= default
 #   MOLECULE_IMAGE_ENV_ARGS = --env MOLECULE_KIALI_OPERATOR_IMAGE_NAME=quay.io/myuser/kiali-operator \
 #                             --env MOLECULE_KIALI_OPERATOR_IMAGE_VERSION=test \
 #                             --env MOLECULE_KIALI_IMAGE_NAME=quay.io/myuser/kiali \
-#                             --env MOLECULE_KIALI_IMAGE_VERSION=test
+#                             --env MOLECULE_KIALI_IMAGE_VERSION=test \
+#                             --env MOLECULE_PLUGIN_IMAGE_NAME=quay.io/myuser/kiali \
+#                             --env MOLECULE_PLUGIN_IMAGE_VERSION=test
 
 ifndef MOLECULE_IMAGE_ENV_ARGS
 ifeq ($(MOLECULE_USE_DEV_IMAGES),true)
 ifeq ($(CLUSTER_TYPE),openshift)
-MOLECULE_IMAGE_ENV_ARGS = --env MOLECULE_KIALI_OPERATOR_IMAGE_NAME=dev --env MOLECULE_KIALI_OPERATOR_IMAGE_VERSION=dev --env MOLECULE_KIALI_IMAGE_NAME=dev --env MOLECULE_KIALI_IMAGE_VERSION=dev
+MOLECULE_IMAGE_ENV_ARGS = --env MOLECULE_KIALI_OPERATOR_IMAGE_NAME=dev --env MOLECULE_KIALI_OPERATOR_IMAGE_VERSION=dev --env MOLECULE_KIALI_IMAGE_NAME=dev --env MOLECULE_KIALI_IMAGE_VERSION=dev --env MOLECULE_PLUGIN_IMAGE_NAME=dev --env MOLECULE_PLUGIN_IMAGE_VERSION=dev
 else ifeq ($(CLUSTER_TYPE),minikube)
 MOLECULE_IMAGE_ENV_ARGS = --env MOLECULE_KIALI_OPERATOR_IMAGE_NAME=localhost:5000/kiali/kiali-operator --env MOLECULE_KIALI_OPERATOR_IMAGE_VERSION=dev --env MOLECULE_KIALI_IMAGE_NAME=localhost:5000/kiali/kiali --env MOLECULE_KIALI_IMAGE_VERSION=dev
 else ifeq ($(CLUSTER_TYPE),kind)
-MOLECULE_IMAGE_ENV_ARGS = --env MOLECULE_KIALI_OPERATOR_IMAGE_NAME=kiali/kiali-operator --env MOLECULE_KIALI_OPERATOR_IMAGE_VERSION=dev --env MOLECULE_KIALI_IMAGE_NAME=kiali/kiali --env MOLECULE_KIALI_IMAGE_VERSION=dev
+MOLECULE_IMAGE_ENV_ARGS = --env MOLECULE_KIALI_OPERATOR_IMAGE_NAME=localhost/kiali/kiali-operator --env MOLECULE_KIALI_OPERATOR_IMAGE_VERSION=dev --env MOLECULE_KIALI_IMAGE_NAME=localhost/kiali/kiali --env MOLECULE_KIALI_IMAGE_VERSION=dev
 MOLECULE_IMAGE_PULL_POLICY="IfNotPresent"
 endif
-else ifeq ($(MOLECULE_USE_DEFAULT_SERVER_IMAGE),true)
+else ifeq ($(MOLECULE_USE_DEFAULT_IMAGES),true)
 export MOLECULE_KIALI_IMAGE_NAME =
 export MOLECULE_KIALI_IMAGE_VERSION =
-MOLECULE_IMAGE_ENV_ARGS = --env 'MOLECULE_KIALI_IMAGE_NAME=' --env 'MOLECULE_KIALI_IMAGE_VERSION='
+export MOLECULE_PLUGIN_IMAGE_NAME =
+export MOLECULE_PLUGIN_IMAGE_VERSION =
+MOLECULE_IMAGE_ENV_ARGS = --env 'MOLECULE_KIALI_IMAGE_NAME=' --env 'MOLECULE_KIALI_IMAGE_VERSION=' --env 'MOLECULE_PLUGIN_IMAGE_NAME=' --env 'MOLECULE_PLUGIN_IMAGE_VERSION='
 endif
 endif
 
 # The Molecule tests by default will have the Kiali and Kiali Operator images pulled "Always".
 # MOLECULE_IMAGE_PULL_POLICY changes that default behavior - other options are the k8s values "Never" and "IfNotPresent".
 ifdef MOLECULE_IMAGE_PULL_POLICY
-MOLECULE_IMAGE_PULL_POLICY_ENV_ARGS ?= --env MOLECULE_KIALI_OPERATOR_IMAGE_PULL_POLICY=${MOLECULE_IMAGE_PULL_POLICY} --env MOLECULE_KIALI_IMAGE_PULL_POLICY=${MOLECULE_IMAGE_PULL_POLICY}
+MOLECULE_IMAGE_PULL_POLICY_ENV_ARGS ?= --env MOLECULE_KIALI_OPERATOR_IMAGE_PULL_POLICY=${MOLECULE_IMAGE_PULL_POLICY} --env MOLECULE_KIALI_IMAGE_PULL_POLICY=${MOLECULE_IMAGE_PULL_POLICY} --env MOLECULE_PLUGIN_IMAGE_PULL_POLICY=${MOLECULE_IMAGE_PULL_POLICY}
 endif
 
 ifeq ($(MOLECULE_DEBUG),true)
@@ -146,27 +152,36 @@ endif
 
 ifndef MOLECULE_ADD_HOST_ARGS
 .prepare-add-host-args: .prepare-cluster
+ifeq ($(CLUSTER_TYPE),openshift)
 	@echo "Will auto-detect hosts to add based on the CLUSTER_REPO: ${CLUSTER_REPO}"
-	@$(eval MOLECULE_ADD_HOST_ARGS ?= $(shell basehost="$(shell echo ${CLUSTER_REPO} | sed 's/^.*\.apps\.\(.*\)/\1/')"; kialihost="kiali-istio-system.apps.$${basehost}"; kialiip="$$(getent hosts $${kialihost} | head -n 1 | awk '{ print $$1 }')"; prometheushost="prometheus-istio-system.apps.$${basehost}"; prometheusip="$$(getent hosts $${prometheushost} | head -n 1 | awk '{ print $$1 }')" apihost="api.$${basehost}"; apiip="$$(getent hosts $${apihost} | head -n 1 | awk '{ print $$1 }')"; oauthoshost="oauth-openshift.apps.$${basehost}"; oauthosip="$$(getent hosts $${oauthoshost} | head -n 1 | awk '{ print $$1 }')"; echo "--add-host=$$kialihost:$$kialiip --add-host=$$prometheushost:$$prometheusip --add-host=$$apihost:$$apiip --add-host=$$oauthoshost:$$oauthosip"))
+	@$(eval MOLECULE_ADD_HOST_ARGS ?= $(shell basehost="$(shell echo ${CLUSTER_REPO} | sed 's/^.*\.apps[\.-]\(.*\)/\1/')"; appsbasehost="$(shell echo ${CLUSTER_REPO} | sed 's/^.*\.\(apps[\.-].*\)/\1/')"; kialihost="kiali-istio-system.$${appsbasehost}"; kialiip="$$(getent hosts $${kialihost} | head -n 1 | awk '{ print $$1 }')"; prometheushost="prometheus-istio-system.$${appsbasehost}"; prometheusip="$$(getent hosts $${prometheushost} | head -n 1 | awk '{ print $$1 }')" apihost="api.$${basehost}"; apiip="$$(getent hosts $${apihost} | head -n 1 | awk '{ print $$1 }')"; oauthoshost="oauth-openshift.$${appsbasehost}"; oauthosip="$$(getent hosts $${oauthoshost} | head -n 1 | awk '{ print $$1 }')"; echo "--add-host=$$kialihost:$$kialiip --add-host=$$prometheushost:$$prometheusip --add-host=$$apihost:$$apiip --add-host=$$oauthoshost:$$oauthosip"))
 	@echo "Auto-detected add host args: ${MOLECULE_ADD_HOST_ARGS}"
+else
+	@echo "Will not auto-detect any hosts for non-OpenShift clusters."
+endif
 else
 .prepare-add-host-args:
 	@echo "Will use the given add host args: ${MOLECULE_ADD_HOST_ARGS}"
 endif
 
 .prepare-molecule-data-volume:
-	$(DORP) volume create molecule-tests-volume
-	$(DORP) create -v molecule-tests-volume:/data --name molecule-volume-helper docker.io/busybox true
-	$(DORP) cp "${HELM_CHARTS_REPO}" molecule-volume-helper:/data/helm-charts-repo
-	$(DORP) cp "${ROOTDIR}/operator/" molecule-volume-helper:/data/operator
-	$(DORP) cp "${MOLECULE_KUBECONFIG}" molecule-volume-helper:/data/kubeconfig
-	$(DORP) rm molecule-volume-helper
+ifeq ($(DORP),docker)
+	@echo "Docker is not supported for running the molecule tests. Ignoring 'dorp=docker' and using podman."
+endif
+
+	podman volume exists molecule-tests-volume && echo "Podman volume already exists; deleting it" && podman volume rm molecule-tests-volume || true
+	podman volume create molecule-tests-volume
+	podman create -v molecule-tests-volume:/data --name molecule-volume-helper docker.io/busybox true
+	podman cp "${HELM_CHARTS_REPO}" molecule-volume-helper:/data/helm-charts-repo
+	podman cp "${ROOTDIR}/operator/" molecule-volume-helper:/data/operator
+	podman cp "${MOLECULE_KUBECONFIG}" molecule-volume-helper:/data/kubeconfig
+	podman rm molecule-volume-helper
 
 ## molecule-test: Runs Molecule tests using the Molecule docker image
-molecule-test: .ensure-operator-repo-exists .ensure-operator-helm-chart-exists .prepare-add-host-args molecule-build .prepare-molecule-data-volume
+molecule-test: .ensure-operator-repo-exists .ensure-operator-helm-chart-exists .prepare-add-host-args molecule-build .prepare-molecule-data-volume .create-operator-pull-secret
 ifeq ($(DORP),docker)
-	for msn in ${MOLECULE_SCENARIO}; do docker run --rm ${MOLECULE_DOCKER_TERM_ARGS} --env KUBECONFIG="/tmp/molecule/kubeconfig" --env K8S_AUTH_KUBECONFIG="/tmp/molecule/kubeconfig" --env MOLECULE_CLUSTER_TYPE="${CLUSTER_TYPE}" --env MOLECULE_HELM_CHARTS_REPO=/tmp/molecule/helm-charts-repo -v molecule-tests-volume:/tmp/molecule -v /var/run/docker.sock:/var/run/docker.sock ${MOLECULE_MINIKUBE_VOL_ARG} ${MOLECULE_MINIKUBE_ENV_ARGS} ${MOLECULE_KIND_ENV_ARGS} -w /tmp/molecule/operator --network="host" ${MOLECULE_ADD_HOST_ARGS} --add-host="api.crc.testing:192.168.130.11" --add-host="kiali-istio-system.apps-crc.testing:192.168.130.11" --add-host="prometheus-istio-system.apps-crc.testing:192.168.130.11" --env DORP=${DORP} --env MOLECULE_KIALI_CR_SPEC_VERSION=${MOLECULE_KIALI_CR_SPEC_VERSION} ${MOLECULE_IMAGE_ENV_ARGS} ${MOLECULE_OPERATOR_PROFILER_ENABLED_ENV_VAR} ${MOLECULE_OPERATOR_INSTALLER_ENV_VAR} ${MOLECULE_DUMP_LOGS_ON_ERROR_ENV_VAR} ${MOLECULE_IMAGE_PULL_POLICY_ENV_ARGS} ${MOLECULE_WAIT_RETRIES_ARG} kiali-molecule:latest molecule ${MOLECULE_DEBUG_ARG} test ${MOLECULE_DESTROY_NEVER_ARG} --scenario-name $${msn}; if [ "$$?" != "0" ]; then echo "Molecule test failed: $${msn}"; docker volume rm molecule-tests-volume; exit 1; fi; done
-else
-	for msn in ${MOLECULE_SCENARIO}; do podman run --rm ${MOLECULE_DOCKER_TERM_ARGS} --env KUBECONFIG="/tmp/molecule/kubeconfig" --env K8S_AUTH_KUBECONFIG="/tmp/molecule/kubeconfig" --env MOLECULE_CLUSTER_TYPE="${CLUSTER_TYPE}" --env MOLECULE_HELM_CHARTS_REPO=/tmp/molecule/helm-charts-repo -v molecule-tests-volume:/tmp/molecule ${MOLECULE_MINIKUBE_VOL_ARG} ${MOLECULE_MINIKUBE_ENV_ARGS} ${MOLECULE_KIND_ENV_ARGS} -w /tmp/molecule/operator --network="host" ${MOLECULE_ADD_HOST_ARGS} --add-host="api.crc.testing:192.168.130.11" --add-host="kiali-istio-system.apps-crc.testing:192.168.130.11" --add-host="prometheus-istio-system.apps-crc.testing:192.168.130.11" --env DORP=${DORP} --env MOLECULE_KIALI_CR_SPEC_VERSION=${MOLECULE_KIALI_CR_SPEC_VERSION} ${MOLECULE_IMAGE_ENV_ARGS} ${MOLECULE_OPERATOR_PROFILER_ENABLED_ENV_VAR} ${MOLECULE_OPERATOR_INSTALLER_ENV_VAR} ${MOLECULE_DUMP_LOGS_ON_ERROR_ENV_VAR} ${MOLECULE_IMAGE_PULL_POLICY_ENV_ARGS} ${MOLECULE_WAIT_RETRIES_ARG} localhost/kiali-molecule:latest molecule ${MOLECULE_DEBUG_ARG} test ${MOLECULE_DESTROY_NEVER_ARG} --scenario-name $${msn}; if [ "$$?" != "0" ]; then echo "Molecule test failed: $${msn}"; podman volume rm molecule-tests-volume; exit 1; fi; done
+	@echo "Docker is not supported for running the molecule tests. Ignoring 'dorp=docker' and using podman."
 endif
-	$(DORP) volume rm molecule-tests-volume
+
+	for msn in ${MOLECULE_SCENARIO}; do podman run --rm ${MOLECULE_DOCKER_TERM_ARGS} --env KUBECONFIG="/tmp/molecule/kubeconfig" --env K8S_AUTH_KUBECONFIG="/tmp/molecule/kubeconfig" --env MOLECULE_CLUSTER_TYPE="${CLUSTER_TYPE}" --env MOLECULE_HELM_CHARTS_REPO=/tmp/molecule/helm-charts-repo -v molecule-tests-volume:/tmp/molecule ${MOLECULE_MINIKUBE_VOL_ARG} ${MOLECULE_MINIKUBE_ENV_ARGS} ${MOLECULE_KIND_ENV_ARGS} -w /tmp/molecule/operator --network="host" ${MOLECULE_ADD_HOST_ARGS} --env DORP=podman --env OPERATOR_IMAGE_PULL_SECRET_NAME=${OPERATOR_IMAGE_PULL_SECRET_NAME} --env MOLECULE_KIALI_CR_SPEC_VERSION=${MOLECULE_KIALI_CR_SPEC_VERSION} --env PLUGIN_IMAGE_PULL_SECRET_JSON="${PLUGIN_IMAGE_PULL_SECRET_JSON}" --env MOLECULE_OSSMCONSOLE_CR_SPEC_VERSION="${MOLECULE_OSSMCONSOLE_CR_SPEC_VERSION}" ${MOLECULE_IMAGE_ENV_ARGS} ${MOLECULE_OPERATOR_PROFILER_ENABLED_ENV_VAR} ${MOLECULE_OPERATOR_INSTALLER_ENV_VAR} ${MOLECULE_DUMP_LOGS_ON_ERROR_ENV_VAR} ${MOLECULE_IMAGE_PULL_POLICY_ENV_ARGS} ${MOLECULE_WAIT_RETRIES_ARG} localhost/kiali-molecule:latest molecule ${MOLECULE_DEBUG_ARG} test ${MOLECULE_DESTROY_NEVER_ARG} --scenario-name $${msn}; if [ "$$?" != "0" ]; then echo "Molecule test failed: $${msn}"; podman volume rm molecule-tests-volume; exit 1; fi; done
+	podman volume rm molecule-tests-volume

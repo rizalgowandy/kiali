@@ -1,9 +1,9 @@
-FROM registry.access.redhat.com/ubi8-minimal AS base-amd64
-FROM registry.access.redhat.com/ubi8-minimal AS base-arm64
-FROM registry.access.redhat.com/ubi8-minimal AS base-s390x
-FROM registry.access.redhat.com/ubi8-minimal AS base-ppc64le
+FROM registry.access.redhat.com/ubi9-minimal AS base-amd64
+FROM registry.access.redhat.com/ubi9-minimal AS base-arm64
+FROM registry.access.redhat.com/ubi9-minimal AS base-s390x
+FROM registry.access.redhat.com/ubi9-minimal AS base-ppc64le
 
-FROM base-${TARGETARCH:-amd64}
+FROM base-${TARGETARCH}
 
 LABEL maintainer="kiali-dev@googlegroups.com"
 

@@ -18,23 +18,26 @@ import (
 // IstioMetricsQuery holds query parameters for a typical metrics query
 type IstioMetricsQuery struct {
 	prometheus.RangeQuery
-	Filters         []string
-	Namespace       string
-	App             string
-	Workload        string
-	Service         string
-	Direction       string // outbound | inbound
-	RequestProtocol string // e.g. http | grpc
-	Reporter        string // source | destination, defaults to source if not provided
 	Aggregate       string
 	AggregateValue  string
+	App             string
+	Cluster         string
+	Direction       string // outbound | inbound
+	IncludeAmbient  bool
+	Filters         []string
+	Namespace       string
+	RequestProtocol string // e.g. http | grpc
+	Reporter        string // source | destination | both, defaults to source if not provided
+	Service         string
+	Workload        string
 }
 
 // FillDefaults fills the struct with default parameters
 func (q *IstioMetricsQuery) FillDefaults() {
+	q.Direction = "outbound"
+	q.IncludeAmbient = false
 	q.RangeQuery.FillDefaults()
 	q.Reporter = "source"
-	q.Direction = "outbound"
 }
 
 // CustomMetricsQuery holds query parameters for a custom metrics query
@@ -60,6 +63,7 @@ type Target struct {
 	Namespace string
 	Name      string
 	Kind      string // app | workload | service
+	Cluster   string
 }
 
 type MetricsStatsQuery struct {
@@ -106,8 +110,20 @@ func (q *MetricsStatsQuery) GenKey() string {
 	}
 	return fmt.Sprintf("%s:%s:%s:%s", q.Target.GenKey(), peer, q.Direction, q.RawInterval)
 }
+
 func (t *Target) GenKey() string {
 	return fmt.Sprintf("%s:%s:%s", t.Namespace, t.Kind, t.Name)
+}
+
+// ControlPlaneMetricsQuery holds query parameters for a control plane metrics query
+type ControlPlaneMetricsQuery struct {
+	prometheus.RangeQuery
+}
+
+// FillDefaults fills the struct with default parameters
+func (q *ControlPlaneMetricsQuery) FillDefaults() {
+	q.RangeQuery.FillDefaults()
+	q.Quantiles = []string{"0.99"}
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -124,6 +140,9 @@ type Datapoint struct {
 	Timestamp int64
 	Value     float64
 }
+
+// MetricsPerNamespace map for MetricsMap per namespace
+type MetricsPerNamespace = map[string]MetricsMap
 
 // MetricsMap contains all simple metrics and histograms data for standard timeseries queries
 type MetricsMap = map[string][]Metric

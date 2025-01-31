@@ -7,7 +7,7 @@ import (
 )
 
 func TestAddMonitoringDashboards(t *testing.T) {
-	builtInListSize := 20
+	builtInListSize := 21
 
 	list := GetBuiltInMonitoringDashboards()
 	assert.Equal(t, builtInListSize, len(list))
@@ -62,7 +62,7 @@ func TestAddMonitoringDashboards(t *testing.T) {
 }
 
 func TestGetBuiltInMonitoringDashboards(t *testing.T) {
-	builtInListSize := 20
+	builtInListSize := 21
 
 	list := GetBuiltInMonitoringDashboards()
 	assert.Equal(t, builtInListSize, len(list))
@@ -78,7 +78,7 @@ func TestGetBuiltInMonitoringDashboards(t *testing.T) {
 	assert.Equal(t, 6, len(d.Items))
 	assert.Equal(t, "CPU ratio", d.Items[0].Chart.Name)
 	assert.Equal(t, 4, d.Items[0].Chart.Spans)
-	assert.Equal(t, "process_cpu_seconds_total", d.Items[0].Chart.MetricName)
+	assert.Equal(t, "container_cpu_usage_seconds_total", d.Items[0].Chart.MetricName)
 	assert.Equal(t, Rate, d.Items[0].Chart.DataType)
 }
 

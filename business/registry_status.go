@@ -1,53 +1,61 @@
 package business
 
 import (
-	"k8s.io/client-go/tools/clientcmd/api"
+	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/kiali/kiali/kubernetes"
+	"github.com/kiali/kiali/kubernetes/cache"
+	"github.com/kiali/kiali/log"
 )
 
 type RegistryStatusService struct {
-	k8s           kubernetes.ClientInterface
-	businessLayer *Layer
+	kialiCache cache.KialiCache
 }
 
-func (in *RegistryStatusService) GetRegistryStatus() ([]*kubernetes.RegistryStatus, error) {
-	if kialiCache == nil {
-		return nil, nil
+type RegistryCriteria struct {
+	// When AllNamespaces is true Namespace criteria is ignored
+	// Note this flag is only supported in Registry queries
+	AllNamespaces   bool
+	Cluster         string
+	Namespace       string
+	ServiceName     string
+	ServiceSelector string
+}
+
+func (in *RegistryStatusService) GetRegistryServices(criteria RegistryCriteria) []*kubernetes.RegistryService {
+	registryStatus := kialiCache.GetRegistryStatus(criteria.Cluster)
+	registryServices := filterRegistryServices(registryStatus, criteria)
+	return registryServices
+}
+
+func filterRegistryServices(registryStatus *kubernetes.RegistryStatus, criteria RegistryCriteria) []*kubernetes.RegistryService {
+	var filteredRegistryServices []*kubernetes.RegistryService
+	if registryStatus == nil {
+		return filteredRegistryServices
 	}
-
-	if kialiCache.CheckRegistryStatus() {
-		return kialiCache.GetRegistryStatus(), nil
+	if criteria.AllNamespaces {
+		return registryStatus.Services
 	}
-
-	var registryStatus []*kubernetes.RegistryStatus
-	var err error
-
-	if registryStatus, err = in.k8s.GetRegistryStatus(); err != nil {
-		if registryStatus, err = in.getRegistryStatusUsingKialiSA(); err != nil {
-			return nil, err
+	if criteria.Namespace != "" {
+		for _, rService := range registryStatus.Services {
+			if rService.Attributes.Namespace == criteria.Namespace {
+				filteredRegistryServices = append(filteredRegistryServices, rService)
+			}
+		}
+		if criteria.ServiceSelector != "" {
+			if selector, err3 := labels.ConvertSelectorToLabelsMap(criteria.ServiceSelector); err3 == nil {
+				var filteredSelectorServices []*kubernetes.RegistryService
+				for _, rService := range filteredRegistryServices {
+					svcSelector := labels.Set(rService.Attributes.LabelSelectors).AsSelector()
+					if !svcSelector.Empty() && svcSelector.Matches(selector) {
+						filteredSelectorServices = append(filteredSelectorServices, rService)
+					}
+				}
+				return filteredSelectorServices
+			} else {
+				log.Warningf("Services not filtered. Selector %s not valid", criteria.ServiceSelector)
+			}
 		}
 	}
-
-	kialiCache.SetRegistryStatus(registryStatus)
-	return kialiCache.GetRegistryStatus(), nil
-}
-
-func (in *RegistryStatusService) getRegistryStatusUsingKialiSA() ([]*kubernetes.RegistryStatus, error) {
-	clientFactory, err := kubernetes.GetClientFactory()
-	if err != nil {
-		return nil, err
-	}
-
-	kialiToken, err := kubernetes.GetKialiToken()
-	if err != nil {
-		return nil, err
-	}
-
-	k8s, err := clientFactory.GetClient(&api.AuthInfo{Token: kialiToken})
-	if err != nil {
-		return nil, err
-	}
-
-	return k8s.GetRegistryStatus()
+	return filteredRegistryServices
 }

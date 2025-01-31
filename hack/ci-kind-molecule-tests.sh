@@ -5,7 +5,15 @@
 #
 
 infomsg() {
-  echo "[INFO] ${1}"
+  if [ -z "${1}" ]; then
+    echo
+  else
+    if [ "${1}" == "-n" ]; then
+      echo -n "[INFO] ${2}"
+    else
+      echo "[INFO] ${1}"
+    fi
+  fi
 }
 
 helpmsg() {
@@ -13,6 +21,10 @@ helpmsg() {
 This script will run the Kiali molecule tests within a KinD cluster.
 It tests the latest published images, but has options to allow you to test dev images
 built from specified branches, thus allowing you to test PRs and other dev builds.
+These require both podman and docker installed on your local system to run since
+the molecule tests do not support docker and support for podman in kind is
+experimental. The molecule tests will run with podman against the kind cluster
+running with docker.
 
 You can use this as a cronjob to test Kiali periodically.
 
@@ -24,9 +36,8 @@ Options:
     Default: <all tests in kiali-operator repo /molecule directory>
 
 -ce <path to kubectl>
-    The full path to the 'kubectl' command.
-    If 'kubectl' is in your PATH, you can pass the option as '-ce \$(which kubectl)'
-    Default: /usr/bin/kubectl
+    The full path to the 'kubectl' command. If relative path, assumes it is in PATH.
+    Default: kubectl
 
 -ci <true|false>
     Run in continuous-integration mode. Verbose logs will be printed to stdout. (default: false).
@@ -68,6 +79,10 @@ Options:
     If not specified, the latest version of Istio is installed.
     Default: <the latest release>
 
+-ke|--kind-exe <path to KinD executable>
+    The full path to the 'kind' command. If relative path, assumes it is in PATH.
+    Default: kind
+
 -kb|--kiali-branch <branch name>
     The kiali branch to clone.
     Default: master
@@ -75,14 +90,6 @@ Options:
 -kf|--kiali-fork <name>
     The kiali fork to clone.
     Default: kiali/kiali
-
--kuib|--kiali-ui-branch <branch name>
-    The kiali-ui branch to clone.
-    Default: master
-
--kuif|--kiali-ui-fork <name>
-    The kiali-ui fork to clone.
-    Default: kiali/kiali-ui
 
 -kob|--kiali-operator-branch <branch name>
     The kiali-operator branch to clone.
@@ -94,7 +101,7 @@ Options:
 
 -lb|--logs-branch <branch name>
     The logs branch to clone.
-    Default: master
+    Default: kind
 
 -lf|--logs-fork <name>
     The logs fork/org to clone.
@@ -116,9 +123,17 @@ Options:
     than to install its own operator.
     Default: helm
 
+-ov|--olm-version <version>
+    Defines the version of OLM to test with. This is ignored if --olm-enabled=false.
+    Default: latest
+
+-rc|--rebuild-cluster <true|false>
+    If true, any existing cluster will be destroyed and a new one will be rebuilt.
+    Default: false
+
 -sd|--src-dir <directory>
     Where the git source repositories will be cloned.
-    Default: /tmp/KIALI-GIT
+    Default: /tmp/KIALI-GIT-KIND
 
 -st|--skip-tests <tests>
     Space-separated list of all the molecule tests to be skipped.
@@ -162,10 +177,9 @@ while [[ $# -gt 0 ]]; do
     -ii|--install-istio)          INSTALL_ISTIO="$2";         shift;shift; ;;
     -ir|--irc-room)               IRC_ROOM="$2";              shift;shift; ;;
     -iv|--istio-version)          ISTIO_VERSION="$2";         shift;shift; ;;
+    -ke|--kind-exe)               KIND_EXE="$2";              shift;shift; ;;
     -kb|--kiali-branch)           KIALI_BRANCH="$2";          shift;shift; ;;
     -kf|--kiali-fork)             KIALI_FORK="$2";            shift;shift; ;;
-    -kuib|--kiali-ui-branch)      UI_BRANCH="$2";             shift;shift; ;;
-    -kuif|--kiali-ui-fork)        UI_FORK="$2";               shift;shift; ;;
     -kob|--kiali-operator-branch) KIALI_OPERATOR_BRANCH="$2"; shift;shift; ;;
     -kof|--kiali-operator-fork)   KIALI_OPERATOR_FORK="$2";   shift;shift; ;;
     -lb|--logs-branch)            LOGS_BRANCH="$2";           shift;shift; ;;
@@ -173,6 +187,8 @@ while [[ $# -gt 0 ]]; do
     -lpn|--logs-project-name)     LOGS_PROJECT_NAME="$2";     shift;shift; ;;
     -oe|--olm-enabled)            OLM_ENABLED="$2";           shift;shift; ;;
     -oi|--operator-installer)     OPERATOR_INSTALLER="$2";    shift;shift; ;;
+    -ov|--olm-version)            OLM_VERSION="$2";           shift;shift; ;;
+    -rc|--rebuild-cluster)        REBUILD_CLUSTER="$2";       shift;shift; ;;
     -sd|--src-dir)                SRC="$2";                   shift;shift; ;;
     -st|--skip-tests)             SKIP_TESTS="$2";            shift;shift; ;;
     -sv|--spec-version)           SPEC_VERSION="$2";          shift;shift; ;;
@@ -186,11 +202,17 @@ done
 set -e
 
 # set up some of our defaults
-CLIENT_EXE=${CLIENT_EXE:-/usr/bin/kubectl}
-SRC="${SRC:-/tmp/KIALI-GIT}"
+CLIENT_EXE=${CLIENT_EXE:-kubectl}
+KIND_EXE=${KIND_EXE:-kind}
+SRC="${SRC:-/tmp/KIALI-GIT-KIND}"
 DORP="${DORP:-docker}"
 GIT_CLONE_PROTOCOL="${GIT_CLONE_PROTOCOL:-git}"
 OLM_ENABLED="${OLM_ENABLED:-false}"
+OLM_VERSION="${OLM_VERSION:-latest}"
+REBUILD_CLUSTER="${REBUILD_CLUSTER:-false}"
+
+CLIENT_EXE="$(which ${CLIENT_EXE} 2>/dev/null || echo "invalid kubectl: ${CLIENT_EXE}")"
+KIND_EXE="$(which ${KIND_EXE} 2>/dev/null || echo "invalid kind: ${KIND_EXE}")"
 
 KIND_NAME="${KIND_NAME:-ci}"
 CI="${CI:-false}"
@@ -205,15 +227,13 @@ HELM_FORK="${HELM_FORK:-kiali/helm-charts}"
 HELM_BRANCH="${HELM_BRANCH:-master}"
 KIALI_FORK="${KIALI_FORK:-kiali/kiali}"
 KIALI_BRANCH="${KIALI_BRANCH:-master}"
-UI_FORK="${UI_FORK:-kiali/kiali-ui}"
-UI_BRANCH="${UI_BRANCH:-master}"
 KIALI_OPERATOR_FORK="${KIALI_OPERATOR_FORK:-kiali/kiali-operator}"
 KIALI_OPERATOR_BRANCH="${KIALI_OPERATOR_BRANCH:-master}"
 
 # details about the github repo where the logs are to be stored
 LOGS_PROJECT_NAME="${LOGS_PROJECT_NAME:-kiali-molecule-test-logs}"
 LOGS_FORK="${LOGS_FORK:-jmazzitelli}"
-LOGS_BRANCH="${LOGS_BRANCH:-master}"
+LOGS_BRANCH="${LOGS_BRANCH:-kind}"
 
 LOGS_LOCAL_DIRNAME="${LOGS_PROJECT_NAME}"
 LOGS_LOCAL_DIRNAME_ABS="${SRC}/${LOGS_LOCAL_DIRNAME}"
@@ -231,8 +251,6 @@ HELM_GITHUB_GITCLONE_GIT="${GITHUB_PROTOCOL_GIT}${HELM_FORK}.git"
 HELM_GITHUB_GITCLONE_HTTPS="${GITHUB_PROTOCOL_HTTPS}${HELM_FORK}.git"
 KIALI_GITHUB_GITCLONE_GIT="${GITHUB_PROTOCOL_GIT}${KIALI_FORK}.git"
 KIALI_GITHUB_GITCLONE_HTTPS="${GITHUB_PROTOCOL_HTTPS}${KIALI_FORK}.git"
-UI_GITHUB_GITCLONE_GIT="${GITHUB_PROTOCOL_GIT}${UI_FORK}.git"
-UI_GITHUB_GITCLONE_HTTPS="${GITHUB_PROTOCOL_HTTPS}${UI_FORK}.git"
 KIALI_OPERATOR_GITHUB_GITCLONE_GIT="${GITHUB_PROTOCOL_GIT}${KIALI_OPERATOR_FORK}.git"
 KIALI_OPERATOR_GITHUB_GITCLONE_HTTPS="${GITHUB_PROTOCOL_HTTPS}${KIALI_OPERATOR_FORK}.git"
 LOGS_GITHUB_GITCLONE_GIT="${GITHUB_PROTOCOL_GIT}${LOGS_FORK}/${LOGS_PROJECT_NAME}.git"
@@ -264,12 +282,12 @@ HELM_BRANCH=$HELM_BRANCH
 HELM_FORK=$HELM_FORK
 INSTALL_ISTIO=$INSTALL_ISTIO
 IRC_ROOM=$IRC_ROOM
+ISTIO_VERSION=$ISTIO_VERSION
 KIALI_BRANCH=$KIALI_BRANCH
 KIALI_FORK=$KIALI_FORK
-UI_BRANCH=$UI_BRANCH
-UI_FORK=$UI_FORK
 KIALI_OPERATOR_BRANCH=$KIALI_OPERATOR_BRANCH
 KIALI_OPERATOR_FORK=$KIALI_OPERATOR_FORK
+KIND_EXE=$KIND_EXE
 KIND_NAME=$KIND_NAME
 LOGS_GITHUB_GITCLONE_GIT=$LOGS_GITHUB_GITCLONE_GIT
 LOGS_GITHUB_GITCLONE_HTTPS=$LOGS_GITHUB_GITCLONE_HTTPS
@@ -278,8 +296,11 @@ LOGS_GITHUB_HTTPS_SUBDIR=$LOGS_GITHUB_HTTPS_SUBDIR
 LOGS_LOCAL_RESULTS=$LOGS_LOCAL_RESULTS
 LOGS_LOCAL_SUBDIR=$LOGS_LOCAL_SUBDIR
 LOGS_LOCAL_SUBDIR_ABS=$LOGS_LOCAL_SUBDIR_ABS
+LOGS_PROJECT_NAME=$LOGS_PROJECT_NAME
 OLM_ENABLED=$OLM_ENABLED
+OLM_VERSION=$OLM_VERSION
 OPERATOR_INSTALLER=$OPERATOR_INSTALLER
+REBUILD_CLUSTER=$REBUILD_CLUSTER
 SKIP_TESTS=$SKIP_TESTS
 SPEC_VERSION=$SPEC_VERSION
 SRC=$SRC
@@ -292,21 +313,19 @@ EOM
 if [ "${GIT_CLONE_PROTOCOL}" == "git" ]; then
   HELM_GITHUB_GITCLONE="${HELM_GITHUB_GITCLONE_GIT}"
   KIALI_GITHUB_GITCLONE="${KIALI_GITHUB_GITCLONE_GIT}"
-  UI_GITHUB_GITCLONE="${UI_GITHUB_GITCLONE_GIT}"
   KIALI_OPERATOR_GITHUB_GITCLONE="${KIALI_OPERATOR_GITHUB_GITCLONE_GIT}"
   LOGS_GITHUB_GITCLONE="${LOGS_GITHUB_GITCLONE_GIT}"
 elif [ "${GIT_CLONE_PROTOCOL}" == "https" ]; then
   HELM_GITHUB_GITCLONE="${HELM_GITHUB_GITCLONE_HTTPS}"
   KIALI_GITHUB_GITCLONE="${KIALI_GITHUB_GITCLONE_HTTPS}"
-  UI_GITHUB_GITCLONE="${UI_GITHUB_GITCLONE_HTTPS}"
   KIALI_OPERATOR_GITHUB_GITCLONE="${KIALI_OPERATOR_GITHUB_GITCLONE_HTTPS}"
   LOGS_GITHUB_GITCLONE="${LOGS_GITHUB_GITCLONE_HTTPS}"
   if [ "${UPLOAD_LOGS}" == "true" ]; then
-    echo "The git clone protocol (-gcp) must be 'git' when upload logs is enabled (-ul true)."
+    infomsg "The git clone protocol (-gcp) must be 'git' when upload logs is enabled (-ul true)."
     exit 1
   fi
 else
-  echo "The git clone protocol must be one of 'git' or 'https'. It was [${GIT_CLONE_PROTOCOL}]"
+  infomsg "The git clone protocol must be one of 'git' or 'https'. It was [${GIT_CLONE_PROTOCOL}]"
   exit 1
 fi
 
@@ -322,12 +341,12 @@ fi
 test -d ${SRC}/helm-charts && rm -rf ${SRC}/helm-charts
 test -d ${SRC}/kiali-operator && rm -rf ${SRC}/kiali-operator
 test -d ${SRC}/kiali && rm -rf ${SRC}/kiali
-test -d ${SRC}/kiali-ui && rm -rf ${SRC}/kiali-ui
 test -d ${SRC}/${LOGS_PROJECT_NAME:-invalid} && [ "${SRC}/${LOGS_PROJECT_NAME}" != "/" ] && rm -rf ${SRC}/${LOGS_PROJECT_NAME:-invalid}
 mkdir -p ${SRC}
 
 infomsg "Make sure everything exists"
 test -x $CLIENT_EXE || (infomsg "kubectl executable [$CLIENT_EXE] is missing"; exit 1)
+test -x $KIND_EXE || (infomsg "kind executable [$KIND_EXE] is missing"; exit 1)
 test -d $SRC || (infomsg "Directory to git clone the repos [$SRC] is missing"; exit 1)
 which $DORP > /dev/null || (infomsg "[$DORP] is not in the PATH"; exit 1)
 
@@ -337,7 +356,7 @@ cd ${SRC}
 
 if [ "$CI" != "true" ]; then
   infomsg "Cloning logs repo [${LOGS_FORK}/${LOGS_PROJECT_NAME}:${LOGS_BRANCH}] from [${LOGS_GITHUB_GITCLONE}]..."
-  git clone --single-branch --branch ${LOGS_BRANCH} ${LOGS_GITHUB_GITCLONE} logs
+  git clone --single-branch --branch ${LOGS_BRANCH} ${LOGS_GITHUB_GITCLONE} ${LOGS_PROJECT_NAME}
 fi
 
 infomsg "Cloning helm-charts [${HELM_FORK}:${HELM_BRANCH}] from [${HELM_GITHUB_GITCLONE}]..."
@@ -352,84 +371,37 @@ git clone --single-branch --branch ${KIALI_OPERATOR_BRANCH} ${KIALI_OPERATOR_GIT
 ln -s ${SRC}/kiali-operator kiali/operator
 cd kiali
 
-KIND_EXE=`which kind`
-if [  -x "${KIND_EXE}" ]; then
-  infomsg "Kind executable: ${KIND_EXE}"
-else
-  errormsg "Cannot find the kind executable. You must install it in your PATH. For details, see: https://kind.sigs.k8s.io/docs/user/quick-start"
-  exit 1
+# TODO kind doesn't work with podman
+#if [ "${DORP}" == "podman" ]; then
+#  export KIND_EXPERIMENTAL_PROVIDER=podman
+#fi
+
+if [ "${REBUILD_CLUSTER}" == "true" ]; then
+  infomsg "Destroying any existing cluster to ensure a new one will be rebuilt."
+  ${KIND_EXE} delete cluster --name ${KIND_NAME}
 fi
 
 if ${KIND_EXE} get kubeconfig --name ${KIND_NAME} > /dev/null 2>&1; then
   infomsg "Kind cluster named [${KIND_NAME}] already exists - it will be used as-is"
 else
   infomsg "Kind cluster to be created with name [${KIND_NAME}]"
-  cat <<EOF | ${KIND_EXE} create cluster --name ${KIND_NAME} --config -
-kind: Cluster
-apiVersion: kind.x-k8s.io/v1alpha4
-nodes:
-  - role: control-plane
-  - role: worker
-EOF
-
-  infomsg "Create Kind LoadBalancer via MetalLB"
-  lb_addr_range="255.70-255.84"
-
-  ${CLIENT_EXE} apply -f https://raw.githubusercontent.com/metallb/metallb/master/manifests/namespace.yaml
-  ${CLIENT_EXE} create secret generic -n metallb-system memberlist --from-literal=secretkey="$(openssl rand -base64 128)"
-  ${CLIENT_EXE} apply -f https://raw.githubusercontent.com/metallb/metallb/master/manifests/metallb.yaml
-
-  subnet=$(${DORP} network inspect kind --format '{{(index .IPAM.Config 0).Subnet}}')
-  subnet_trimmed=$(echo ${subnet} | sed -E 's/([0-9]+\.[0-9]+)\.[0-9]+\..*/\1/')
-  first_ip="${subnet_trimmed}.$(echo "${lb_addr_range}" | cut -d '-' -f 1)"
-  last_ip="${subnet_trimmed}.$(echo "${lb_addr_range}" | cut -d '-' -f 2)"
-  cat <<LBCONFIGMAP | ${CLIENT_EXE} apply -f -
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  namespace: metallb-system
-  name: config
-data:
-  config: |
-    address-pools:
-    - name: default
-      protocol: layer2
-      addresses: ['${first_ip}-${last_ip}']
-LBCONFIGMAP
+  hack/start-kind.sh --name ${KIND_NAME} --enable-image-registry true --enable-keycloak false
 fi
 
 if [ "${USE_DEV_IMAGES}" == "true" ]; then
   infomsg "Dev images are to be tested. Will prepare them now."
 
-  infomsg "Cloning kiali-ui [${UI_FORK}:${UI_BRANCH}] from [${UI_GITHUB_GITCLONE}]..."
-  git clone --single-branch --branch ${UI_BRANCH} ${UI_GITHUB_GITCLONE} ../kiali-ui
-
-  # TODO: Remove this patch command. It's needed because of an ongoing reconciliation issue in KinD.
-  # TODO: See: https://github.com/operator-framework/operator-sdk/issues/5319
-  patch -i - operator/build/Dockerfile << EOF
-2c2
-< FROM quay.io/openshift/origin-ansible-operator:\${OPERATOR_BASE_IMAGE_VERSION}
----
-> FROM quay.io/operator-framework/ansible-operator:v1.13.0
-EOF
-
-  infomsg "Building dev image..."
-  make -e CLIENT_EXE="${CLIENT_EXE}" -e DORP="${DORP}" -e CONSOLE_LOCAL_DIR="../kiali-ui" clean build test
-
-  pushd ../kiali-ui
-  yarn && yarn build
-  popd
+  infomsg "Building dev image (backend and frontend)..."
+  make -e CLIENT_EXE="${CLIENT_EXE}" -e DORP="${DORP}" clean build test build-ui
 
   infomsg "Pushing the images into the cluster..."
-  make -e CLIENT_EXE="${CLIENT_EXE}" -e DORP="${DORP}" -e CLUSTER_TYPE="kind" -e KIND_NAME="${KIND_NAME}" -e CONSOLE_LOCAL_DIR="../kiali-ui" cluster-push
+  make -e CLIENT_EXE="${CLIENT_EXE}" -e DORP="${DORP}" -e CLUSTER_TYPE="kind" -e KIND="${KIND_EXE}" -e KIND_NAME="${KIND_NAME}" cluster-push
 else
   infomsg "Will test the latest published images"
 fi
 
 # if requested, install OLM and the Kiali Operator via OLM
 if [ "${OLM_ENABLED}" == "true" ]; then
-  OLM_VERSION="latest" # TODO might be nice to allow the user to set this via a command line option --olm-version
-
   if [ "${OLM_VERSION}" == "latest" ]; then
     OLM_VERSION="$(curl -s https://api.github.com/repos/operator-framework/operator-lifecycle-manager/releases 2> /dev/null | grep "tag_name" | sed -e 's/.*://' -e 's/ *"//' -e 's/",//' | grep -v "snapshot" | sort -t "." -k 1.2g,1 -k 2g,2 -k 3g | tail -n 1)"
     if [ -z "${OLM_VERSION}" ]; then
@@ -438,6 +410,8 @@ if [ "${OLM_ENABLED}" == "true" ]; then
     else
       infomsg "Github reports the latest OLM version is: ${OLM_VERSION}"
     fi
+  else
+      infomsg "Using the specified OLM version: ${OLM_VERSION}"
   fi
 
   # force the install.sh script to go through our client executable when it executes kubectl commands
@@ -455,22 +429,30 @@ if [ "${OLM_ENABLED}" == "true" ]; then
   infomsg "Installing Kiali Operator via OLM"
   ${CLIENT_EXE} create -f https://operatorhub.io/install/stable/kiali.yaml
 
-  echo -n "Waiting for Kiali CRD to be created."
+  infomsg -n "Waiting for Kiali CRD to be created."
   timeout 1h bash -c "until ${CLIENT_EXE} get crd kialis.kiali.io >& /dev/null; do echo -n '.' ; sleep 3; done"
-  echo
+  infomsg
 
   infomsg "Waiting for Kiali CRD to be established."
   ${CLIENT_EXE} wait --for condition=established --timeout=300s crd kialis.kiali.io
 
-  infomsg "Configuring the Kiali operator to allow ad hoc images and ad hoc namespaces."
+  infomsg -n "Waiting for operator to be created."
+  timeout 1h bash -c 'until [ -n "$(${CLIENT_EXE} get --namespace operators -o name deployments)" ]; do echo -n "." ; sleep 2; done'
+  infomsg
+
+  infomsg "Waiting for deployments to start up in the operators namespace."
+  ${CLIENT_EXE} wait --for condition=available --timeout=300s --all --namespace operators deployments
+
+  infomsg "Configuring the Kiali operator to allow ad hoc images, ad hoc namespaces, and changes to security context."
   operator_namespace="$(${CLIENT_EXE} get deployments --all-namespaces  | grep kiali-operator | cut -d ' ' -f 1)"
-  for env_name in ALLOW_AD_HOC_KIALI_NAMESPACE ALLOW_AD_HOC_KIALI_IMAGE; do
+  infomsg "Kiali operator namespace: [${operator_namespace}]"
+  for env_name in ALLOW_AD_HOC_KIALI_NAMESPACE ALLOW_AD_HOC_KIALI_IMAGE ALLOW_SECURITY_CONTEXT_OVERRIDE; do
     ${CLIENT_EXE} -n ${operator_namespace} patch $(${CLIENT_EXE} -n ${operator_namespace} get csv -o name | grep kiali) --type=json -p "[{'op':'replace','path':"/spec/install/spec/deployments/0/spec/template/spec/containers/0/env/$(${CLIENT_EXE} -n ${operator_namespace} get $(${CLIENT_EXE} -n ${operator_namespace} get csv -o name | grep kiali) -o jsonpath='{.spec.install.spec.deployments[0].spec.template.spec.containers[0].env[*].name}' | tr ' ' '\n' | cat --number | grep ${env_name} | cut -f 1 | xargs echo -n | cat - <(echo "-1") | bc)/value",'value':"\"true\""}]"
   done
   sleep 5
 
   infomsg "Waiting for the Kiali Operator to be ready."
-  ${CLIENT_EXE} wait -n ${operator_namespace} --for=condition=ready --timeout=300s $(${CLIENT_EXE} get pod -n ${operator_namespace} -l app.kubernetes.io/name=kiali-operator -o name)
+  ${CLIENT_EXE} wait --for condition=available --timeout=300s -n ${operator_namespace} deployments kiali-operator
 fi
 
 if [ "${OPERATOR_INSTALLER}" != "skip" ]; then
@@ -495,15 +477,18 @@ else
   infomsg "There is an 'istio-system' namespace - assuming Istio is installed and ready."
 fi
 
-infomsg "Building the Molecule test docker image using [${DORP}]"
-make -e FORCE_MOLECULE_BUILD="true" -e DORP="${DORP}" molecule-build
+infomsg "Building the Molecule test docker image using [podman]"
+# Need to build molecule test image with podman here because the
+# tests run with podman and the image won't be available in the
+# local registry if we build with docker.
+make -e FORCE_MOLECULE_BUILD="true" -e DORP="podman" molecule-build
 
 mkdir -p "${LOGS_LOCAL_SUBDIR_ABS}"
 infomsg "Running the tests - logs are going here: ${LOGS_LOCAL_SUBDIR_ABS}"
 if [ "${CI}" == "true" ]; then
-  eval hack/run-molecule-tests.sh $(test ! -z "$ALL_TESTS" && echo "--all-tests \"$ALL_TESTS\"") $(test ! -z "$SKIP_TESTS" && echo "--skip-tests \"$SKIP_TESTS\"") --use-dev-images "${USE_DEV_IMAGES}" --spec-version "${SPEC_VERSION}" --helm-charts-repo "${SRC}/helm-charts" --client-exe "$CLIENT_EXE" --color false --test-logs-dir "${LOGS_LOCAL_SUBDIR_ABS}" -dorp "${DORP}" --cluster-type "kind" --operator-installer "${OPERATOR_INSTALLER:-helm}" -ci true
+  eval hack/run-molecule-tests.sh $(test ! -z "$ALL_TESTS" && echo "--all-tests \"$ALL_TESTS\"") $(test ! -z "$SKIP_TESTS" && echo "--skip-tests \"$SKIP_TESTS\"") --use-dev-images "${USE_DEV_IMAGES}" --spec-version "${SPEC_VERSION}" --helm-charts-repo "${SRC}/helm-charts" --client-exe "$CLIENT_EXE" --color false --test-logs-dir "${LOGS_LOCAL_SUBDIR_ABS}" -dorp "${DORP}" --cluster-type "kind" --operator-installer "${OPERATOR_INSTALLER:-helm}" -ci true --kind-name "${KIND_NAME}" --kind-exe "${KIND_EXE}"
 else
-  eval hack/run-molecule-tests.sh $(test ! -z "$ALL_TESTS" && echo "--all-tests \"$ALL_TESTS\"") $(test ! -z "$SKIP_TESTS" && echo "--skip-tests \"$SKIP_TESTS\"") --use-dev-images "${USE_DEV_IMAGES}" --spec-version "${SPEC_VERSION}" --helm-charts-repo "${SRC}/helm-charts" --client-exe "$CLIENT_EXE" --color false --test-logs-dir "${LOGS_LOCAL_SUBDIR_ABS}" -dorp "${DORP}" --cluster-type "kind" --operator-installer "${OPERATOR_INSTALLER:-helm}" -ci false > "${LOGS_LOCAL_RESULTS}"
+  eval hack/run-molecule-tests.sh $(test ! -z "$ALL_TESTS" && echo "--all-tests \"$ALL_TESTS\"") $(test ! -z "$SKIP_TESTS" && echo "--skip-tests \"$SKIP_TESTS\"") --use-dev-images "${USE_DEV_IMAGES}" --spec-version "${SPEC_VERSION}" --helm-charts-repo "${SRC}/helm-charts" --client-exe "$CLIENT_EXE" --color false --test-logs-dir "${LOGS_LOCAL_SUBDIR_ABS}" -dorp "${DORP}" --cluster-type "kind" --operator-installer "${OPERATOR_INSTALLER:-helm}" -ci false --kind-name "${KIND_NAME}" --kind-exe "${KIND_EXE}" > "${LOGS_LOCAL_RESULTS}"
 fi
 
 cd ${LOGS_LOCAL_SUBDIR_ABS}

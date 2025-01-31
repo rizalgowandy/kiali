@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/kiali/kiali/config"
 )
 
 func TestMetricsLabelsBuilderInboundHttp(t *testing.T) {
@@ -11,7 +13,7 @@ func TestMetricsLabelsBuilderInboundHttp(t *testing.T) {
 
 	lb := NewMetricsLabelsBuilder("inbound")
 	lb.App("test", "ns")
-	lb.Reporter("source")
+	lb.Reporter("source", false)
 	lb.Protocol("http")
 	assert.Equal(`{destination_workload_namespace="ns",destination_canonical_service="test",reporter="source",request_protocol="http"}`, lb.Build())
 
@@ -25,7 +27,7 @@ func TestMetricsLabelsBuilderOutboundGrpc(t *testing.T) {
 
 	lb := NewMetricsLabelsBuilder("outbound")
 	lb.Workload("test", "ns")
-	lb.Reporter("destination")
+	lb.Reporter("destination", false)
 	lb.Protocol("grpc")
 	assert.Equal(`{source_workload_namespace="ns",source_workload="test",reporter="destination",request_protocol="grpc"}`, lb.Build())
 
@@ -51,4 +53,18 @@ func TestMetricsLabelsBuilderOutboundPeerLabels(t *testing.T) {
 	lb.Workload("test", "ns")
 	lb.PeerService("peer", "ns2")
 	assert.Equal(`{source_workload_namespace="ns",source_workload="test",destination_service_name="peer",destination_service_namespace="ns2"}`, lb.Build())
+}
+
+func TestMetricsLabelsBuilderQueryScope(t *testing.T) {
+	testConfig := config.NewConfig()
+	testConfig.ExternalServices.Prometheus.QueryScope = map[string]string{"mesh_id": "mesh1"}
+	config.Set(testConfig)
+
+	assert := assert.New(t)
+
+	lb := NewMetricsLabelsBuilder("outbound")
+	lb.QueryScope()
+	lb.Workload("test", "ns")
+	lb.PeerService("peer", "ns2")
+	assert.Equal(`{mesh_id="mesh1",source_workload_namespace="ns",source_workload="test",destination_service_name="peer",destination_service_namespace="ns2"}`, lb.Build())
 }

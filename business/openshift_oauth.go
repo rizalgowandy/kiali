@@ -1,31 +1,71 @@
 package business
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
-	"net/url"
+	"os"
 	"strings"
 	"time"
+
+	user_v1 "github.com/openshift/api/user/v1"
+	"golang.org/x/oauth2"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/log"
 )
 
-type OpenshiftOAuthService struct {
-	k8s kubernetes.ClientInterface
+const (
+	// OAuthServerCAFile is a certificate bundle used to connect to the oAuth server.
+	// This is for cases when the authentication server is using TLS with a self-signed
+	// certificate.
+	OAuthServerCAFile = "/kiali-cabundle/oauth-server-ca.crt"
+)
+
+const (
+	defaultAccessTokenAgeInSeconds = 86400 // 24 hours in seconds
+	userScopeFull                  = "user:full"
+)
+
+// TODO: Too many oauthconfigs? We don't want to expose the oauth2.Config since that
+// potentially has the secret in it but there's probably too many representations of
+// the oauthconfig.
+
+// OAuthConfig is some configuration for the OAuth service.
+type OAuthConfig struct {
+	// AuthorizationEndpoint is the url to redirect the user to for authentication.
+	// Kiali must now redirect to a url that it owns in order to first attach
+	// the nonce to the session until we can think of a better way to do this.
+	AuthorizationEndpoint string
+	RedirectURL           string
+	TokenAgeInSeconds     int
 }
 
-type OAuthMetadata struct {
-	AuthorizationEndpoint string `json:"authorizationEndpoint"`
-	LogoutEndpoint        string `json:"logoutEndpoint"`
-	LogoutRedirect        string `json:"logoutRedirect"`
+// oAuthConfig is the oauth2 config with some additional fields
+// copied over from the openshift oauthclient object.
+type oAuthConfig struct {
+	oauth2.Config
+
+	// AccessTokenMaxAgeSeconds is the maximum age of the access token in seconds.
+	AccessTokenMaxAgeSeconds int
+}
+
+type OpenshiftOAuthService struct {
+	clientFactory  kubernetes.ClientFactory
+	conf           *config.Config
+	kialiSAClients map[string]kubernetes.ClientInterface
+	oAuthConfigs   map[string]*oAuthConfig
+	certPool       *x509.CertPool
 }
 
 // Structure that's returned by the openshift oauth authorization server.
@@ -33,185 +73,236 @@ type OAuthMetadata struct {
 // more usable on our side.
 type OAuthAuthorizationServer struct {
 	AuthorizationEndpoint string `json:"authorization_endpoint"`
+	TokenEndpoint         string `json:"token_endpoint"`
 	Issuer                string `json:"issuer"`
 }
 
-type OAuthUser struct {
-	Metadata OAuthUserMetadata `json:"metadata"`
-}
-
-type OAuthUserMetadata struct {
-	Name string `json:"name"`
-}
-
-type OAuthRoute struct {
-	Spec OAuthRouteSpec `json:"spec"`
-}
-
-type OAuthRouteSpec struct {
-	Host string             `json:"host"`
-	TLS  *OAuthRouteTLSSpec `json:"tls,omitempty"`
-}
-
-type OAuthRouteTLSSpec struct {
-	Termination string `json:"termination"`
-}
-
-const serverPrefix = "https://kubernetes.default.svc/"
-
-const defaultRequestTimeout = 10 * time.Second
-
-var kialiNamespace string
-
-func (in *OpenshiftOAuthService) Metadata() (metadata *OAuthMetadata, err error) {
-	// this is the prefix of the OAuthClient name as well as the Route name
-	clientIdPrefix := config.Get().Auth.OpenShift.ClientIdPrefix
-
-	redirectURL, err := getKialiRoutePath(clientIdPrefix)
-
-	if err != nil {
-		log.Error(err)
-		message := fmt.Errorf("could not get Kiali route for OAuth redirect: %v", err)
-		return nil, message
+// Generates an http.Client with RootCAs specified in kubeconfig along with the system certs.
+func httpClientWithPool(conf *config.Config, restConfig rest.Config, systemPool *x509.CertPool) (*http.Client, error) {
+	// Need to populate CAData from CAFile.
+	if err := rest.LoadTLSFiles(&restConfig); err != nil {
+		return nil, fmt.Errorf("unable to load CA info from restConfig")
 	}
 
-	server, err := getOAuthAuthorizationServer()
+	tlsConfig, err := rest.TLSConfigFor(&restConfig)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unable to create tls config from restConfig: %s", err)
 	}
 
-	version, err := in.k8s.GetServerVersion()
-	if err != nil {
-		return nil, err
+	// We can't merge two cert pools directly so first check that some tls configuration
+	// is set and then use the original kubeConfig CAData.
+	if tlsConfig == nil {
+		tlsConfig = &tls.Config{}
 	}
 
-	metadata = &OAuthMetadata{}
-
-	namespace, err := getKialiNamespace()
-	if err != nil {
-		return nil, err
+	// If this setting is set in the Kiali config then override whatever is set on the kubeconfig.
+	if conf.Auth.OpenShift.InsecureSkipVerifyTLS {
+		tlsConfig.InsecureSkipVerify = true
 	}
 
-	if version.Major == "1" && (strings.HasPrefix(version.Minor, "11") || strings.HasPrefix(version.Minor, "10")) {
-		metadata.AuthorizationEndpoint = fmt.Sprintf("%s?client_id=%s&redirect_uri=%s&response_type=%s", server.AuthorizationEndpoint, clientIdPrefix+"-"+namespace, url.QueryEscape(*redirectURL), "token")
+	if !tlsConfig.InsecureSkipVerify {
+		// Append system certs
+		pool := systemPool.Clone()
+		if restConfig.TLSClientConfig.CAData != nil {
+			log.Trace("Appending CA data from tls client config to pool")
+			if !pool.AppendCertsFromPEM(restConfig.TLSClientConfig.CAData) {
+				return nil, fmt.Errorf("unable to append CA from restConfig to system pool: %s", restConfig.TLSClientConfig.CAData)
+			}
+		}
+		tlsConfig.RootCAs = pool
 	} else {
-		// The logout endpoint on the OpenShift OAuth Server
-		metadata.LogoutEndpoint = fmt.Sprintf("%s/logout", server.Issuer)
-		// The redirect path when logging out of the OpenShift OAuth Server. Note: this has to be a relative link to the OAuth server
-		metadata.LogoutRedirect = fmt.Sprintf("/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=%s", clientIdPrefix+"-"+namespace, url.QueryEscape(*redirectURL), "token")
-		// The fully qualified endpoint to use logging into the OpenShift OAuth server.
-		metadata.AuthorizationEndpoint = fmt.Sprintf("%s%s", server.Issuer, metadata.LogoutRedirect)
+		log.Debug("Insecure connection to oAuth server.")
 	}
-	return metadata, nil
+
+	return &http.Client{
+		Timeout:   restConfig.Timeout,
+		Transport: &http.Transport{TLSClientConfig: tlsConfig},
+	}, nil
 }
 
-func getOAuthAuthorizationServer() (*OAuthAuthorizationServer, error) {
-	var server *OAuthAuthorizationServer
-
-	response, err := request("GET", ".well-known/oauth-authorization-server", nil)
-
+// Returns a new cert Pool with the system certs appended as well as
+// any custom CA if it exists.
+func newCertPool(oAuthServerCAFilePath string) *x509.CertPool {
+	// Adding system certs in case the idp does not use the same cert as the oAuth server.
+	pool, err := x509.SystemCertPool()
 	if err != nil {
-		log.Error(err)
-		message := fmt.Errorf("could not get OAuthAuthorizationServer: %v", err)
-		return nil, message
+		log.Errorf("While initializing openshift auth, unable to read system certs: %s", err)
 	}
 
-	err = json.Unmarshal(response, &server)
-
-	if err != nil {
-		log.Error(err)
-		message := fmt.Errorf("could not parse OAuthAuthorizationServer: %v", err)
-		return nil, message
+	if pool == nil {
+		pool = x509.NewCertPool()
 	}
 
-	return server, nil
+	if b, err := os.ReadFile(oAuthServerCAFilePath); err == nil {
+		if ok := pool.AppendCertsFromPEM(b); !ok {
+			log.Errorf("Unable to append oAuth server CA to cert pool. Ensure that your CA bundle file: '%s' is formatted correctly as a PEM encoded block", oAuthServerCAFilePath)
+		}
+	} else if !os.IsNotExist(err) {
+		log.Errorf("Unable to read oAuth server CA from bundle file '%s': %s", oAuthServerCAFilePath, err)
+	}
+
+	return pool
 }
 
-func (in *OpenshiftOAuthService) GetUserInfo(token string) (*OAuthUser, error) {
-	var user *OAuthUser
+// NewOpenshiftOAuthService creates a new OpenshiftOAuthService.
+// It will try to autodiscover the OAuth server configuration from each cluster.
+// It also assumes that you've created an OAuthClient for Kiali in each cluster.
+func NewOpenshiftOAuthService(ctx context.Context, conf *config.Config, kialiSAClients map[string]kubernetes.ClientInterface, clientFactory kubernetes.ClientFactory, oAuthServerCustomCAFilePath string) (*OpenshiftOAuthService, error) {
+	oAuthConfigs := make(map[string]*oAuthConfig)
 
-	response, err := request("GET", "apis/user.openshift.io/v1/users/~", &token)
+	// Creating a single context for all the clusters.
+	var cancel context.CancelFunc
+	// How many times we're going to try to get the oAuth metdata.
+	// After a minute we should give up.
+	oneMinuteFromNow := time.Now().Add(time.Minute)
+	ctx, cancel = context.WithDeadline(ctx, oneMinuteFromNow)
+	defer cancel()
 
-	if err != nil {
-		log.Error(err)
-		return nil, fmt.Errorf("could not get user info from Openshift: %v", err)
+	pool := newCertPool(oAuthServerCustomCAFilePath)
+
+	// TODO: We could parallelize this to potentially speed up the process.
+	for cluster, client := range kialiSAClients {
+		if !client.IsOpenShift() {
+			log.Infof("While setting up the OAuthService, skipping cluster [%s] because it is not an OpenShift cluster", cluster)
+			continue
+		}
+
+		log.Debugf("Getting OAuth config for cluster [%s]", cluster)
+		// Use CA info from kube config.
+		url := client.ClusterInfo().ClientConfig.Host + "/.well-known/oauth-authorization-server"
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request for fetching oauth server metadata from kube api server url [%s]. Likely the url is malformed. Error: %s", url, err)
+		}
+		request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", client.GetToken()))
+
+		httpClient, err := httpClientWithPool(conf, *client.ClusterInfo().ClientConfig, pool)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create http client for fetching oauth server metadata from kube api server [%s], error: %s", url, err)
+		}
+
+		var response []byte
+		err = wait.PollUntilContextCancel(ctx, time.Second*10, true, func(ctx context.Context) (bool, error) {
+			// TODO: Catch specific errors and retry only on those?
+			var err error
+			response, err = doRequest(httpClient, request)
+			if err != nil {
+				log.Infof("Failed to get oauth metadata from Kubernetes API server for endpoint [%s]. Error: %s. Retrying...", url, err)
+				return false, nil
+			}
+
+			return true, nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to get oauth metadata from Kubernetes API server for endpoint [%s]. Error: %s", url, err)
+		}
+
+		oAuthServer := &OAuthAuthorizationServer{}
+		if err := json.Unmarshal(response, &oAuthServer); err != nil {
+			log.Error(err)
+			message := fmt.Errorf("could not parse OAuthAuthorizationServer: %v", err)
+			return nil, message
+		}
+
+		// Get the OAuthClient for Kiali. This is created by the operator or the helm chart.
+		kialiOAuthClientName := conf.Deployment.InstanceName + "-" + conf.Deployment.Namespace
+		oAuthClient, err := client.GetOAuthClient(ctx, kialiOAuthClientName)
+		if err != nil {
+			log.Errorf("Could not get OAuth client: %v", err)
+			return nil, err
+		}
+
+		if len(oAuthClient.RedirectURIs) == 0 {
+			return nil, fmt.Errorf("oAuth client has no redirect URIs")
+		}
+
+		oAuthConfig := &oAuthConfig{
+			Config: oauth2.Config{
+				ClientID:    oAuthClient.Name,
+				RedirectURL: oAuthClient.RedirectURIs[0],
+				Scopes:      []string{userScopeFull},
+				Endpoint: oauth2.Endpoint{
+					AuthURL:  oAuthServer.AuthorizationEndpoint,
+					TokenURL: oAuthServer.TokenEndpoint,
+				},
+			},
+		}
+
+		if oAuthClient.AccessTokenMaxAgeSeconds != nil {
+			oAuthConfig.AccessTokenMaxAgeSeconds = int(*oAuthClient.AccessTokenMaxAgeSeconds)
+		} else {
+			oAuthConfig.AccessTokenMaxAgeSeconds = defaultAccessTokenAgeInSeconds
+		}
+
+		oAuthConfigs[cluster] = oAuthConfig
 	}
 
-	err = json.Unmarshal(response, &user)
+	return &OpenshiftOAuthService{
+		clientFactory:  clientFactory,
+		conf:           conf,
+		kialiSAClients: kialiSAClients,
+		oAuthConfigs:   oAuthConfigs,
+		certPool:       pool,
+	}, nil
+}
 
+// Exchange exchanges the code for a token that can be used to talk to the kube API server.
+func (in *OpenshiftOAuthService) Exchange(ctx context.Context, code string, verifier string, cluster string) (*oauth2.Token, error) {
+	client := in.kialiSAClients[cluster]
+	if client == nil {
+		return nil, fmt.Errorf("could not get ServiceAccount client for cluster [%s]", cluster)
+	}
+
+	httpClient, err := httpClientWithPool(in.conf, *client.ClusterInfo().ClientConfig, in.certPool)
 	if err != nil {
-		log.Error(err)
-		return nil, fmt.Errorf("could not parse user info from Openshift: %v", err)
+		return nil, fmt.Errorf("failed to create http client for oauth consumption, error: %s", err)
+	}
+
+	oAuthConfig := in.oAuthConfigs[cluster]
+	if oAuthConfig == nil {
+		return nil, fmt.Errorf("could not get OAuth config for cluster [%s]", cluster)
+	}
+
+	ctx = context.WithValue(ctx, oauth2.HTTPClient, httpClient)
+	tok, err := oAuthConfig.Exchange(ctx, code, oauth2.VerifierOption(verifier))
+	if err != nil {
+		return nil, fmt.Errorf("could not exchange the code for a token: %v", err)
+	}
+
+	return tok, nil
+}
+
+// AuthCodeURL returns the URL to redirect the user to for authentication.
+func (in *OpenshiftOAuthService) AuthCodeURL(verifier string, cluster string) (string, error) {
+	oAuthConfig := in.oAuthConfigs[cluster]
+	if oAuthConfig == nil {
+		return "", fmt.Errorf("could not get OAuth config for cluster [%s]", cluster)
+	}
+
+	return oAuthConfig.AuthCodeURL("", oauth2.S256ChallengeOption(verifier)), nil
+}
+
+func (in *OpenshiftOAuthService) GetUserInfo(ctx context.Context, token string, cluster string) (*user_v1.User, error) {
+	userClient, err := in.clientFactory.GetClient(&api.AuthInfo{Token: token}, cluster)
+	if err != nil {
+		return nil, fmt.Errorf("could not get client for user info: %w", err)
+	}
+
+	user, err := userClient.GetUser(ctx, "~")
+	if err != nil {
+		return nil, fmt.Errorf("could not get user info: %w", err)
 	}
 
 	return user, nil
 }
 
-func getKialiNamespace() (string, error) {
-	if kialiNamespace == "" {
-		namespace, err := ioutil.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-		if err != nil {
-			return "", err
-		}
-		kialiNamespace = string(namespace)
-	}
-	return kialiNamespace, nil
-}
-
-func getKialiRoutePath(routeName string) (*string, error) {
-	var route *OAuthRoute
-	var protocol string
-
-	namespace, err := getKialiNamespace()
-	if err != nil {
-		log.Error(err)
-		return nil, fmt.Errorf("cannot read Kiali's Namespace: %v", err)
-	}
-
-	conf, err := kubernetes.ConfigClient()
-	if err != nil {
-		log.Error(err)
-		return nil, fmt.Errorf("could not get openshift config client: %v", err)
-	}
-
-	response, err := request("GET", fmt.Sprintf("apis/route.openshift.io/v1/namespaces/%v/routes/%s", namespace, routeName), &conf.BearerToken)
-	if err != nil {
-		log.Error(err)
-		return nil, fmt.Errorf("could not connect to Openshift: %v", err)
-	}
-
-	err = json.Unmarshal(response, &route)
-	if err != nil {
-		log.Error(err)
-		return nil, fmt.Errorf("cannot parse Kiali route: %v", err)
-	}
-
-	if route.Spec.TLS == nil {
-		protocol = "http://"
-	} else {
-		protocol = "https://"
-	}
-
-	url := strings.Join([]string{protocol, route.Spec.Host}, "")
-
-	return &url, nil
-}
-
-func (in *OpenshiftOAuthService) Logout(token string) error {
-	conf, err := kubernetes.ConfigClient()
-
-	if err != nil {
-		log.Error(err)
-		return fmt.Errorf("could not connect to Openshift: %v", err)
-	}
-
+// Logout deletes the oauth access token from the API server.
+func (in *OpenshiftOAuthService) Logout(ctx context.Context, token string, cluster string) error {
 	// https://github.com/kiali/kiali/issues/3595
 	// OpenShift 4.6+ changed the format of the OAuthAccessToken.
 	// In pre-4.6, the access_token given to the client is the same name as the OAuthAccessToken resource.
 	// In 4.6+, that is not true anymore - you have to encode the access_token to obtain the OAuthAccessToken resource name.
 	// The code below will attempt to delete the access token using the new 4.6+ format.
-	// If this first delete attempt fails, an attempt will immediately be made to delete using the old pre-4.6 name.
-	// This will allow for supporting running Kiali in pre-4.6 OpenShift.
 
 	// convert the access token to the corresponding oauthaccesstoken resource name
 	// see: https://github.com/openshift/console/blob/9f352ba49f82ad693a72d0d35709961428b43b93/pkg/server/server.go#L609-L613
@@ -221,75 +312,43 @@ func (in *OpenshiftOAuthService) Logout(token string) error {
 	log.Debugf("Logging out by deleting OAuth access token [%v] which was converted from access token [%v]", oauthTokenName, token)
 
 	// Delete the access token from the API server using OpenShift 4.6+ access token name
-	_, err = request("DELETE", fmt.Sprintf("apis/oauth.openshift.io/v1/oauthaccesstokens/%v", oauthTokenName), &conf.BearerToken)
-
-	if err != nil {
-		// Try to delete the access token from the API server using the pre-4.6 access token name.
-		// If this also fails, we'll send back the err from the first attempt.
-		// If this succeeds, set err to nil to indicate a successful logout.
-		_, err2 := request("DELETE", fmt.Sprintf("apis/oauth.openshift.io/v1/oauthaccesstokens/%v", token), &conf.BearerToken)
-		if err2 == nil {
-			err = nil
-		}
+	kialiSAClient := in.kialiSAClients[cluster]
+	if kialiSAClient == nil {
+		return fmt.Errorf("could not get ServiceAccount client for cluster [%s]", cluster)
 	}
 
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return kialiSAClient.DeleteOAuthToken(ctx, oauthTokenName)
 }
 
-func request(method string, url string, auth *string) ([]byte, error) {
-	return requestWithTimeout(method, url, auth, time.Duration(defaultRequestTimeout))
-}
-
-func requestWithTimeout(method string, url string, auth *string, timeout time.Duration) ([]byte, error) {
-	certPool := x509.NewCertPool()
-	cert, err := ioutil.ReadFile("/run/secrets/kubernetes.io/serviceaccount/ca.crt")
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to get root CA certificates: %s", err)
+func (in *OpenshiftOAuthService) OAuthConfig(cluster string) (*OAuthConfig, error) {
+	oAuthConfig := in.oAuthConfigs[cluster]
+	if oAuthConfig == nil {
+		return nil, fmt.Errorf("OAuth config does not exist for cluster [%s]", cluster)
 	}
 
-	certPool.AppendCertsFromPEM(cert)
+	return &OAuthConfig{
+		RedirectURL:       oAuthConfig.RedirectURL,
+		TokenAgeInSeconds: oAuthConfig.AccessTokenMaxAgeSeconds,
+	}, nil
+}
 
-	tlsConfig := &tls.Config{RootCAs: certPool}
-
-	client := &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			TLSClientConfig: tlsConfig,
-		}}
-
+func doRequest(client *http.Client, request *http.Request) ([]byte, error) {
 	defer client.CloseIdleConnections()
 
-	request, err := http.NewRequest(method, strings.Join([]string{serverPrefix, url}, ""), nil)
-
-	if err != nil {
-		return nil, fmt.Errorf("Failed to create request for api endpoint [%s] for oauth consumption, error: %s", url, err)
-	}
-
-	if auth != nil {
-		request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *auth))
-	}
-
 	response, err := client.Do(request)
-
 	if err != nil {
-		return nil, fmt.Errorf("Failed to get response for api endpoint [%s] for oauth consumption, error: %s", url, err)
+		return nil, fmt.Errorf("failed to get response for api endpoint [%s] for oauth consumption, error: %s", request.URL, err)
 	}
 
 	defer response.Body.Close()
 
-	body, err := ioutil.ReadAll(response.Body)
-
+	body, err := io.ReadAll(response.Body)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to read response body for api endpoint [%s] for oauth consumption, error: %s", url, err)
+		return nil, fmt.Errorf("failed to read response body for api endpoint [%s] for oauth consumption, error: %s", request.URL, err)
 	}
 
 	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("Failed to get OK status from api endpoint [%s] for oauth consumption, error: %s", url, string(body))
+		return nil, fmt.Errorf("failed to get OK status from api endpoint [%s] for oauth consumption, error: %s", request.URL, string(body))
 	}
 
 	return body, nil

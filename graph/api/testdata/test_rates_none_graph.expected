@@ -6,16 +6,16 @@
     "nodes": [
       {
         "data": {
-          "id": "722acba99d3e761608c9797ae63494e4",
+          "id": "4bd27abd1d0da1555deb8144a7110ff733792e22662a41c520d09d7d4dc34820",
           "nodeType": "workload",
-          "cluster": "unknown",
+          "cluster": "east",
           "namespace": "bankapp",
           "workload": "deposit-v1",
           "app": "deposit",
           "version": "v1",
           "destServices": [
             {
-              "cluster": "unknown",
+              "cluster": "east",
               "namespace": "bankapp",
               "name": "deposit"
             }
@@ -28,15 +28,16 @@
               }
             }
           ],
+          "healthData": null,
           "isInaccessible": true,
           "isOutside": true
         }
       },
       {
         "data": {
-          "id": "aa79c6b34228bebc55a417555ccc779e",
+          "id": "75e6bff154aefcf8a8dcf46396a6d897afb9ad7b256b70d7e2ea5a5e8ed98242",
           "nodeType": "workload",
-          "cluster": "unknown",
+          "cluster": "east",
           "namespace": "bookinfo",
           "workload": "productpage-v1",
           "app": "productpage",
@@ -49,14 +50,15 @@
               }
             }
           ],
+          "healthData": null,
           "isRoot": true
         }
       },
       {
         "data": {
-          "id": "a31610f853c036d085df2b80c2f24615",
+          "id": "1e4148c5bef0363ad2d1768561fee88cbb32472c458cea990374e23224998811",
           "nodeType": "workload",
-          "cluster": "unknown",
+          "cluster": "east",
           "namespace": "bookinfo",
           "workload": "reviews-v3",
           "app": "reviews",
@@ -69,21 +71,22 @@
               }
             }
           ],
+          "healthData": null,
           "isRoot": true
         }
       },
       {
         "data": {
-          "id": "03533eaac2b4b0973ed07a0c2c7ef8d7",
+          "id": "4b4c0547ac843fd48ba81b7c72d5602d8e32ab580d3184f68d5a64825c7cb5e6",
           "nodeType": "workload",
-          "cluster": "unknown",
+          "cluster": "east",
           "namespace": "bookinfo",
           "workload": "tcp-v1",
           "app": "tcp",
           "version": "v1",
           "destServices": [
             {
-              "cluster": "unknown",
+              "cluster": "east",
               "namespace": "bookinfo",
               "name": "tcp"
             }
@@ -95,14 +98,15 @@
                 "tcpIn": "1743.00"
               }
             }
-          ]
+          ],
+          "healthData": null
         }
       },
       {
         "data": {
-          "id": "d5644516f2f70a6e887a3d366876c647",
+          "id": "294cc51c6a37db5f2f644f7b121233dadc9cccf5686b31c9722c1fa72e8caa30",
           "nodeType": "workload",
-          "cluster": "unknown",
+          "cluster": "east",
           "namespace": "istio-system",
           "workload": "ingressgateway-unknown",
           "app": "ingressgateway",
@@ -115,6 +119,7 @@
               }
             }
           ],
+          "healthData": null,
           "isInaccessible": true,
           "isOutside": true,
           "isRoot": true
@@ -122,7 +127,7 @@
       },
       {
         "data": {
-          "id": "375ab940b56ae7bcf0f89cb1a7af5d44",
+          "id": "65be8a76856b9d3ef07a3348abcf6476fc80408bd342dd7882a5f4274542a1e0",
           "nodeType": "unknown",
           "cluster": "unknown",
           "namespace": "unknown",
@@ -137,6 +142,7 @@
               }
             }
           ],
+          "healthData": null,
           "isInaccessible": true,
           "isRoot": true
         }
@@ -145,9 +151,53 @@
     "edges": [
       {
         "data": {
-          "id": "55798fbf115d0652891f91961c34dbad",
-          "source": "375ab940b56ae7bcf0f89cb1a7af5d44",
-          "target": "03533eaac2b4b0973ed07a0c2c7ef8d7",
+          "id": "d7311f910ca87f99a5fa2ec3de300c0c14115f378f47dcb32bf7fb63f6fdfd3c",
+          "source": "1e4148c5bef0363ad2d1768561fee88cbb32472c458cea990374e23224998811",
+          "target": "4bd27abd1d0da1555deb8144a7110ff733792e22662a41c520d09d7d4dc34820",
+          "traffic": {
+            "protocol": "grpc",
+            "rates": {
+              "grpc": "150.00",
+              "grpcPercentReq": "100.0"
+            },
+            "responses": {
+              "-": {
+                "hosts": {
+                  "deposit:9080": "100.0"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "d324954539c3f2437dad37168cda833d890c0b48b8a5f490a588d48a0f33168a",
+          "source": "294cc51c6a37db5f2f644f7b121233dadc9cccf5686b31c9722c1fa72e8caa30",
+          "target": "4b4c0547ac843fd48ba81b7c72d5602d8e32ab580d3184f68d5a64825c7cb5e6",
+          "traffic": {
+            "protocol": "tcp",
+            "rates": {
+              "tcp": "450.00"
+            },
+            "responses": {
+              "-": {
+                "flags": {
+                  "-": "100.0"
+                },
+                "hosts": {
+                  "tcp:9080": "100.0"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "data": {
+          "id": "b59d7fb631f53aafcc96bf74028f008383c210fd345913021f605244360be047",
+          "source": "65be8a76856b9d3ef07a3348abcf6476fc80408bd342dd7882a5f4274542a1e0",
+          "target": "4b4c0547ac843fd48ba81b7c72d5602d8e32ab580d3184f68d5a64825c7cb5e6",
           "traffic": {
             "protocol": "tcp",
             "rates": {
@@ -168,57 +218,13 @@
       },
       {
         "data": {
-          "id": "230f85dfbf8a828cfcd5379a49876de7",
-          "source": "a31610f853c036d085df2b80c2f24615",
-          "target": "722acba99d3e761608c9797ae63494e4",
-          "traffic": {
-            "protocol": "grpc",
-            "rates": {
-              "grpc": "150.00",
-              "grpcPercentReq": "100.0"
-            },
-            "responses": {
-              "-": {
-                "hosts": {
-                  "deposit:9080": "100.0"
-                }
-              }
-            }
-          }
-        }
-      },
-      {
-        "data": {
-          "id": "5686985336f05006df3ae891e7ff84d0",
-          "source": "aa79c6b34228bebc55a417555ccc779e",
-          "target": "03533eaac2b4b0973ed07a0c2c7ef8d7",
+          "id": "a1ec7f03f76bddadc061a3f1a93a5e7abf5b5077fe7cf3e3942f6d8a53c7731b",
+          "source": "75e6bff154aefcf8a8dcf46396a6d897afb9ad7b256b70d7e2ea5a5e8ed98242",
+          "target": "4b4c0547ac843fd48ba81b7c72d5602d8e32ab580d3184f68d5a64825c7cb5e6",
           "traffic": {
             "protocol": "tcp",
             "rates": {
               "tcp": "93.00"
-            },
-            "responses": {
-              "-": {
-                "flags": {
-                  "-": "100.0"
-                },
-                "hosts": {
-                  "tcp:9080": "100.0"
-                }
-              }
-            }
-          }
-        }
-      },
-      {
-        "data": {
-          "id": "ddc66fe0aacf6094ae85a13ab442f973",
-          "source": "d5644516f2f70a6e887a3d366876c647",
-          "target": "03533eaac2b4b0973ed07a0c2c7ef8d7",
-          "traffic": {
-            "protocol": "tcp",
-            "rates": {
-              "tcp": "450.00"
             },
             "responses": {
               "-": {
