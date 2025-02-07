@@ -1,13 +1,23 @@
 package models
 
-import "time"
+import (
+	"time"
 
-type JaegerInfo struct {
-	Enabled              bool     `json:"enabled"`
-	Integration          bool     `json:"integration"`
-	URL                  string   `json:"url"`
-	NamespaceSelector    bool     `json:"namespaceSelector"`
-	WhiteListIstioSystem []string `json:"whiteListIstioSystem"`
+	"github.com/kiali/kiali/config"
+)
+
+const (
+	IstioClusterTag string = "istio.cluster_id"
+)
+
+type TracingInfo struct {
+	Enabled              bool               `json:"enabled"`
+	Integration          bool               `json:"integration"`
+	Provider             string             `json:"provider"`
+	TempoConfig          config.TempoConfig `json:"tempoConfig"`
+	URL                  string             `json:"url"`
+	NamespaceSelector    bool               `json:"namespaceSelector"`
+	WhiteListIstioSystem []string           `json:"whiteListIstioSystem"`
 }
 
 type TracingQuery struct {
@@ -16,4 +26,5 @@ type TracingQuery struct {
 	Tags        map[string]string
 	MinDuration time.Duration
 	Limit       int
+	Cluster     string
 }

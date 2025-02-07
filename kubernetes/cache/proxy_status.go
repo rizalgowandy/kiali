@@ -2,73 +2,43 @@ package cache
 
 import (
 	"strings"
-	"time"
 
 	"github.com/kiali/kiali/kubernetes"
 )
 
-type (
-	ProxyStatusCache interface {
-		CheckProxyStatus() bool
-		GetPodProxyStatus(namespace, pod string) *kubernetes.ProxyStatus
-		SetProxyStatus(proxyStatus []*kubernetes.ProxyStatus)
-		RefreshProxyStatus()
-	}
-)
-
-func (c *kialiCacheImpl) CheckProxyStatus() bool {
-	defer c.proxyStatusLock.RUnlock()
-	c.proxyStatusLock.RLock()
-	if c.proxyStatusCreated == nil {
-		return false
-	}
-	if time.Since(*c.proxyStatusCreated) > c.tokenNamespaceDuration {
-		return false
-	}
-	return true
+func proxyStatusKey(cluster, namespace, pod string) string {
+	return cluster + namespace + pod
 }
 
-func (c *kialiCacheImpl) GetPodProxyStatus(namespace, pod string) *kubernetes.ProxyStatus {
-	defer c.proxyStatusLock.RUnlock()
-	c.proxyStatusLock.RLock()
-	if nsProxyStatus, ok := c.proxyStatusNamespaces[namespace]; ok {
-		if podProxyStatus, ok := nsProxyStatus[pod]; ok {
-			return podProxyStatus.proxyStatus
-		}
-	}
-	return nil
+type ProxyStatusCache interface {
+	SetPodProxyStatus([]*kubernetes.ProxyStatus)
+	GetPodProxyStatus(cluster, namespace, pod string) *kubernetes.ProxyStatus
 }
 
-func (c *kialiCacheImpl) SetProxyStatus(proxyStatus []*kubernetes.ProxyStatus) {
-	defer c.proxyStatusLock.Unlock()
-	c.proxyStatusLock.Lock()
-	if len(proxyStatus) > 0 {
-		timeNow := time.Now()
-		c.proxyStatusCreated = &timeNow
-		for _, ps := range proxyStatus {
-			if ps != nil {
-				// Expected format <pod-name>.<namespace>
-				// "proxy": "control-7bcc64d69d-qzsdk.travel-control"
-				podId := strings.Split(ps.ProxyID, ".")
-				if len(podId) == 2 {
-					pod := podId[0]
-					ns := podId[1]
-					if _, exist := c.proxyStatusNamespaces[ns]; !exist {
-						c.proxyStatusNamespaces[ns] = make(map[string]podProxyStatus)
-					}
-					c.proxyStatusNamespaces[ns][pod] = podProxyStatus{
-						namespace:   ns,
-						pod:         pod,
-						proxyStatus: ps,
-					}
-				}
+func (c *kialiCacheImpl) SetPodProxyStatus(proxyStatus []*kubernetes.ProxyStatus) {
+	podProxyByID := make(map[string]*kubernetes.ProxyStatus)
+	for _, ps := range proxyStatus {
+		if ps != nil {
+			// Expected format <pod-name>.<namespace>
+			// "proxy": "control-7bcc64d69d-qzsdk.travel-control"
+			podId := strings.Split(ps.ProxyID, ".")
+			if len(podId) == 2 {
+				pod := podId[0]
+				ns := podId[1]
+				cluster := ps.ClusterID
+				key := proxyStatusKey(cluster, ns, pod)
+				podProxyByID[key] = ps
 			}
 		}
 	}
+	c.proxyStatusStore.Replace(podProxyByID)
 }
 
-func (c *kialiCacheImpl) RefreshProxyStatus() {
-	defer c.proxyStatusLock.Unlock()
-	c.proxyStatusLock.Lock()
-	c.proxyStatusNamespaces = make(map[string]map[string]podProxyStatus)
+func (c *kialiCacheImpl) GetPodProxyStatus(cluster, namespace, pod string) *kubernetes.ProxyStatus {
+	key := proxyStatusKey(cluster, namespace, pod)
+	proxyStatus, found := c.proxyStatusStore.Get(key)
+	if !found {
+		return nil
+	}
+	return proxyStatus
 }

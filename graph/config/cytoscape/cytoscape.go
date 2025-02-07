@@ -12,10 +12,11 @@
 //            nodes for requested boxing.
 //
 // The package provides the Cytoscape implementation of graph/ConfigVendor.
+
 package cytoscape
 
 import (
-	"crypto/md5"
+	"crypto/sha256"
 	"fmt"
 	"sort"
 	"strings"
@@ -25,17 +26,19 @@ import (
 
 // ResponseFlags is a map of maps. Each response code is broken down by responseFlags:percentageOfTraffic, e.g.:
 // "200" : {
-//    "-"     : "80.0",
-//    "DC"    : "10.0",
-//    "FI,FD" : "10.0"
+//	"-"     : "80.0",
+//	"DC"    : "10.0",
+//	"FI,FD" : "10.0"
 // }, ...
+
 type ResponseFlags map[string]string
 
 // ResponseHosts is a map of maps. Each response host is broken down by responseFlags:percentageOfTraffic, e.g.:
-// "200" : {
-//    "www.google.com" : "80.0",
-//    "www.yahoo.com"  : "20.0"
-// }, ...
+//
+//	"200" : {
+//	   "www.google.com" : "80.0",
+//	   "www.yahoo.com"  : "20.0"
+//	}, ...
 type ResponseHosts map[string]string
 
 // ResponseDetail holds information broken down by response code.
@@ -58,6 +61,10 @@ type ProtocolTraffic struct {
 type GWInfo struct {
 	// IngressInfo contains the resolved gateway configuration if the node represents an Istio ingress gateway
 	IngressInfo GWInfoIngress `json:"ingressInfo,omitempty"`
+	// EgressInfo contains the resolved gateway configuration if the node represents an Istio egress gateway
+	EgressInfo GWInfoIngress `json:"egressInfo,omitempty"`
+	// GatewayAPIInfo contains the resolved gateway configuration if the node represents a Gateway API gateway
+	GatewayAPIInfo GWInfoIngress `json:"gatewayAPIInfo,omitempty"`
 }
 
 // GWInfoIngress contains the resolved gateway configuration if the node represents an Istio ingress gateway
@@ -90,26 +97,38 @@ type NodeData struct {
 	Service               string              `json:"service,omitempty"`               // requested service for NodeTypeService
 	Aggregate             string              `json:"aggregate,omitempty"`             // set like "<aggregate>=<aggregateVal>"
 	DestServices          []graph.ServiceName `json:"destServices,omitempty"`          // requested services for [dest] node
+	Labels                map[string]string   `json:"labels,omitempty"`                // k8s labels associated with the node
 	Traffic               []ProtocolTraffic   `json:"traffic,omitempty"`               // traffic rates for all detected protocols
+	HealthData            interface{}         `json:"healthData"`                      // data to calculate health status from configurations
+	HealthDataApp         interface{}         `json:"-"`                               // for local use to generate appBox health
 	HasCB                 bool                `json:"hasCB,omitempty"`                 // true (has circuit breaker) | false
 	HasFaultInjection     bool                `json:"hasFaultInjection,omitempty"`     // true (vs has fault injection) | false
 	HasHealthConfig       HealthConfig        `json:"hasHealthConfig,omitempty"`       // set to the health config override
 	HasMirroring          bool                `json:"hasMirroring,omitempty"`          // true (has mirroring) | false
-	HasMissingSC          bool                `json:"hasMissingSC,omitempty"`          // true (has missing sidecar) | false
 	HasRequestRouting     bool                `json:"hasRequestRouting,omitempty"`     // true (vs has request routing) | false
 	HasRequestTimeout     bool                `json:"hasRequestTimeout,omitempty"`     // true (vs has request timeout) | false
 	HasTCPTrafficShifting bool                `json:"hasTCPTrafficShifting,omitempty"` // true (vs has tcp traffic shifting) | false
 	HasTrafficShifting    bool                `json:"hasTrafficShifting,omitempty"`    // true (vs has traffic shifting) | false
 	HasVS                 *VSInfo             `json:"hasVS,omitempty"`                 // it can be empty if there is a VS without hostnames
 	HasWorkloadEntry      []graph.WEInfo      `json:"hasWorkloadEntry,omitempty"`      // static workload entry information | empty if there are no workload entries
+	IsAmbient             bool                `json:"isAmbient,omitempty"`             // true (captured by ambient) | false
 	IsBox                 string              `json:"isBox,omitempty"`                 // set for NodeTypeBox, current values: [ 'app', 'cluster', 'namespace' ]
 	IsDead                bool                `json:"isDead,omitempty"`                // true (has no pods) | false
+	IsExtension           *graph.ExtInfo      `json:"isExtension,omitempty"`           // set for Extension nodes, with extension info
 	IsGateway             *GWInfo             `json:"isGateway,omitempty"`             // Istio ingress/egress gateway information
 	IsIdle                bool                `json:"isIdle,omitempty"`                // true | false
 	IsInaccessible        bool                `json:"isInaccessible,omitempty"`        // true if the node exists in an inaccessible namespace
+	IsK8sGatewayAPI       bool                `json:"isK8sGatewayAPI,omitempty"`       // true (object is auto-generated from K8s API Gateway) | false
+	IsOutOfMesh           bool                `json:"isOutOfMesh,omitempty"`           // true (has missing sidecar) | false
 	IsOutside             bool                `json:"isOutside,omitempty"`             // true | false
 	IsRoot                bool                `json:"isRoot,omitempty"`                // true | false
 	IsServiceEntry        *graph.SEInfo       `json:"isServiceEntry,omitempty"`        // set static service entry information
+	IsWaypoint            bool                `json:"isWaypoint,omitempty"`            // true | false
+}
+
+type WaypointEdge struct {
+	Direction string    `json:"direction"`          // WaypointEdgeDirectionTo | WaypointEdgeDirectionFrom
+	FromEdge  *EdgeData `json:"fromEdge,omitempty"` // for a bi-directional 'to' waypoint edge, this is the return 'from' edge
 }
 
 type EdgeData struct {
@@ -125,6 +144,7 @@ type EdgeData struct {
 	SourcePrincipal string          `json:"sourcePrincipal,omitempty"` // principal used for the edge source
 	Throughput      string          `json:"throughput,omitempty"`      // in bytes/sec (request or response, depends on client request)
 	Traffic         ProtocolTraffic `json:"traffic,omitempty"`         // traffic rates for the edge protocol
+	Waypoint        *WaypointEdge   `json:"waypoint,omitempty"`        // Biderectional edges for waypoint nodes
 }
 
 type NodeWrapper struct {
@@ -148,11 +168,11 @@ type Config struct {
 }
 
 func nodeHash(id string) string {
-	return fmt.Sprintf("%x", md5.Sum([]byte(id)))
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(id)))
 }
 
 func edgeHash(from, to, protocol string) string {
-	return fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%s.%s.%s", from, to, protocol))))
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%s.%s.%s", from, to, protocol))))
 }
 
 // NewConfig is required by the graph/ConfigVendor interface
@@ -160,7 +180,7 @@ func NewConfig(trafficMap graph.TrafficMap, o graph.ConfigOptions) (result Confi
 	nodes := []*NodeWrapper{}
 	edges := []*EdgeWrapper{}
 
-	buildConfig(trafficMap, &nodes, &edges, o)
+	buildConfig(trafficMap, &nodes, &edges)
 
 	// Add compound nodes as needed, inner boxes first
 	if strings.Contains(o.BoxBy, graph.BoxByApp) || o.GraphType == graph.GraphTypeApp || o.GraphType == graph.GraphTypeVersionedApp {
@@ -227,7 +247,7 @@ func NewConfig(trafficMap graph.TrafficMap, o graph.ConfigOptions) (result Confi
 	return result
 }
 
-func buildConfig(trafficMap graph.TrafficMap, nodes *[]*NodeWrapper, edges *[]*EdgeWrapper, o graph.ConfigOptions) {
+func buildConfig(trafficMap graph.TrafficMap, nodes *[]*NodeWrapper, edges *[]*EdgeWrapper) {
 	for id, n := range trafficMap {
 		nodeID := nodeHash(id)
 
@@ -244,14 +264,70 @@ func buildConfig(trafficMap graph.TrafficMap, nodes *[]*NodeWrapper, edges *[]*E
 
 		addNodeTelemetry(n, nd)
 
+		if val, ok := n.Metadata[graph.HealthData]; ok {
+			nd.HealthData = val
+		}
+		if val, ok := n.Metadata[graph.HealthDataApp]; ok {
+			nd.HealthDataApp = val
+		}
+
+		// set k8s labels, if any
+		if val, ok := n.Metadata[graph.Labels]; ok {
+			nd.Labels = val.(graph.LabelsMetadata)
+		}
+
 		// set annotations, if available
 		if val, ok := n.Metadata[graph.HasHealthConfig]; ok {
 			nd.HasHealthConfig = val.(map[string]string)
 		}
 
+		// node captured by ambient
+		if val, ok := n.Metadata[graph.IsAmbient]; ok {
+			nd.IsAmbient = val.(bool)
+		}
+
 		// node may have deployment but no pods running)
 		if val, ok := n.Metadata[graph.IsDead]; ok {
 			nd.IsDead = val.(bool)
+		}
+
+		// node added via registered extension
+		if val, ok := n.Metadata[graph.IsExtension]; ok {
+			nd.IsExtension = val.(*graph.ExtInfo)
+		}
+
+		// node may represent an Istio Ingress Gateway
+		if ingGateways, ok := n.Metadata[graph.IsIngressGateway]; ok {
+			var configuredHostnames []string
+			for _, hosts := range ingGateways.(graph.GatewaysMetadata) {
+				configuredHostnames = append(configuredHostnames, hosts...)
+			}
+
+			nd.IsGateway = &GWInfo{
+				IngressInfo: GWInfoIngress{Hostnames: configuredHostnames},
+			}
+		} else if egrGateways, ok := n.Metadata[graph.IsEgressGateway]; ok {
+			// node may represent an Istio Egress Gateway
+			var configuredHostnames []string
+			for _, hosts := range egrGateways.(graph.GatewaysMetadata) {
+				configuredHostnames = append(configuredHostnames, hosts...)
+			}
+
+			nd.IsGateway = &GWInfo{
+				EgressInfo: GWInfoIngress{Hostnames: configuredHostnames},
+			}
+		} else if apiGateways, ok := n.Metadata[graph.IsGatewayAPI]; ok {
+			// node may represent a Gateway API
+			var configuredHostnames []string
+			for _, hosts := range apiGateways.(graph.GatewaysMetadata) {
+				configuredHostnames = append(configuredHostnames, hosts...)
+			}
+
+			nd.IsGateway = &GWInfo{
+				GatewayAPIInfo: GWInfoIngress{Hostnames: configuredHostnames},
+			}
+
+			nd.IsK8sGatewayAPI = true
 		}
 
 		// node may be idle
@@ -267,18 +343,6 @@ func buildConfig(trafficMap graph.TrafficMap, nodes *[]*NodeWrapper, edges *[]*E
 		// node is not accessible to the current user
 		if val, ok := n.Metadata[graph.IsInaccessible]; ok {
 			nd.IsInaccessible = val.(bool)
-		}
-
-		// node may represent an Istio Ingress Gateway
-		if gateways, ok := n.Metadata[graph.IsIngressGateway]; ok {
-			var configuredHostnames []string
-			for _, hosts := range gateways.(graph.GatewaysMetadata) {
-				configuredHostnames = append(configuredHostnames, hosts...)
-			}
-
-			nd.IsGateway = &GWInfo{
-				IngressInfo: GWInfoIngress{Hostnames: configuredHostnames},
-			}
 		}
 
 		// node may have a circuit breaker
@@ -297,14 +361,19 @@ func buildConfig(trafficMap graph.TrafficMap, nodes *[]*NodeWrapper, edges *[]*E
 			nd.HasVS = &VSInfo{Hostnames: configuredHostnames}
 		}
 
-		// set sidecars checks, if available
-		if val, ok := n.Metadata[graph.HasMissingSC]; ok {
-			nd.HasMissingSC = val.(bool)
+		// set mesh checks, if available
+		if val, ok := n.Metadata[graph.IsOutOfMesh]; ok {
+			nd.IsOutOfMesh = val.(bool)
 		}
 
 		// check if node is on another namespace
 		if val, ok := n.Metadata[graph.IsOutside]; ok {
 			nd.IsOutside = val.(bool)
+		}
+
+		// check if node is a waypoint proxy
+		if val, ok := n.Metadata[graph.IsWaypoint]; ok {
+			nd.IsWaypoint = val.(bool)
 		}
 
 		if val, ok := n.Metadata[graph.HasMirroring]; ok {
@@ -331,12 +400,29 @@ func buildConfig(trafficMap graph.TrafficMap, nodes *[]*NodeWrapper, edges *[]*E
 			nd.HasRequestTimeout = val.(bool)
 		}
 
+		if val, ok := n.Metadata[graph.IsK8sGatewayAPI]; ok {
+			nd.IsK8sGatewayAPI = val.(bool)
+		}
+
 		// node may have destination service info
 		if val, ok := n.Metadata[graph.DestServices]; ok {
 			nd.DestServices = []graph.ServiceName{}
-			for _, val := range val.(graph.DestServicesMetadata) {
-				nd.DestServices = append(nd.DestServices, val)
+			for _, ds := range val.(graph.DestServicesMetadata) {
+				nd.DestServices = append(nd.DestServices, ds)
 			}
+			// sort destServices for better json presentation (and predictable testing)
+			sort.Slice(nd.DestServices, func(i, j int) bool {
+				ds1 := nd.DestServices[i]
+				ds2 := nd.DestServices[j]
+				switch {
+				case ds1.Cluster != ds2.Cluster:
+					return ds1.Cluster < ds2.Cluster
+				case ds1.Namespace != ds2.Namespace:
+					return ds1.Namespace < ds2.Namespace
+				default:
+					return ds1.Name < ds2.Name
+				}
+			})
 		}
 
 		// node may have service entry static info
@@ -364,35 +450,52 @@ func buildConfig(trafficMap graph.TrafficMap, nodes *[]*NodeWrapper, edges *[]*E
 		*nodes = append(*nodes, &nw)
 
 		for _, e := range n.Edges {
-			sourceIDHash := nodeHash(n.ID)
-			destIDHash := nodeHash(e.Dest.ID)
-			protocol := ""
-			if e.Metadata[graph.ProtocolKey] != nil {
-				protocol = e.Metadata[graph.ProtocolKey].(string)
-			}
-			edgeID := edgeHash(sourceIDHash, destIDHash, protocol)
-			ed := EdgeData{
-				ID:     edgeID,
-				Source: sourceIDHash,
-				Target: destIDHash,
-				Traffic: ProtocolTraffic{
-					Protocol: protocol,
-				},
-			}
-			if e.Metadata[graph.DestPrincipal] != nil {
-				ed.DestPrincipal = e.Metadata[graph.DestPrincipal].(string)
-			}
-			if e.Metadata[graph.SourcePrincipal] != nil {
-				ed.SourcePrincipal = e.Metadata[graph.SourcePrincipal].(string)
-			}
-			addEdgeTelemetry(e, &ed)
-
+			ed := convertEdge(*e, n.ID)
 			ew := EdgeWrapper{
 				Data: &ed,
 			}
 			*edges = append(*edges, &ew)
 		}
 	}
+}
+
+func convertEdge(e graph.Edge, nodeID string) EdgeData {
+	sourceIDHash := nodeHash(nodeID)
+	destIDHash := nodeHash(e.Dest.ID)
+	protocol := ""
+	if e.Metadata[graph.ProtocolKey] != nil {
+		protocol = e.Metadata[graph.ProtocolKey].(string)
+	}
+	edgeID := edgeHash(sourceIDHash, destIDHash, protocol)
+	ed := EdgeData{
+		ID:     edgeID,
+		Source: sourceIDHash,
+		Target: destIDHash,
+		Traffic: ProtocolTraffic{
+			Protocol: protocol,
+		},
+	}
+	if e.Metadata[graph.DestPrincipal] != nil {
+		ed.DestPrincipal = e.Metadata[graph.DestPrincipal].(string)
+	}
+	if e.Metadata[graph.SourcePrincipal] != nil {
+		ed.SourcePrincipal = e.Metadata[graph.SourcePrincipal].(string)
+	}
+	if e.Metadata[graph.Waypoint] != nil {
+		waypointEdgeInfo := e.Metadata[graph.Waypoint].(*graph.WaypointEdgeInfo)
+		waypointEdge := WaypointEdge{
+			Direction: waypointEdgeInfo.Direction,
+		}
+		if waypointEdgeInfo.FromEdge != nil {
+			fromEdgeData := convertEdge(*(waypointEdgeInfo.FromEdge), nodeID)
+			waypointEdge.FromEdge = &fromEdgeData
+		}
+		ed.Waypoint = &waypointEdge
+	}
+
+	addEdgeTelemetry(&e, &ed)
+
+	return ed
 }
 
 func addNodeTelemetry(n *graph.Node, nd *NodeData) {
@@ -529,13 +632,15 @@ func boxByNamespace(nodes *[]*NodeWrapper) {
 	box := make(map[string][]*NodeData)
 
 	for _, nw := range *nodes {
-		if nw.Data.Parent == "" {
+		// never box unknown
+		if nw.Data.Parent == "" && nw.Data.Namespace != graph.Unknown {
 			k := fmt.Sprintf("box_%s_%s", nw.Data.Cluster, nw.Data.Namespace)
 			box[k] = append(box[k], nw.Data)
 		}
 	}
-
-	generateBoxCompoundNodes(box, nodes, graph.BoxByNamespace)
+	if len(box) > 1 {
+		generateBoxCompoundNodes(box, nodes, graph.BoxByNamespace)
+	}
 }
 
 // boxByCluster adds compound nodes to box nodes in the same cluster
@@ -543,18 +648,20 @@ func boxByCluster(nodes *[]*NodeWrapper) {
 	box := make(map[string][]*NodeData)
 
 	for _, nw := range *nodes {
-		if nw.Data.Parent == "" {
+		// never box unknown
+		if nw.Data.Parent == "" && nw.Data.Cluster != graph.Unknown {
 			k := fmt.Sprintf("box_%s", nw.Data.Cluster)
 			box[k] = append(box[k], nw.Data)
 		}
 	}
-
-	generateBoxCompoundNodes(box, nodes, graph.BoxByCluster)
+	if len(box) > 1 {
+		generateBoxCompoundNodes(box, nodes, graph.BoxByCluster)
+	}
 }
 
 func generateBoxCompoundNodes(box map[string][]*NodeData, nodes *[]*NodeWrapper, boxBy string) {
 	for k, members := range box {
-		if boxBy != graph.BoxByApp || len(members) > 1 {
+		if len(members) > 1 {
 			// create the compound (parent) node for the member nodes
 			nodeID := nodeHash(k)
 			namespace := ""
@@ -581,7 +688,7 @@ func generateBoxCompoundNodes(box map[string][]*NodeData, nodes *[]*NodeWrapper,
 			}
 
 			// assign each member node to the compound parent
-			nd.HasMissingSC = false // TODO: this is probably unecessarily noisy
+			nd.IsOutOfMesh = false // TODO: this is probably unecessarily noisy
 			nd.IsInaccessible = false
 			nd.IsOutside = false
 
@@ -590,7 +697,17 @@ func generateBoxCompoundNodes(box map[string][]*NodeData, nodes *[]*NodeWrapper,
 
 				// For logical boxing (app), copy some member attributes to to the box node
 				if boxBy == graph.BoxByApp {
-					nd.HasMissingSC = nd.HasMissingSC || n.HasMissingSC
+					// make sure to use app health for the app box
+					if nd.HealthData == nil && n.NodeType == graph.NodeTypeApp {
+						if graph.IsOK(n.Workload) {
+							// for versionedApp node, use the app health (n.HealthData has workload health)
+							nd.HealthData = n.HealthDataApp
+						} else {
+							// for app node just ue the node's health
+							nd.HealthData = n.HealthData
+						}
+					}
+					nd.IsOutOfMesh = nd.IsOutOfMesh || n.IsOutOfMesh
 					nd.IsInaccessible = nd.IsInaccessible || n.IsInaccessible
 					nd.IsOutside = nd.IsOutside || n.IsOutside
 				}

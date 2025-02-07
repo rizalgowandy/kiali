@@ -1,6 +1,7 @@
 package business
 
 import (
+	"fmt"
 	"math"
 	"sort"
 	"strings"
@@ -28,9 +29,15 @@ func (in *MetricsService) GetMetrics(q models.IstioMetricsQuery, scaler func(n s
 
 func createMetricsLabelsBuilder(q *models.IstioMetricsQuery) *MetricsLabelsBuilder {
 	lb := NewMetricsLabelsBuilder(q.Direction)
-	lb.Reporter(q.Reporter)
+	if q.Reporter != "both" {
+		lb.Reporter(q.Reporter, q.IncludeAmbient)
+	}
 
 	namespaceSet := false
+
+	// add custom labels from config if custom labels are configured
+	lb.QueryScope()
+
 	if q.Service != "" {
 		lb.Service(q.Service, q.Namespace)
 		namespaceSet = true
@@ -52,6 +59,10 @@ func createMetricsLabelsBuilder(q *models.IstioMetricsQuery) *MetricsLabelsBuild
 	if q.Aggregate != "" {
 		lb.Aggregate(q.Aggregate, q.AggregateValue)
 	}
+	if q.Cluster != "" {
+		lb.Cluster(q.Cluster)
+	}
+
 	return lb
 }
 
@@ -146,28 +157,46 @@ func (in *MetricsService) GetStats(queries []models.MetricsStatsQuery) (map[stri
 		err   error
 	}
 
-	statsChan := make(chan statsChanResult, len(queries))
-	var wg sync.WaitGroup
-
-	for _, q := range queries {
-		wg.Add(1)
-		go func(q models.MetricsStatsQuery) {
-			defer wg.Done()
-			stats, err := in.getSingleQueryStats(&q)
-			statsChan <- statsChanResult{key: q.GenKey(), stats: stats, err: err}
-		}(q)
-	}
-	wg.Wait()
-	// All stats are fetched, close channel
-	close(statsChan)
-	// Read channel
-	result := make(map[string]models.MetricsStats)
-	for r := range statsChan {
-		if r.err != nil {
-			return nil, r.err
+	// The number of queries could be high, limit concurrent requests to 10 at a time (see https://github.com/kiali/kiali/issues/5584)
+	// Note that the default prometheus_engine_queries_concurrent_max = 20, so by limiting here to 10 we leave some room for
+	// other users hitting prom while still allowing a decent amount of concurrency.  Prom also has a default query timeout
+	// of 2 minutes, and any queries pending execution (so any number > 20 by default) are still subject to that timer.
+	chunkSize := 10
+	numQueries := len(queries)
+	var queryChunks [][]models.MetricsStatsQuery
+	for i := 0; i < numQueries; i += chunkSize {
+		end := i + chunkSize
+		if end > numQueries {
+			end = numQueries
 		}
-		if r.stats != nil {
-			result[r.key] = *r.stats
+		queryChunks = append(queryChunks, queries[i:end])
+	}
+
+	result := make(map[string]models.MetricsStats)
+
+	for i, queryChunk := range queryChunks {
+		statsChan := make(chan statsChanResult, len(queryChunk))
+		var wg sync.WaitGroup
+
+		for _, q := range queryChunks[i] {
+			wg.Add(1)
+			go func(q models.MetricsStatsQuery) {
+				defer wg.Done()
+				stats, err := in.getSingleQueryStats(&q)
+				statsChan <- statsChanResult{key: q.GenKey(), stats: stats, err: err}
+			}(q)
+		}
+		wg.Wait()
+		// All chunk stats are fetched, close channel
+		close(statsChan)
+		// Read channel
+		for r := range statsChan {
+			if r.err != nil {
+				return nil, r.err
+			}
+			if r.stats != nil {
+				result[r.key] = *r.stats
+			}
 		}
 	}
 	return result, nil
@@ -217,5 +246,79 @@ func createStatsMetricsLabelsBuilder(q *models.MetricsStatsQuery) *MetricsLabels
 			lb.PeerService(q.PeerTarget.Name, q.PeerTarget.Namespace)
 		}
 	}
+	if q.Target.Cluster != "" {
+		lb.Cluster(q.Target.Cluster)
+	}
 	return lb
+}
+
+func (in *MetricsService) GetControlPlaneMetrics(q models.IstioMetricsQuery, pods models.Pods, scaler func(n string) float64) (models.MetricsMap, error) {
+	podRegex := ""
+	separator := ""
+	for _, pod := range pods {
+		podRegex = fmt.Sprintf("%s%s%s", podRegex, separator, pod.Name)
+		separator = "|"
+	}
+	podLabel := fmt.Sprintf(`{pod="%s"}`, podRegex)
+
+	metrics := make(models.MetricsMap)
+	var err error
+
+	// pilot_proxy_convergence_time is handled in a special way.  our typical "sum(range(" queries for avg and quantiles,
+	// don't work here. Because proxy sync is reported more like a step function.  The count and sum are updated one time,
+	// and so there is typically no range, because any range requires at least two data points.  What we really want here
+	// is delta(sum) / delta(count) for the time period. Note, this is pretty non-standard manipulation of a histogram,
+	// don't try this at home.
+	deltaDuration := q.End.Sub(q.Start)
+	deltaSumMetric := in.prom.FetchDelta("pilot_proxy_convergence_time_sum", podLabel, "", q.End, deltaDuration)
+	deltaSumConverted, err := models.ConvertMetric("pilot_proxy_convergence_time_sum", deltaSumMetric, models.ConversionParams{Scale: 1})
+	if err != nil {
+		return nil, err
+	}
+	deltaCountMetric := in.prom.FetchDelta("pilot_proxy_convergence_time_count", podLabel, "", q.End, deltaDuration)
+	deltaCountConverted, err := models.ConvertMetric("pilot_proxy_convergence_time_count", deltaCountMetric, models.ConversionParams{Scale: 1})
+	if err != nil {
+		return nil, err
+	}
+
+	var converted []models.Metric
+
+	// if the supporting metrics are not there just don't report this metric
+	if len(deltaSumConverted) > 0 && len(deltaSumConverted[0].Datapoints) > 0 && len(deltaCountConverted) > 0 && len(deltaCountConverted[0].Datapoints) > 0 {
+		deltaSum := deltaSumConverted[0].Datapoints[0].Value
+		deltaCount := deltaCountConverted[0].Datapoints[0].Value
+		converted = deltaSumConverted
+		converted[0].Datapoints[0].Value = deltaSum / deltaCount
+		metrics["pilot_proxy_convergence_time"] = append(metrics["pilot_proxy_convergence_time"], converted...)
+	}
+
+	metric := in.prom.FetchRateRange("container_cpu_usage_seconds_total", []string{podLabel}, "", &q.RangeQuery)
+	converted, err = models.ConvertMetric("container_cpu_usage_seconds_total", metric, models.ConversionParams{Scale: 1})
+	if err != nil {
+		return nil, err
+	}
+	metrics["container_cpu_usage_seconds_total"] = append(metrics["container_cpu_usage_seconds_total"], converted...)
+
+	metric = in.prom.FetchRateRange("process_cpu_seconds_total", []string{podLabel}, "", &q.RangeQuery)
+	converted, err = models.ConvertMetric("process_cpu_seconds_total", metric, models.ConversionParams{Scale: 1})
+	if err != nil {
+		return nil, err
+	}
+	metrics["process_cpu_seconds_total"] = append(metrics["process_cpu_seconds_total"], converted...)
+
+	metric = in.prom.FetchRange("container_memory_working_set_bytes", podLabel, "", "", &q.RangeQuery)
+	converted, err = models.ConvertMetric("container_memory_working_set_bytes", metric, models.ConversionParams{Scale: 0.000001})
+	if err != nil {
+		return nil, err
+	}
+	metrics["container_memory_working_set_bytes"] = append(metrics["container_memory_working_set_bytes"], converted...)
+
+	metric = in.prom.FetchRange("process_resident_memory_bytes", podLabel, "", "", &q.RangeQuery)
+	converted, err = models.ConvertMetric("process_resident_memory_bytes", metric, models.ConversionParams{Scale: 0.000001})
+	if err != nil {
+		return nil, err
+	}
+	metrics["process_resident_memory_bytes"] = append(metrics["process_resident_memory_bytes"], converted...)
+
+	return metrics, nil
 }

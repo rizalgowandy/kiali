@@ -1,25 +1,58 @@
 package kubernetes
 
-import "io/ioutil"
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/kiali/kiali/config"
+)
 
 // Be careful with how you use this token. This is the Kiali Service Account token, not the user token.
 // We need the Service Account token to access third-party in-cluster services (e.g. Grafana).
 
-const DefaultServiceAccountPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+var DefaultServiceAccountPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 
-var KialiToken string
+var (
+	KialiTokenForHomeCluster     string
+	KialiTokenFileForHomeCluster string
+	tokenRead                    time.Time
+)
 
-func GetKialiToken() (string, error) {
-	if KialiToken == "" {
-		if remoteSecret, err := GetRemoteSecret(RemoteSecretData); err == nil {
-			KialiToken = remoteSecret.Users[0].User.Token
-		} else {
-			token, err := ioutil.ReadFile(DefaultServiceAccountPath)
-			if err != nil {
-				return "", err
+// GetKialiTokenForHomeCluster returns the Kiali SA token to be used to communicate with the local data plane k8s api endpoint and the token file.
+func GetKialiTokenForHomeCluster() (string, string, error) {
+	// TODO: refresh the token when it changes rather than after it expires
+	if KialiTokenForHomeCluster == "" || shouldRefreshToken() {
+		if remoteSecret, err := GetRemoteSecret(config.Get().Deployment.RemoteSecretPath); err == nil { // for experimental feature - for when data plane is in a remote cluster
+			currentContextAuthInfo := remoteSecret.Contexts[remoteSecret.CurrentContext].AuthInfo
+			if authInfo, ok := remoteSecret.AuthInfos[currentContextAuthInfo]; ok {
+				KialiTokenForHomeCluster = authInfo.Token
+				KialiTokenFileForHomeCluster = authInfo.TokenFile
+			} else {
+				return "", "", fmt.Errorf("auth info not found for current context: [%s]. Current context must be set for kiali remote secret", remoteSecret.CurrentContext)
 			}
-			KialiToken = string(token)
+		} else {
+			token, err := os.ReadFile(DefaultServiceAccountPath)
+			if err != nil {
+				return "", "", err
+			}
+			KialiTokenForHomeCluster = string(token)
+			KialiTokenFileForHomeCluster = DefaultServiceAccountPath
 		}
+		tokenRead = time.Now()
 	}
-	return KialiToken, nil
+	return KialiTokenForHomeCluster, KialiTokenFileForHomeCluster, nil
+}
+
+// shouldRefreshToken checks to see if the local Kiali token expired.
+// TODO should check all tokens for all clusters
+func shouldRefreshToken() bool {
+	// TODO: hardcoded to 60s, do we want this configurable? Or do we need to obtain this from k8s somehow?
+	timerDuration := time.Second * 60
+
+	if time.Since(tokenRead) > timerDuration {
+		return true
+	} else {
+		return false
+	}
 }

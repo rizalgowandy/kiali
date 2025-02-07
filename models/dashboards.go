@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sort"
 
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
 	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/config/dashboards"
 	"github.com/kiali/kiali/prometheus"
@@ -17,7 +19,7 @@ type DashboardQuery struct {
 	AdditionalLabels  []Aggregation
 	RawDataAggregator string
 	Workload          string
-	WorkloadType      string
+	WorkloadGVK       schema.GroupVersionKind
 }
 
 // FillDefaults fills the struct with default parameters
@@ -144,6 +146,10 @@ func metricsDefaults(local, remote string) []Aggregation {
 		{
 			Label:       "response_flags",
 			DisplayName: "Response flags",
+		},
+		{
+			Label:       "connection_security_policy",
+			DisplayName: "Connection Security Policy",
 		},
 	}...)
 	return aggs

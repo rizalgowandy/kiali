@@ -1,3 +1,7 @@
+############################################
+#                BACKEND                   #
+############################################
+
 # Binaries for programs and plugins
 *.exe
 *.dll
@@ -32,6 +36,9 @@ _output
 # VSCode
 .vscode/
 
+# Swagger
+swagger.json
+
 # The vendor directory is to be committed to the git repo
 #vendor/
 
@@ -39,12 +46,56 @@ _output
 hack/*.local.sh
 
 # E2E testing files
-tests/e2e/.pytest_cache
-tests/e2e/**/__pycache__
-tests/e2e/.kiali-e2e/
+tests/integration/junit-rest-report.xml
+tests/integration/int-test.log
 
 # Do not commit operator code to this repo
 operator
 
 # Do not commit helm-charts code to this repo
 helm-charts
+
+# Ignore ansible if a dev has installed it under kiali for convenience
+ansible
+
+############################################
+#                FRONTEND                  #
+############################################
+
+# See https://help.github.com/ignore-files/ for more about ignoring files.
+
+# dependencies
+frontend/node_modules
+
+# IDE
+frontend/.idea
+frontend/.vscode
+
+# testing
+frontend/coverage
+
+# production
+frontend/build
+
+# misc
+frontend/.DS_Store
+frontend/.env.local
+frontend/.env.development.local
+frontend/.env.test.local
+frontend/.env.production.local
+
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+
+frontend/package-lock.json
+
+frontend/logs
+
+# Cypress
+frontend/cypress/videos
+frontend/cypress/screenshots
+frontend/cypress/results
+
+# locales
+frontend/public/locales/en

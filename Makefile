@@ -4,20 +4,21 @@ SHELL=/bin/bash
 # Directories based on the root project directory
 ROOTDIR=$(CURDIR)
 OUTDIR=${ROOTDIR}/_output
+OPERATOR_DIR=${ROOTDIR}/operator
 
 # list for multi-arch image publishing
 TARGET_ARCHS ?= amd64 arm64 s390x ppc64le
 
 # Identifies the current build.
 # These will be embedded in the app and displayed when it starts.
-VERSION ?= v1.43.0-SNAPSHOT
+VERSION ?= v2.6.0-SNAPSHOT
 COMMIT_HASH ?= $(shell git rev-parse HEAD)
 
 # The path where the UI project has been git cloned. The UI should
 # have been built before trying to create a kiali server container
 # image. The UI project is configured to place its build
 # output in the $UI_SRC_ROOT/build/ subdirectory.
-CONSOLE_LOCAL_DIR ?= ${ROOTDIR}/../../../../../kiali-ui
+CONSOLE_LOCAL_DIR ?= ${ROOTDIR}/frontend
 
 # Version label is used in the OpenShift/K8S resources to identify
 # their specific instances. Kiali resources will have labels of
@@ -28,9 +29,8 @@ VERSION_LABEL ?= ${VERSION}
 # The go commands and the minimum Go version that must be used to build the app.
 GO ?= go
 GOFMT ?= $(shell ${GO} env GOROOT)/bin/gofmt
-GO_VERSION_KIALI = 1.16.2
-
-SWAGGER_VERSION ?= 0.27.0
+GO_VERSION_KIALI = $(shell sed -rn 's/^go[[:space:]]+([[:digit:].]+)/\1/p' go.mod)
+GO_TEST_FLAGS ?=
 
 # Identifies the Kiali container image that will be built.
 IMAGE_ORG ?= kiali
@@ -47,10 +47,28 @@ OPERATOR_CONTAINER_VERSION ?= ${CONTAINER_VERSION}
 OPERATOR_QUAY_NAME ?= quay.io/${OPERATOR_CONTAINER_NAME}
 OPERATOR_QUAY_TAG ?= ${OPERATOR_QUAY_NAME}:${OPERATOR_CONTAINER_VERSION}
 
+# Identifies the Kiali interation tests container image that will be built
+INT_TESTS_CONTAINER_NAME ?= ${IMAGE_ORG}/kiali-int-tests
+INT_TESTS_CONTAINER_VERSION ?= ${CONTAINER_VERSION}
+INT_TESTS_QUAY_NAME ?= quay.io/${INT_TESTS_CONTAINER_NAME}
+INT_TESTS_QUAY_TAG ?= ${INT_TESTS_QUAY_NAME}:${INT_TESTS_CONTAINER_VERSION}
+
+# Identifies the Kiali cypress tests container image that will be built
+CYPRESS_TESTS_CONTAINER_NAME ?= ${IMAGE_ORG}/kiali-cypress-tests
+CYPRESS_TESTS_CONTAINER_VERSION ?= ${CONTAINER_VERSION}
+CYPRESS_TESTS_QUAY_NAME ?= quay.io/${CYPRESS_TESTS_CONTAINER_NAME}
+CYPRESS_TESTS_QUAY_TAG ?= ${CYPRESS_TESTS_QUAY_NAME}:${CYPRESS_TESTS_CONTAINER_VERSION}
+
 # Where the control plane is
 ISTIO_NAMESPACE ?= istio-system
-# Declares the namespace/project where the objects are to be deployed.
+# Declares the namespace/project where the Kiali objects are to be deployed.
 NAMESPACE ?= ${ISTIO_NAMESPACE}
+# Declares the namespace/project where the OSSM Console objects are to be deployed.
+OSSMCONSOLE_NAMESPACE ?= ossmconsole
+
+# Local arch details needed when downloading tools
+OS := $(shell uname -s | tr '[:upper:]' '[:lower:]')
+ARCH := $(shell uname -m | sed 's/x86_64/amd64/')
 
 # A default go GOPATH if it isn't user defined
 GOPATH ?= ${HOME}/go
@@ -58,13 +76,17 @@ GOPATH ?= ${HOME}/go
 # Environment variables set when running the Go compiler.
 GOOS ?= $(shell ${GO} env GOOS)
 GOARCH ?= $(shell ${GO} env GOARCH)
+CGO_ENABLED ?= 0
 GO_BUILD_ENVVARS = \
 	GOOS=$(GOOS) \
 	GOARCH=$(GOARCH) \
-	CGO_ENABLED=0 \
+	CGO_ENABLED=$(CGO_ENABLED)
+
+# Extra build flags passed to the go compiler.
+GO_BUILD_FLAGS ?= 
 
 # Determine which Dockerfile is used to build the server container
-KIALI_DOCKER_FILE ?= Dockerfile-ubi8-minimal
+KIALI_DOCKER_FILE ?= Dockerfile-distroless
 
 # Determine if we should use Docker OR Podman - value must be one of "docker" or "podman"
 DORP ?= docker
@@ -112,6 +134,7 @@ OPERATOR_WATCH_NAMESPACE ?= \"\"
 OPERATOR_INSTALL_KIALI ?= false
 OPERATOR_ALLOW_AD_HOC_KIALI_NAMESPACE ?= true
 OPERATOR_ALLOW_AD_HOC_KIALI_IMAGE ?= true
+OPERATOR_ALLOW_AD_HOC_OSSMCONSOLE_IMAGE ?= true
 ifeq ($(OPERATOR_WATCH_NAMESPACE),\"\")
 OPERATOR_INSTALL_KIALI_CR_NAMESPACE ?= ${OPERATOR_NAMESPACE}
 else
@@ -119,7 +142,7 @@ OPERATOR_INSTALL_KIALI_CR_NAMESPACE ?= ${OPERATOR_WATCH_NAMESPACE}
 endif
 
 # When installing Kiali to a remote cluster via make, here are some configuration settings for it.
-ACCESSIBLE_NAMESPACES ?= **
+CLUSTER_WIDE_ACCESS ?= true
 ifneq ($(CLUSTER_TYPE),openshift)
 AUTH_STRATEGY ?= anonymous
 else
@@ -133,20 +156,12 @@ endif
 SERVICE_TYPE ?= ClusterIP
 KIALI_CR_SPEC_VERSION ?= default
 
-# Determine if Maistra/ServiceMesh is deployed. If not, assume we are working with upstream Istio.
-ifeq ($(OC_READY),true)
-IS_MAISTRA ?= $(shell if ${OC} get namespace ${NAMESPACE} -o jsonpath='{.metadata.labels}' 2>/dev/null | grep -q maistra ; then echo "true" ; else echo "false" ; fi)
-else
-IS_MAISTRA ?= false
-endif
-
-# Path to Kiali CR file which is different based on what Istio implementation is deployed (upstream or Maistra)
-# This is used when deploying Kiali via make
-ifeq ($(IS_MAISTRA),true)
-KIALI_CR_FILE ?= ${ROOTDIR}/operator/deploy/kiali/kiali_cr_dev_servicemesh.yaml
-else
+# Path to Kiali CR file. This is used when deploying Kiali via make
 KIALI_CR_FILE ?= ${ROOTDIR}/operator/deploy/kiali/kiali_cr_dev.yaml
-endif
+
+# When creating a OSSMConsole CR, these can customize it
+OSSMCONSOLE_CR_FILE ?= ${ROOTDIR}/operator/deploy/ossmconsole/ossmconsole_cr_dev.yaml
+OSSMCONSOLE_CR_SPEC_VERSION ?= default
 
 # When ensuring the helm chart repo exists, by default the make infrastructure will pull the latest code from git.
 # If you do not want this to happen (i.e. if you want to retain the local copies of your helm charts), set this to false.
@@ -165,6 +180,8 @@ include make/Makefile.cluster.mk
 include make/Makefile.helm.mk
 include make/Makefile.operator.mk
 include make/Makefile.molecule.mk
+include make/Makefile.ui.mk
+include make/Makefile.olm.mk
 
 .PHONY: help
 help: Makefile
@@ -187,19 +204,23 @@ help: Makefile
 	@echo "Molecule test targets"
 	@sed -n 's/^##//p' make/Makefile.molecule.mk | column -t -s ':' |  sed -e 's/^/ /'
 	@echo
+	@echo "UI targets"
+	@sed -n 's/^##//p' make/Makefile.ui.mk | column -t -s ':' |  sed -e 's/^/ /'
+	@echo
+	@echo "OLM targets"
+	@sed -n 's/^##//p' make/Makefile.olm.mk | column -t -s ':' |  sed -e 's/^/ /'
+	@echo
 	@echo "Misc targets"
 	@sed -n 's/^##//p' $< | column -t -s ':' |  sed -e 's/^/ /'
 	@echo
-
-## git-init: Set the hooks under ./git/hooks
-git-init:
-	@echo Setting Git Hooks
-	cp hack/hooks/* .git/hooks
 
 .ensure-oc-exists:
 	@if [ ! -x "${OC}" ]; then \
 	  echo "Missing 'oc' or 'kubectl'"; exit 1; \
 	fi
+
+.ensure-oc-login: .ensure-oc-exists
+	@if [[ "${OC}" = *"oc" ]]; then if ! ${OC} whoami &> /dev/null; then echo "You are not logged into an OpenShift cluster. Run 'oc login' before continuing."; exit 1; fi; fi
 
 .ensure-minikube-exists:
 	@if [ ! -x "${MINIKUBE}" ]; then \

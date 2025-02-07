@@ -21,23 +21,22 @@ import (
 	"github.com/kiali/kiali/util/httputil"
 )
 
-var (
-	invalidLabelCharRE = regexp.MustCompile(`[^a-zA-Z0-9_]`)
-)
+var invalidLabelCharRE = regexp.MustCompile(`[^a-zA-Z0-9_]`)
 
 // ClientInterface for mocks (only mocked function are necessary here)
 type ClientInterface interface {
+	FetchDelta(metricName, labels, grouping string, queryTime time.Time, duration time.Duration) Metric
 	FetchHistogramRange(metricName, labels, grouping string, q *RangeQuery) Histogram
 	FetchHistogramValues(metricName, labels, grouping, rateInterval string, avg bool, quantiles []string, queryTime time.Time) (map[string]model.Vector, error)
 	FetchRange(metricName, labels, grouping, aggregator string, q *RangeQuery) Metric
 	FetchRateRange(metricName string, labels []string, grouping string, q *RangeQuery) Metric
-	GetAllRequestRates(namespace, ratesInterval string, queryTime time.Time) (model.Vector, error)
-	GetAppRequestRates(namespace, app, ratesInterval string, queryTime time.Time) (model.Vector, model.Vector, error)
+	GetAllRequestRates(namespace, cluster, ratesInterval string, queryTime time.Time) (model.Vector, error)
+	GetAppRequestRates(namespace, cluster, app, ratesInterval string, queryTime time.Time) (model.Vector, model.Vector, error)
 	GetConfiguration() (prom_v1.ConfigResult, error)
 	GetFlags() (prom_v1.FlagsResult, error)
-	GetNamespaceServicesRequestRates(namespace, ratesInterval string, queryTime time.Time) (model.Vector, error)
-	GetServiceRequestRates(namespace, service, ratesInterval string, queryTime time.Time) (model.Vector, error)
-	GetWorkloadRequestRates(namespace, workload, ratesInterval string, queryTime time.Time) (model.Vector, model.Vector, error)
+	GetNamespaceServicesRequestRates(namespace, cluster, ratesInterval string, queryTime time.Time) (model.Vector, error)
+	GetServiceRequestRates(namespace, cluster, service, ratesInterval string, queryTime time.Time) (model.Vector, error)
+	GetWorkloadRequestRates(namespace, cluster, workload, ratesInterval string, queryTime time.Time) (model.Vector, model.Vector, error)
 	GetMetricsForLabels(metricNames []string, labels string) ([]string, error)
 }
 
@@ -50,8 +49,10 @@ type Client struct {
 	ctx context.Context
 }
 
-var once sync.Once
-var promCache PromCache
+var (
+	once      sync.Once
+	promCache PromCache
+)
 
 func initPromCache() {
 	if config.Get().ExternalServices.Prometheus.CacheEnabled {
@@ -82,7 +83,7 @@ func NewClientForConfig(cfg config.PrometheusConfig) (*Client, error) {
 		// Note: if we are using the 'bearer' authentication method then we want to use the Kiali
 		// service account token and not the user's token. This is because Kiali does filtering based
 		// on the user's token and prevents people who shouldn't have access to particular metrics.
-		token, err := kubernetes.GetKialiToken()
+		token, _, err := kubernetes.GetKialiTokenForHomeCluster()
 		if err != nil {
 			log.Errorf("Could not read the Kiali Service Account token: %v", err)
 			return nil, err
@@ -125,19 +126,19 @@ func (in *Client) Inject(api prom_v1.API) {
 // be inflated due to duplication, and therefore should be used mainly for calculating ratios
 // (e.g total rates / error rates).
 // Returns (rates, error)
-func (in *Client) GetAllRequestRates(namespace string, ratesInterval string, queryTime time.Time) (model.Vector, error) {
+func (in *Client) GetAllRequestRates(namespace, cluster string, ratesInterval string, queryTime time.Time) (model.Vector, error) {
 	log.Tracef("GetAllRequestRates [namespace: %s] [ratesInterval: %s] [queryTime: %s]", namespace, ratesInterval, queryTime.String())
 	if promCache != nil {
-		if isCached, result := promCache.GetAllRequestRates(namespace, ratesInterval, queryTime); isCached {
+		if isCached, result := promCache.GetAllRequestRates(namespace, cluster, ratesInterval, queryTime); isCached {
 			return result, nil
 		}
 	}
-	result, err := getAllRequestRates(in.ctx, in.api, namespace, queryTime, ratesInterval)
+	result, err := getAllRequestRates(in.ctx, in.api, namespace, cluster, queryTime, ratesInterval)
 	if err != nil {
 		return result, err
 	}
 	if promCache != nil {
-		promCache.SetAllRequestRates(namespace, ratesInterval, queryTime, result)
+		promCache.SetAllRequestRates(namespace, cluster, ratesInterval, queryTime, result)
 	}
 	return result, nil
 }
@@ -147,19 +148,19 @@ func (in *Client) GetAllRequestRates(namespace string, ratesInterval string, que
 // be inflated due to duplication, and therefore should be used mainly for calculating ratios
 // (e.g total rates / error rates).
 // Returns (rates, error)
-func (in *Client) GetNamespaceServicesRequestRates(namespace string, ratesInterval string, queryTime time.Time) (model.Vector, error) {
+func (in *Client) GetNamespaceServicesRequestRates(namespace, cluster string, ratesInterval string, queryTime time.Time) (model.Vector, error) {
 	log.Tracef("GetNamespaceServicesRequestRates [namespace: %s] [ratesInterval: %s] [queryTime: %s]", namespace, ratesInterval, queryTime.String())
 	if promCache != nil {
-		if isCached, result := promCache.GetNamespaceServicesRequestRates(namespace, ratesInterval, queryTime); isCached {
+		if isCached, result := promCache.GetNamespaceServicesRequestRates(namespace, cluster, ratesInterval, queryTime); isCached {
 			return result, nil
 		}
 	}
-	result, err := getNamespaceServicesRequestRates(in.ctx, in.api, namespace, queryTime, ratesInterval)
+	result, err := getNamespaceServicesRequestRates(in.ctx, in.api, namespace, cluster, queryTime, ratesInterval)
 	if err != nil {
 		return result, err
 	}
 	if promCache != nil {
-		promCache.SetNamespaceServicesRequestRates(namespace, ratesInterval, queryTime, result)
+		promCache.SetNamespaceServicesRequestRates(namespace, cluster, ratesInterval, queryTime, result)
 	}
 	return result, nil
 }
@@ -169,19 +170,19 @@ func (in *Client) GetNamespaceServicesRequestRates(namespace string, ratesInterv
 // be inflated due to duplication, and therefore should be used mainly for calculating ratios
 // (e.g total rates / error rates).
 // Returns (in, error)
-func (in *Client) GetServiceRequestRates(namespace, service, ratesInterval string, queryTime time.Time) (model.Vector, error) {
+func (in *Client) GetServiceRequestRates(namespace, cluster, service, ratesInterval string, queryTime time.Time) (model.Vector, error) {
 	log.Tracef("GetServiceRequestRates [namespace: %s] [service: %s] [ratesInterval: %s] [queryTime: %s]", namespace, service, ratesInterval, queryTime.String())
 	if promCache != nil {
-		if isCached, result := promCache.GetServiceRequestRates(namespace, service, ratesInterval, queryTime); isCached {
+		if isCached, result := promCache.GetServiceRequestRates(namespace, cluster, service, ratesInterval, queryTime); isCached {
 			return result, nil
 		}
 	}
-	result, err := getServiceRequestRates(in.ctx, in.api, namespace, service, queryTime, ratesInterval)
+	result, err := getServiceRequestRates(in.ctx, in.api, namespace, cluster, service, queryTime, ratesInterval)
 	if err != nil {
 		return result, err
 	}
 	if promCache != nil {
-		promCache.SetServiceRequestRates(namespace, service, ratesInterval, queryTime, result)
+		promCache.SetServiceRequestRates(namespace, cluster, service, ratesInterval, queryTime, result)
 	}
 	return result, nil
 }
@@ -191,19 +192,19 @@ func (in *Client) GetServiceRequestRates(namespace, service, ratesInterval strin
 // be inflated due to duplication, and therefore should be used mainly for calculating ratios
 // (e.g total rates / error rates).
 // Returns (in, out, error)
-func (in *Client) GetAppRequestRates(namespace, app, ratesInterval string, queryTime time.Time) (model.Vector, model.Vector, error) {
-	log.Tracef("GetAppRequestRates [namespace: %s] [app: %s] [ratesInterval: %s] [queryTime: %s]", namespace, app, ratesInterval, queryTime.String())
+func (in *Client) GetAppRequestRates(namespace, cluster, app, ratesInterval string, queryTime time.Time) (model.Vector, model.Vector, error) {
+	log.Tracef("GetAppRequestRates [namespace: %s] [cluster: %s] [app: %s] [ratesInterval: %s] [queryTime: %s]", namespace, cluster, app, ratesInterval, queryTime.String())
 	if promCache != nil {
-		if isCached, inResult, outResult := promCache.GetAppRequestRates(namespace, app, ratesInterval, queryTime); isCached {
+		if isCached, inResult, outResult := promCache.GetAppRequestRates(namespace, cluster, app, ratesInterval, queryTime); isCached {
 			return inResult, outResult, nil
 		}
 	}
-	inResult, outResult, err := getItemRequestRates(in.ctx, in.api, namespace, app, "app", queryTime, ratesInterval)
+	inResult, outResult, err := getItemRequestRates(in.ctx, in.api, namespace, cluster, app, "app", queryTime, ratesInterval)
 	if err != nil {
 		return inResult, outResult, err
 	}
 	if promCache != nil {
-		promCache.SetAppRequestRates(namespace, app, ratesInterval, queryTime, inResult, outResult)
+		promCache.SetAppRequestRates(namespace, cluster, app, ratesInterval, queryTime, inResult, outResult)
 	}
 	return inResult, outResult, nil
 }
@@ -213,21 +214,30 @@ func (in *Client) GetAppRequestRates(namespace, app, ratesInterval string, query
 // be inflated due to duplication, and therefore should be used mainly for calculating ratios
 // (e.g total rates / error rates).
 // Returns (in, out, error)
-func (in *Client) GetWorkloadRequestRates(namespace, workload, ratesInterval string, queryTime time.Time) (model.Vector, model.Vector, error) {
+func (in *Client) GetWorkloadRequestRates(namespace, cluster, workload, ratesInterval string, queryTime time.Time) (model.Vector, model.Vector, error) {
 	log.Tracef("GetWorkloadRequestRates [namespace: %s] [workload: %s] [ratesInterval: %s] [queryTime: %s]", namespace, workload, ratesInterval, queryTime.String())
 	if promCache != nil {
-		if isCached, inResult, outResult := promCache.GetWorkloadRequestRates(namespace, workload, ratesInterval, queryTime); isCached {
+		if isCached, inResult, outResult := promCache.GetWorkloadRequestRates(namespace, cluster, workload, ratesInterval, queryTime); isCached {
 			return inResult, outResult, nil
 		}
 	}
-	inResult, outResult, err := getItemRequestRates(in.ctx, in.api, namespace, workload, "workload", queryTime, ratesInterval)
+	inResult, outResult, err := getItemRequestRates(in.ctx, in.api, namespace, cluster, workload, "workload", queryTime, ratesInterval)
 	if err != nil {
 		return inResult, outResult, err
 	}
 	if promCache != nil {
-		promCache.SetWorkloadRequestRates(namespace, workload, ratesInterval, queryTime, inResult, outResult)
+		promCache.SetWorkloadRequestRates(namespace, cluster, workload, ratesInterval, queryTime, inResult, outResult)
 	}
 	return inResult, outResult, nil
+}
+
+// FetchDelta fetches a delta for a simple metric (gauge or counter), for a given duration
+func (in *Client) FetchDelta(metricName, labels, grouping string, queryTime time.Time, duration time.Duration) Metric {
+	query := fmt.Sprintf("delta(%s%s[%s])", metricName, labels, duration.Round(time.Second).String())
+	if grouping != "" {
+		query += fmt.Sprintf(" by (%s)", grouping)
+	}
+	return fetchQuery(in.ctx, in.api, query, queryTime)
 }
 
 // FetchRange fetches a simple metric (gauge or counter) in given range
@@ -236,7 +246,6 @@ func (in *Client) FetchRange(metricName, labels, grouping, aggregator string, q 
 	if grouping != "" {
 		query += fmt.Sprintf(" by (%s)", grouping)
 	}
-	query = roundSignificant(query, 0.001)
 	return fetchRange(in.ctx, in.api, query, q.Range)
 }
 
@@ -277,12 +286,12 @@ func (in *Client) GetContext() context.Context {
 	return in.ctx
 }
 
-func (in *Client) GetFlags() (prom_v1.FlagsResult, error) {
-	flags, err := in.API().Flags(in.ctx)
+func (in *Client) GetRuntimeinfo() (prom_v1.RuntimeinfoResult, error) {
+	ri, err := in.API().Runtimeinfo(in.ctx)
 	if err != nil {
-		return nil, err
+		return prom_v1.RuntimeinfoResult{}, err
 	}
-	return flags, nil
+	return ri, nil
 }
 
 // GetMetricsForLabels returns a list of metrics existing for the provided labels set. Only metrics that match a name in the given
@@ -296,7 +305,7 @@ func (in *Client) GetMetricsForLabels(metricNames []string, labelQueryString str
 	startT := time.Now()
 	queryString := fmt.Sprintf("count(%v) by (__name__)", labelQueryString)
 	results, warnings, err := in.api.Query(in.ctx, queryString, time.Now())
-	if warnings != nil && len(warnings) > 0 {
+	if len(warnings) > 0 {
 		log.Warningf("GetMetricsForLabels. Prometheus Warnings: [%s]", strings.Join(warnings, ","))
 	}
 	if err != nil {
@@ -317,6 +326,39 @@ func (in *Client) GetMetricsForLabels(metricNames []string, labelQueryString str
 	}
 
 	log.Tracef("[Prom] GetMetricsForLabels: exec time=[%v], results count=[%v], looking for count=[%v], found count=[%v]", time.Since(startT), len(results.(model.Vector)), len(metricsWeAreLookingFor), len(metricsWeFound))
+	return metricsWeFound, nil
+}
+
+// GetExistingMetricNames returns a list of the requested metric names that exist in Prometheus (meaning there is a matching __name__ label).
+func (in *Client) GetExistingMetricNames(metricNames []string) ([]string, error) {
+	if len(metricNames) == 0 {
+		return []string{}, nil
+	}
+
+	log.Tracef("[Prom] GetExistingMetricNames: metricNames=[%v]", metricNames)
+	startT := time.Now()
+	results, warnings, err := in.api.LabelValues(in.ctx, "__name__", []string{}, time.Unix(0, 0), time.Now())
+	if len(warnings) > 0 {
+		log.Warningf("GetExistingMetricNames. Prometheus Warnings: [%s]", strings.Join(warnings, ","))
+	}
+	if err != nil {
+		return nil, errors.NewServiceUnavailable(err.Error())
+	}
+
+	metricsWeAreLookingFor := make(map[string]bool, len(metricNames))
+	for i := 0; i < len(metricNames); i++ {
+		metricsWeAreLookingFor[string(metricNames[i])] = true
+	}
+
+	metricsWeFound := make([]string, 0, len(metricNames))
+	for _, item := range results {
+		name := string(item)
+		if metricsWeAreLookingFor[name] {
+			metricsWeFound = append(metricsWeFound, name)
+		}
+	}
+
+	log.Tracef("[Prom] GetExistingMetricNames: exec time=[%v], results count=[%v], looking for count=[%v], found count=[%v]", time.Since(startT), len(results), len(metricsWeAreLookingFor), len(metricsWeFound))
 	return metricsWeFound, nil
 }
 

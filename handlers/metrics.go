@@ -4,15 +4,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
 
 	"github.com/kiali/kiali/business"
+	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/log"
 	"github.com/kiali/kiali/models"
 	"github.com/kiali/kiali/prometheus"
@@ -21,7 +23,7 @@ import (
 
 // AppMetrics is the API handler to fetch metrics to be displayed, related to an app-label grouping
 func AppMetrics(w http.ResponseWriter, r *http.Request) {
-	getAppMetrics(w, r, defaultPromClientSupplier)
+	getAppMetrics(w, r, DefaultPromClientSupplier)
 }
 
 // getAppMetrics (mock-friendly version)
@@ -29,15 +31,17 @@ func getAppMetrics(w http.ResponseWriter, r *http.Request, promSupplier promClie
 	vars := mux.Vars(r)
 	namespace := vars["namespace"]
 	app := vars["app"]
+	cluster := clusterNameFromQuery(r.URL.Query())
 
-	metricsService, namespaceInfo := createMetricsServiceForNamespace(w, r, promSupplier, namespace)
+	metricsService, namespaceInfo := createMetricsServiceForNamespaceMC(w, r, promSupplier, namespace)
 	if metricsService == nil {
 		// any returned value nil means error & response already written
 		return
 	}
 
-	params := models.IstioMetricsQuery{Namespace: namespace, App: app}
-	err := extractIstioMetricsQueryParams(r, &params, namespaceInfo)
+	params := models.IstioMetricsQuery{Cluster: cluster, Namespace: namespace, App: app}
+	oldestNs := GetOldestNamespace(namespaceInfo)
+	err := extractIstioMetricsQueryParams(r, &params, oldestNs)
 	if err != nil {
 		RespondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -53,7 +57,7 @@ func getAppMetrics(w http.ResponseWriter, r *http.Request, promSupplier promClie
 
 // WorkloadMetrics is the API handler to fetch metrics to be displayed, related to a single workload
 func WorkloadMetrics(w http.ResponseWriter, r *http.Request) {
-	getWorkloadMetrics(w, r, defaultPromClientSupplier)
+	getWorkloadMetrics(w, r, DefaultPromClientSupplier)
 }
 
 // getWorkloadMetrics (mock-friendly version)
@@ -61,15 +65,17 @@ func getWorkloadMetrics(w http.ResponseWriter, r *http.Request, promSupplier pro
 	vars := mux.Vars(r)
 	namespace := vars["namespace"]
 	workload := vars["workload"]
+	cluster := clusterNameFromQuery(r.URL.Query())
 
-	metricsService, namespaceInfo := createMetricsServiceForNamespace(w, r, promSupplier, namespace)
-	if metricsService == nil {
+	metricsService, namespaceInfo := createMetricsServiceForNamespaceMC(w, r, promSupplier, namespace)
+	if metricsService == nil || namespaceInfo == nil {
 		// any returned value nil means error & response already written
 		return
 	}
+	oldestNs := GetOldestNamespace(namespaceInfo)
 
-	params := models.IstioMetricsQuery{Namespace: namespace, Workload: workload}
-	err := extractIstioMetricsQueryParams(r, &params, namespaceInfo)
+	params := models.IstioMetricsQuery{Cluster: cluster, Namespace: namespace, Workload: workload}
+	err := extractIstioMetricsQueryParams(r, &params, oldestNs)
 	if err != nil {
 		RespondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -85,7 +91,7 @@ func getWorkloadMetrics(w http.ResponseWriter, r *http.Request, promSupplier pro
 
 // ServiceMetrics is the API handler to fetch metrics to be displayed, related to a single service
 func ServiceMetrics(w http.ResponseWriter, r *http.Request) {
-	getServiceMetrics(w, r, defaultPromClientSupplier)
+	getServiceMetrics(w, r, DefaultPromClientSupplier)
 }
 
 // getServiceMetrics (mock-friendly version)
@@ -93,15 +99,17 @@ func getServiceMetrics(w http.ResponseWriter, r *http.Request, promSupplier prom
 	vars := mux.Vars(r)
 	namespace := vars["namespace"]
 	service := vars["service"]
+	cluster := clusterNameFromQuery(r.URL.Query())
 
-	metricsService, namespaceInfo := createMetricsServiceForNamespace(w, r, promSupplier, namespace)
+	metricsService, namespaceInfo := createMetricsServiceForNamespaceMC(w, r, promSupplier, namespace)
 	if metricsService == nil {
 		// any returned value nil means error & response already written
 		return
 	}
+	oldestNs := GetOldestNamespace(namespaceInfo)
 
-	params := models.IstioMetricsQuery{Namespace: namespace, Service: service}
-	err := extractIstioMetricsQueryParams(r, &params, namespaceInfo)
+	params := models.IstioMetricsQuery{Cluster: cluster, Namespace: namespace, Service: service}
+	err := extractIstioMetricsQueryParams(r, &params, oldestNs)
 	if err != nil {
 		RespondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -117,7 +125,7 @@ func getServiceMetrics(w http.ResponseWriter, r *http.Request, promSupplier prom
 
 // AggregateMetrics is the API handler to fetch metrics to be displayed, related to a single aggregate
 func AggregateMetrics(w http.ResponseWriter, r *http.Request) {
-	getAggregateMetrics(w, r, defaultPromClientSupplier)
+	getAggregateMetrics(w, r, DefaultPromClientSupplier)
 }
 
 // getServiceMetrics (mock-friendly version)
@@ -127,14 +135,15 @@ func getAggregateMetrics(w http.ResponseWriter, r *http.Request, promSupplier pr
 	aggregate := vars["aggregate"]
 	aggregateValue := vars["aggregateValue"]
 
-	metricsService, namespaceInfo := createMetricsServiceForNamespace(w, r, promSupplier, namespace)
+	metricsService, namespaceInfo := createMetricsServiceForNamespaceMC(w, r, promSupplier, namespace)
 	if metricsService == nil {
 		// any returned value nil means error & response already written
 		return
 	}
+	oldestNs := GetOldestNamespace(namespaceInfo)
 
 	params := models.IstioMetricsQuery{Namespace: namespace, Aggregate: aggregate, AggregateValue: aggregateValue}
-	err := extractIstioMetricsQueryParams(r, &params, namespaceInfo)
+	err := extractIstioMetricsQueryParams(r, &params, oldestNs)
 	if err != nil {
 		RespondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -156,41 +165,171 @@ func getAggregateMetrics(w http.ResponseWriter, r *http.Request, promSupplier pr
 	RespondWithJSON(w, http.StatusOK, metrics)
 }
 
-// NamespaceMetrics is the API handler to fetch metrics to be displayed, related to all
-// services in the namespace
-func NamespaceMetrics(w http.ResponseWriter, r *http.Request) {
-	getNamespaceMetrics(w, r, defaultPromClientSupplier)
+// ControlPlaneMetrics is the API handler to fetch metrics to be displayed, related to a single control plane revision
+func ControlPlaneMetrics(promSupplier promClientSupplier) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		layer, err := getBusiness(r)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		vars := mux.Vars(r)
+		namespace := vars["namespace"]
+		controlPlane := vars["controlplane"]
+		cluster := clusterNameFromQuery(r.URL.Query())
+
+		metricsService, namespaceInfo := createMetricsServiceForNamespaceMC(w, r, promSupplier, namespace)
+		if metricsService == nil {
+			// any returned value nil means error & response already written
+			return
+		}
+		oldestNs := GetOldestNamespace(namespaceInfo)
+
+		params := models.IstioMetricsQuery{Cluster: cluster, Namespace: namespace}
+
+		err = extractIstioMetricsQueryParams(r, &params, oldestNs)
+		if err != nil {
+			RespondWithError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		if namespace != config.Get().IstioNamespace {
+			RespondWithError(w, http.StatusBadRequest, fmt.Sprintf("namespace [%s] is not the control plane namespace", namespace))
+			return
+		}
+
+		cpWorkload, err := layer.Workload.GetWorkload(r.Context(), business.WorkloadCriteria{
+			Cluster:               cluster,
+			Namespace:             namespace,
+			WorkloadName:          controlPlane,
+			IncludeServices:       false,
+			IncludeIstioResources: false,
+			IncludeHealth:         false,
+		})
+		if err != nil {
+			RespondWithError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		metrics := make(models.MetricsMap)
+
+		controlPlaneMetrics, err := metricsService.GetControlPlaneMetrics(params, cpWorkload.Pods, nil)
+		if err != nil {
+			RespondWithError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+
+		for k, v := range controlPlaneMetrics {
+			metrics[k] = v
+		}
+
+		RespondWithJSON(w, http.StatusOK, metrics)
+	}
 }
 
-// getServiceMetrics (mock-friendly version)
-func getNamespaceMetrics(w http.ResponseWriter, r *http.Request, promSupplier promClientSupplier) {
-	vars := mux.Vars(r)
-	namespace := vars["namespace"]
+// NamespaceMetrics is the API handler to fetch metrics to be displayed, related to all
+// services in the namespace
+func NamespaceMetrics(promSupplier promClientSupplier) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		_, err := getBusiness(r)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 
-	metricsService, namespaceInfo := createMetricsServiceForNamespace(w, r, promSupplier, namespace)
-	if metricsService == nil {
-		// any returned value nil means error & response already written
-		return
-	}
+		vars := mux.Vars(r)
+		namespace := vars["namespace"]
+		cluster := clusterNameFromQuery(r.URL.Query())
 
-	params := models.IstioMetricsQuery{Namespace: namespace}
-	err := extractIstioMetricsQueryParams(r, &params, namespaceInfo)
-	if err != nil {
-		RespondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
+		metricsService, namespaceInfo := createMetricsServiceForNamespaceMC(w, r, promSupplier, namespace)
+		if metricsService == nil {
+			// any returned value nil means error & response already written
+			return
+		}
+		oldestNs := GetOldestNamespace(namespaceInfo)
 
-	metrics, err := metricsService.GetMetrics(params, nil)
-	if err != nil {
-		RespondWithError(w, http.StatusServiceUnavailable, err.Error())
-		return
+		params := models.IstioMetricsQuery{Cluster: cluster, Namespace: namespace}
+
+		err = extractIstioMetricsQueryParams(r, &params, oldestNs)
+		if err != nil {
+			RespondWithError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		metrics, err := metricsService.GetMetrics(params, nil)
+		if err != nil {
+			RespondWithError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+
+		RespondWithJSON(w, http.StatusOK, metrics)
 	}
-	RespondWithJSON(w, http.StatusOK, metrics)
+}
+
+// ClustersMetrics is the API handler to fetch metrics to be displayed, related to all
+// services in provided namespaces of given cluster
+func ClustersMetrics(promSupplier promClientSupplier) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		namespaces := query.Get("namespaces") // csl of namespaces
+		nss := []string{}
+		if len(namespaces) > 0 {
+			nss = strings.Split(namespaces, ",")
+		}
+		cluster := clusterNameFromQuery(query)
+
+		business, err := getBusiness(r)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if len(nss) == 0 {
+			loadedNamespaces, _ := business.Namespace.GetClusterNamespaces(r.Context(), cluster)
+			for _, ns := range loadedNamespaces {
+				nss = append(nss, ns.Name)
+			}
+		}
+
+		metricsService, namespaceInfo := createMetricsServiceForClusterMC(w, r, promSupplier, cluster, nss)
+		if metricsService == nil {
+			// any returned value nil means error & response already written
+			return
+		}
+		oldestNs := GetOldestNamespace(namespaceInfo)
+
+		result := models.MetricsPerNamespace{}
+		for _, namespace := range nss {
+			params := models.IstioMetricsQuery{Cluster: cluster, Namespace: namespace}
+
+			err = extractIstioMetricsQueryParams(r, &params, oldestNs)
+			if err != nil {
+				RespondWithError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+
+			metrics, err := metricsService.GetMetrics(params, nil)
+			if err != nil {
+				RespondWithError(w, http.StatusServiceUnavailable, err.Error())
+				return
+			}
+
+			if err != nil {
+				RespondWithError(w, http.StatusServiceUnavailable, err.Error())
+				return
+			}
+			result[namespace] = metrics
+		}
+
+		RespondWithJSON(w, http.StatusOK, result)
+	}
 }
 
 func extractIstioMetricsQueryParams(r *http.Request, q *models.IstioMetricsQuery, namespaceInfo *models.Namespace) error {
-	q.FillDefaults()
 	queryParams := r.URL.Query()
+
+	q.FillDefaults()
+
 	if filters, ok := queryParams["filters[]"]; ok && len(filters) > 0 {
 		q.Filters = filters
 	}
@@ -202,17 +341,29 @@ func extractIstioMetricsQueryParams(r *http.Request, q *models.IstioMetricsQuery
 		}
 		q.Direction = dir
 	}
+
+	includeAmbientParam := queryParams.Get("includeAmbient")
+	if includeAmbientParam != "" {
+		includeAmbient, err := strconv.ParseBool(includeAmbientParam)
+		if err != nil {
+			return errors.New("bad request, query parameter 'includeAmbient' must be either 'true' or 'false'")
+		}
+		q.IncludeAmbient = includeAmbient
+	}
+
+	reporter := queryParams.Get("reporter")
+	if reporter != "" {
+		if reporter != "both" && reporter != "destination" && reporter != "source" {
+			return errors.New("bad request, query parameter 'reporter' must be one of 'both, 'destination', or 'source'")
+		}
+		q.Reporter = reporter
+	}
+
 	requestProtocol := queryParams.Get("requestProtocol")
 	if requestProtocol != "" {
 		q.RequestProtocol = requestProtocol
 	}
-	reporter := queryParams.Get("reporter")
-	if reporter != "" {
-		if reporter != "source" && reporter != "destination" {
-			return errors.New("bad request, query parameter 'reporter' must be either 'source' or 'destination'")
-		}
-		q.Reporter = reporter
-	}
+
 	return extractBaseMetricsQueryParams(queryParams, &q.RangeQuery, namespaceInfo)
 }
 
@@ -305,18 +456,19 @@ func extractBaseMetricsQueryParams(queryParams url.Values, q *prometheus.RangeQu
 
 // MetricsStats is the API handler to compute some stats based on metrics
 func MetricsStats(w http.ResponseWriter, r *http.Request) {
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		RespondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	var raw models.MetricsStatsQueries
+
 	err = json.Unmarshal(body, &raw)
 	if err != nil {
 		RespondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	metricsService, queries, warns := prepareStatsQueries(w, r, raw.Queries, defaultPromClientSupplier)
+	metricsService, queries, warns := prepareStatsQueries(w, r, raw.Queries, DefaultPromClientSupplier)
 	if len(queries) == 0 && warns != nil {
 		// All queries failed to be adjusted => return an error
 		handleErrorResponse(w, warns)
@@ -336,17 +488,18 @@ func MetricsStats(w http.ResponseWriter, r *http.Request) {
 
 func prepareStatsQueries(w http.ResponseWriter, r *http.Request, rawQ []models.MetricsStatsQuery, promSupplier promClientSupplier) (*business.MetricsService, []models.MetricsStatsQuery, *util.Errors) {
 	// Get unique namespaces list
-	var namespaces []string
+	var namespaces []models.Namespace
 	for _, q := range rawQ {
 		found := false
 		for _, ns := range namespaces {
-			if ns == q.Target.Namespace {
+			if ns.Name == q.Target.Namespace {
 				found = true
 				break
 			}
 		}
 		if !found {
-			namespaces = append(namespaces, q.Target.Namespace)
+			newNs := models.Namespace{Name: q.Target.Namespace, Cluster: config.GetSafeClusterName(q.Target.Cluster)}
+			namespaces = append(namespaces, newNs)
 		}
 	}
 
@@ -362,10 +515,10 @@ func prepareStatsQueries(w http.ResponseWriter, r *http.Request, rawQ []models.M
 			continue
 		}
 		if nsInfoErr, ok := nsInfos[q.Target.Namespace]; !ok {
-			errors.Add(fmt.Errorf("Missing info for namespace '%s'", q.Target.Namespace))
+			errors.Add(fmt.Errorf("missing info for namespace '%s'", q.Target.Namespace))
 			continue
 		} else if nsInfoErr.err != nil {
-			errors.Add(fmt.Errorf("Namespace '%s': %v", q.Target.Namespace, nsInfoErr.err))
+			errors.Add(fmt.Errorf("namespace '%s': %v", q.Target.Namespace, nsInfoErr.err))
 			continue
 		} else {
 			namespaceInfo := nsInfoErr.info

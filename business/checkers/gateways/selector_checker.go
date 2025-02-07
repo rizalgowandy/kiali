@@ -1,7 +1,7 @@
 package gateways
 
 import (
-	networking_v1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
 	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/kiali/kiali/models"
@@ -9,7 +9,8 @@ import (
 
 type SelectorChecker struct {
 	WorkloadsPerNamespace map[string]models.WorkloadList
-	Gateway               networking_v1alpha3.Gateway
+	Gateway               *networking_v1.Gateway
+	IsGatewayToNamespace  bool
 }
 
 // Check verifies that the Gateway's selector's labels do match a known service inside the same namespace as recommended/required by the docs
@@ -26,6 +27,9 @@ func (s SelectorChecker) hasMatchingWorkload(labelSelector map[string]string) bo
 	selector := labels.SelectorFromSet(labelSelector)
 
 	for _, wls := range s.WorkloadsPerNamespace {
+		if s.IsGatewayToNamespace && wls.Namespace != s.Gateway.Namespace {
+			continue
+		}
 		for _, wl := range wls.Workloads {
 			wlLabelSet := labels.Set(wl.Labels)
 			if selector.Matches(wlLabelSet) {

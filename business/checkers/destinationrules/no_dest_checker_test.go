@@ -5,8 +5,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	api_networking_v1alpha3 "istio.io/api/networking/v1alpha3"
-	networking_v1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
+	api_networking_v1 "istio.io/api/networking/v1"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
 
 	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/kubernetes"
@@ -26,13 +26,13 @@ func TestValidHost(t *testing.T) {
 	assert := assert.New(t)
 
 	vals, valid := NoDestinationChecker{
-		Namespace: "test-namespace",
-		WorkloadList: data.CreateWorkloadList("test-namespace",
-			data.CreateWorkloadListItem("reviewsv1", appVersionLabel("reviews", "v1")),
-			data.CreateWorkloadListItem("reviewsv2", appVersionLabel("reviews", "v2")),
-		),
-		ServiceList:     fakeServicesReview(),
-		DestinationRule: *data.CreateTestDestinationRule("test-namespace", "name", "reviews"),
+		WorkloadsPerNamespace: map[string]models.WorkloadList{
+			"test-namespace": data.CreateWorkloadList("test-namespace",
+				data.CreateWorkloadListItem("reviewsv1", appVersionLabel("reviews", "v1")),
+				data.CreateWorkloadListItem("reviewsv2", appVersionLabel("reviews", "v2"))),
+		},
+		RegistryServices: data.CreateFakeRegistryServicesLabels("reviews", "test-namespace"),
+		DestinationRule:  data.CreateTestDestinationRule("test-namespace", "name", "reviews"),
 	}.Check()
 
 	assert.True(valid)
@@ -43,13 +43,13 @@ func TestValidWildcardHost(t *testing.T) {
 	assert := assert.New(t)
 
 	vals, valid := NoDestinationChecker{
-		Namespace: "test-namespace",
-		WorkloadList: data.CreateWorkloadList("test-namespace",
-			data.CreateWorkloadListItem("reviewsv1", appVersionLabel("reviews", "v1")),
-			data.CreateWorkloadListItem("reviewsv2", appVersionLabel("reviews", "v2")),
-		),
-		ServiceList: fakeServicesReview(),
-		DestinationRule: *data.CreateTestDestinationRule("test-namespace",
+		WorkloadsPerNamespace: map[string]models.WorkloadList{
+			"test-namespace": data.CreateWorkloadList("test-namespace",
+				data.CreateWorkloadListItem("reviewsv1", appVersionLabel("reviews", "v1")),
+				data.CreateWorkloadListItem("reviewsv2", appVersionLabel("reviews", "v2"))),
+		},
+		RegistryServices: data.CreateFakeRegistryServicesLabels("reviews", "test-namespace"),
+		DestinationRule: data.CreateTestDestinationRule("test-namespace",
 			"name", "*.test-namespace.svc.cluster.local"),
 	}.Check()
 
@@ -64,13 +64,33 @@ func TestValidMeshWideHost(t *testing.T) {
 	assert := assert.New(t)
 
 	vals, valid := NoDestinationChecker{
-		Namespace: "test-namespace",
-		WorkloadList: data.CreateWorkloadList("test-namespace",
-			data.CreateWorkloadListItem("reviewsv1", appVersionLabel("reviews", "v1")),
-			data.CreateWorkloadListItem("reviewsv2", appVersionLabel("reviews", "v2")),
-		),
-		ServiceList:     fakeServicesReview(),
-		DestinationRule: *data.CreateTestDestinationRule("test-namespace", "name", "*.local"),
+		WorkloadsPerNamespace: map[string]models.WorkloadList{
+			"test-namespace": data.CreateWorkloadList("test-namespace",
+				data.CreateWorkloadListItem("reviewsv1", appVersionLabel("reviews", "v1")),
+				data.CreateWorkloadListItem("reviewsv2", appVersionLabel("reviews", "v2"))),
+		},
+		RegistryServices: data.CreateFakeRegistryServicesLabels("reviews", "test-namespace"),
+		DestinationRule:  data.CreateTestDestinationRule("test-namespace", "name", "*.local"),
+	}.Check()
+
+	assert.True(valid)
+	assert.Empty(vals)
+}
+
+func TestValidShortSvcHost(t *testing.T) {
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	assert := assert.New(t)
+
+	vals, valid := NoDestinationChecker{
+		WorkloadsPerNamespace: map[string]models.WorkloadList{
+			"test-namespace": data.CreateWorkloadList("test-namespace",
+				data.CreateWorkloadListItem("reviewsv1", appVersionLabel("reviews", "v1")),
+				data.CreateWorkloadListItem("reviewsv2", appVersionLabel("reviews", "v2"))),
+		},
+		RegistryServices: data.CreateFakeRegistryServicesLabels("reviews", "test-namespace"),
+		DestinationRule:  data.CreateTestDestinationRule("test-namespace", "name", "reviews.test-namespace.svc"),
 	}.Check()
 
 	assert.True(valid)
@@ -84,13 +104,13 @@ func TestValidServiceNamespace(t *testing.T) {
 	assert := assert.New(t)
 
 	vals, valid := NoDestinationChecker{
-		Namespace: "test-namespace",
-		WorkloadList: data.CreateWorkloadList("test-namespace",
-			data.CreateWorkloadListItem("reviewsv1", appVersionLabel("reviews", "v1")),
-			data.CreateWorkloadListItem("reviewsv2", appVersionLabel("reviews", "v2")),
-		),
-		ServiceList:     fakeServicesReview(),
-		DestinationRule: *data.CreateTestDestinationRule("test-namespace", "name", "reviews.test-namespace"),
+		WorkloadsPerNamespace: map[string]models.WorkloadList{
+			"test-namespace": data.CreateWorkloadList("test-namespace",
+				data.CreateWorkloadListItem("reviewsv1", appVersionLabel("reviews", "v1")),
+				data.CreateWorkloadListItem("reviewsv2", appVersionLabel("reviews", "v2"))),
+		},
+		RegistryServices: data.CreateFakeRegistryServicesLabels("reviews", "test-namespace"),
+		DestinationRule:  data.CreateTestDestinationRule("test-namespace", "name", "reviews.test-namespace"),
 	}.Check()
 
 	assert.True(valid)
@@ -104,17 +124,17 @@ func TestValidServiceNamespaceInvalid(t *testing.T) {
 	assert := assert.New(t)
 
 	vals, valid := NoDestinationChecker{
-		Namespace: "test-namespace",
 		Namespaces: models.Namespaces{
 			models.Namespace{Name: "test-namespace"},
 			models.Namespace{Name: "outside-ns"},
 		},
-		WorkloadList: data.CreateWorkloadList("test-namespace",
-			data.CreateWorkloadListItem("reviewsv1", appVersionLabel("reviews", "v1")),
-			data.CreateWorkloadListItem("reviewsv2", appVersionLabel("reviews", "v2")),
-		),
-		ServiceList:     fakeServicesReview(),
-		DestinationRule: *data.CreateTestDestinationRule("test-namespace", "name", "reviews.not-a-namespace"),
+		WorkloadsPerNamespace: map[string]models.WorkloadList{
+			"test-namespace": data.CreateWorkloadList("test-namespace",
+				data.CreateWorkloadListItem("reviewsv1", appVersionLabel("reviews", "v1")),
+				data.CreateWorkloadListItem("reviewsv2", appVersionLabel("reviews", "v2"))),
+		},
+		RegistryServices: data.CreateFakeRegistryServicesLabels("reviews", "test-namespace"),
+		DestinationRule:  data.CreateTestDestinationRule("test-namespace", "name", "reviews.not-a-namespace"),
 	}.Check()
 
 	assert.False(valid)
@@ -130,23 +150,20 @@ func TestValidServiceNamespaceCrossNamespace(t *testing.T) {
 
 	assert := assert.New(t)
 
-	// Note that a cross-namespace service should be visible in the registry, otherwise won't be visible
-	registryService := kubernetes.RegistryStatus{}
-	registryService.Hostname = "reviews.outside-ns.svc.cluster.local"
-
 	vals, valid := NoDestinationChecker{
-		Namespace: "test-namespace",
 		Namespaces: models.Namespaces{
 			models.Namespace{Name: "test-namespace"},
 			models.Namespace{Name: "outside-ns"},
 		},
-		WorkloadList: data.CreateWorkloadList("test-namespace",
-			data.CreateWorkloadListItem("reviewsv1", appVersionLabel("reviews", "v1")),
-			data.CreateWorkloadListItem("reviewsv2", appVersionLabel("reviews", "v2")),
-		),
-		ServiceList:     fakeServicesReview(),
-		DestinationRule: *data.CreateTestDestinationRule("test-namespace", "name", "reviews.outside-ns.svc.cluster.local"),
-		RegistryStatus:  []*kubernetes.RegistryStatus{&registryService},
+		WorkloadsPerNamespace: map[string]models.WorkloadList{
+			"outside-ns": data.CreateWorkloadList("outside-ns",
+				data.CreateWorkloadListItem("reviewsv1", appVersionLabel("reviews", "v1")),
+				data.CreateWorkloadListItem("reviewsv2", appVersionLabel("reviews", "v2"))),
+		},
+		// using outside-ns namespace in host where the workloads are created. this should not fail
+		DestinationRule: data.CreateTestDestinationRule("test-namespace", "name", "reviews.outside-ns.svc.cluster.local"),
+		// Note that a cross-namespace service should be visible in the registry, otherwise won't be visible
+		RegistryServices: append(data.CreateFakeRegistryServicesLabels("reviews", "outside-ns"), data.CreateFakeRegistryServicesLabels("reviews", "test-namespace")...),
 	}.Check()
 
 	assert.True(valid)
@@ -161,13 +178,42 @@ func TestNoValidHost(t *testing.T) {
 
 	// reviews is not part of services
 	vals, valid := NoDestinationChecker{
-		Namespace: "test-namespace",
-		WorkloadList: data.CreateWorkloadList("test-namespace",
-			data.CreateWorkloadListItem("detailsv1", appVersionLabel("details", "v1")),
-			data.CreateWorkloadListItem("otherv1", appVersionLabel("other", "v1")),
-		),
-		ServiceList:     models.ServiceList{},
-		DestinationRule: *data.CreateTestDestinationRule("test-namespace", "name", "reviews"),
+		WorkloadsPerNamespace: map[string]models.WorkloadList{
+			"test-namespace": data.CreateWorkloadList("test-namespace",
+				data.CreateWorkloadListItem("detailsv1", appVersionLabel("details", "v1")),
+				data.CreateWorkloadListItem("otherv1", appVersionLabel("other", "v1"))),
+		},
+		RegistryServices: []*kubernetes.RegistryService{{}},
+		DestinationRule:  data.CreateTestDestinationRule("test-namespace", "name", "reviews"),
+	}.Check()
+
+	assert.False(valid)
+	assert.NotEmpty(vals)
+	assert.Equal(models.ErrorSeverity, vals[0].Severity)
+	assert.NoError(validations.ConfirmIstioCheckMessage("destinationrules.nodest.matchingregistry", vals[0]))
+	assert.Equal("spec/host", vals[0].Path)
+}
+
+func TestNoValidShortSvcHost(t *testing.T) {
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	assert := assert.New(t)
+
+	// Valid cases:
+	// reviews.test-namespace
+	// reviews.test-namespace.svc
+	// reviews.test-namespace.svc.cluster.local
+	// Not valid:
+	// reviews.test-namespace.svc.cluster
+	vals, valid := NoDestinationChecker{
+		WorkloadsPerNamespace: map[string]models.WorkloadList{
+			"test-namespace": data.CreateWorkloadList("test-namespace",
+				data.CreateWorkloadListItem("detailsv1", appVersionLabel("details", "v1")),
+				data.CreateWorkloadListItem("otherv1", appVersionLabel("other", "v1"))),
+		},
+		RegistryServices: data.CreateFakeRegistryServicesLabels("reviews", "test-namespace"),
+		DestinationRule:  data.CreateTestDestinationRule("test-namespace", "name", "reviews.test-namespace.svc.cluster"),
 	}.Check()
 
 	assert.False(valid)
@@ -185,13 +231,13 @@ func TestNoMatchingSubset(t *testing.T) {
 
 	// reviews does not have v2 in known services
 	vals, valid := NoDestinationChecker{
-		Namespace: "test-namespace",
-		WorkloadList: data.CreateWorkloadList("test-namespace",
-			data.CreateWorkloadListItem("reviews", appVersionLabel("reviews", "v1")),
-		),
-		ServiceList:     fakeServicesReview(),
-		DestinationRule: *data.CreateTestDestinationRule("test-namespace", "name", "reviews"),
-		VirtualServices: []networking_v1alpha3.VirtualService{*data.AddHttpRoutesToVirtualService(data.CreateHttpRouteDestination("reviews", "v1", 55),
+		WorkloadsPerNamespace: map[string]models.WorkloadList{
+			"test-namespace": data.CreateWorkloadList("test-namespace",
+				data.CreateWorkloadListItem("reviews", appVersionLabel("reviews", "v1"))),
+		},
+		RegistryServices: data.CreateFakeRegistryServicesLabels("reviews", "test-namespace"),
+		DestinationRule:  data.CreateTestDestinationRule("test-namespace", "name", "reviews"),
+		VirtualServices: []*networking_v1.VirtualService{data.AddHttpRoutesToVirtualService(data.CreateHttpRouteDestination("reviews", "v1", 55),
 			data.AddHttpRoutesToVirtualService(data.CreateHttpRouteDestination("reviews", "v2", 45),
 				data.CreateEmptyVirtualService("reviews", "test-namespace", []string{"reviews"}),
 			),
@@ -211,13 +257,13 @@ func TestNoMatchingSubsetWithMoreLabels(t *testing.T) {
 
 	assert := assert.New(t)
 
-	s1 := &api_networking_v1alpha3.Subset{
+	s1 := &api_networking_v1.Subset{
 		Name: "reviewsv2",
 		Labels: map[string]string{
 			"version": "v2",
 		},
 	}
-	s2 := &api_networking_v1alpha3.Subset{
+	s2 := &api_networking_v1.Subset{
 		Name: "reviewsv1",
 		Labels: map[string]string{
 			"version": "v1",
@@ -228,14 +274,14 @@ func TestNoMatchingSubsetWithMoreLabels(t *testing.T) {
 		data.AddSubsetToDestinationRule(s2, data.CreateEmptyDestinationRule("test-namespace", "name", "reviews")))
 
 	vals, valid := NoDestinationChecker{
-		Namespace: "test-namespace",
-		WorkloadList: data.CreateWorkloadList("test-namespace",
-			data.CreateWorkloadListItem("reviews", appVersionLabel("reviews", "v1")),
-			data.CreateWorkloadListItem("reviews", appVersionLabel("reviews", "v2")),
-		),
-		ServiceList:     fakeServicesReview(),
-		DestinationRule: *dr,
-		VirtualServices: []networking_v1alpha3.VirtualService{*data.AddHttpRoutesToVirtualService(data.CreateHttpRouteDestination("reviews", "reviewsv1", 55),
+		WorkloadsPerNamespace: map[string]models.WorkloadList{
+			"test-namespace": data.CreateWorkloadList("test-namespace",
+				data.CreateWorkloadListItem("reviews", appVersionLabel("reviews", "v1")),
+				data.CreateWorkloadListItem("reviews", appVersionLabel("reviews", "v2"))),
+		},
+		RegistryServices: data.CreateFakeRegistryServicesLabels("reviews", "test-namespace"),
+		DestinationRule:  dr,
+		VirtualServices: []*networking_v1.VirtualService{data.AddHttpRoutesToVirtualService(data.CreateHttpRouteDestination("reviews", "reviewsv1", 55),
 			data.AddHttpRoutesToVirtualService(data.CreateHttpRouteDestination("reviews", "reviewsv2", 100),
 				data.CreateEmptyVirtualService("reviews", "test-namespace", []string{"reviews"}),
 			),
@@ -261,15 +307,15 @@ func TestSubsetNotReferenced(t *testing.T) {
 	dr := loader.FindDestinationRule("testrule", "bookinfo")
 
 	vals, valid := NoDestinationChecker{
-		Namespace:  "bookinfo",
 		Namespaces: models.Namespaces{models.Namespace{Name: "bookinfo2"}, models.Namespace{Name: "bookinfo"}},
-		WorkloadList: data.CreateWorkloadList("bookinfo",
-			data.CreateWorkloadListItem("reviews", appVersionLabel("reviews", "v1")),
-			data.CreateWorkloadListItem("reviews", appVersionLabel("reviews", "v2")),
-		),
-		ServiceList:     fakeServicesReview(),
-		DestinationRule: *dr,
-		VirtualServices: []networking_v1alpha3.VirtualService{},
+		WorkloadsPerNamespace: map[string]models.WorkloadList{
+			"bookinfo": data.CreateWorkloadList("bookinfo",
+				data.CreateWorkloadListItem("reviews", appVersionLabel("reviews", "v1")),
+				data.CreateWorkloadListItem("reviews", appVersionLabel("reviews", "v2"))),
+		},
+		RegistryServices: data.CreateFakeRegistryServicesLabels("reviews", "test-namespace"),
+		DestinationRule:  dr,
+		VirtualServices:  []*networking_v1.VirtualService{},
 	}.Check()
 
 	assert.True(valid)
@@ -293,15 +339,15 @@ func TestSubsetReferenced(t *testing.T) {
 	vs := loader.FindVirtualService("testvs", "bookinfo")
 
 	vals, valid := NoDestinationChecker{
-		Namespace:  "bookinfo",
 		Namespaces: models.Namespaces{models.Namespace{Name: "bookinfo2"}, models.Namespace{Name: "bookinfo"}},
-		WorkloadList: data.CreateWorkloadList("bookinfo",
-			data.CreateWorkloadListItem("reviews", appVersionLabel("reviews", "v1")),
-			data.CreateWorkloadListItem("reviews", appVersionLabel("reviews", "v2")),
-		),
-		ServiceList:     fakeServicesReview(),
-		DestinationRule: *dr,
-		VirtualServices: []networking_v1alpha3.VirtualService{*vs},
+		WorkloadsPerNamespace: map[string]models.WorkloadList{
+			"bookinfo": data.CreateWorkloadList("bookinfo",
+				data.CreateWorkloadListItem("reviews", appVersionLabel("reviews", "v1")),
+				data.CreateWorkloadListItem("reviews", appVersionLabel("reviews", "v2"))),
+		},
+		RegistryServices: data.CreateFakeRegistryServicesLabels("reviews", "test-namespace"),
+		DestinationRule:  dr,
+		VirtualServices:  []*networking_v1.VirtualService{vs},
 	}.Check()
 
 	assert.False(valid)
@@ -329,15 +375,15 @@ func TestSubsetPresentMatchingNotReferenced(t *testing.T) {
 	vs := loader.FindVirtualService("testvs", "bookinfo")
 
 	vals, valid := NoDestinationChecker{
-		Namespace:  "bookinfo",
 		Namespaces: models.Namespaces{models.Namespace{Name: "bookinfo"}},
-		WorkloadList: data.CreateWorkloadList("bookinfo",
-			data.CreateWorkloadListItem("reviews", appVersionLabel("reviews", "v1")),
-			data.CreateWorkloadListItem("reviews", appVersionLabel("reviews", "v2")),
-		),
-		ServiceList:     fakeServicesReview(),
-		DestinationRule: *dr,
-		VirtualServices: []networking_v1alpha3.VirtualService{*vs},
+		WorkloadsPerNamespace: map[string]models.WorkloadList{
+			"bookinfo": data.CreateWorkloadList("bookinfo",
+				data.CreateWorkloadListItem("reviews", appVersionLabel("reviews", "v1")),
+				data.CreateWorkloadListItem("reviews", appVersionLabel("reviews", "v2"))),
+		},
+		RegistryServices: data.CreateFakeRegistryServicesLabels("reviews", "bookinfo"),
+		DestinationRule:  dr,
+		VirtualServices:  []*networking_v1.VirtualService{vs},
 	}.Check()
 
 	assert.True(valid)
@@ -358,15 +404,15 @@ func TestWronglyReferenced(t *testing.T) {
 	vs := loader.FindVirtualService("testvs", "bookinfo")
 
 	vals, valid := NoDestinationChecker{
-		Namespace:  "bookinfo",
 		Namespaces: models.Namespaces{models.Namespace{Name: "bookinfo2"}, models.Namespace{Name: "bookinfo"}},
-		WorkloadList: data.CreateWorkloadList("bookinfo",
-			data.CreateWorkloadListItem("reviews", appVersionLabel("reviews", "v1")),
-			data.CreateWorkloadListItem("reviews", appVersionLabel("reviews", "v2")),
-		),
-		ServiceList:     fakeServicesReview(),
-		DestinationRule: *dr,
-		VirtualServices: []networking_v1alpha3.VirtualService{*vs},
+		WorkloadsPerNamespace: map[string]models.WorkloadList{
+			"bookinfo": data.CreateWorkloadList("bookinfo",
+				data.CreateWorkloadListItem("reviews", appVersionLabel("reviews", "v1")),
+				data.CreateWorkloadListItem("reviews", appVersionLabel("reviews", "v2"))),
+		},
+		RegistryServices: data.CreateFakeRegistryServicesLabels("reviews", "test-namespace"),
+		DestinationRule:  dr,
+		VirtualServices:  []*networking_v1.VirtualService{vs},
 	}.Check()
 
 	assert.True(valid)
@@ -376,43 +422,31 @@ func TestWronglyReferenced(t *testing.T) {
 	assert.Equal("spec/subsets[0]", vals[0].Path)
 }
 
-func fakeServicesReview() models.ServiceList {
-	serviceList := models.ServiceList{
-		Services: []models.ServiceOverview{
-			{
-				Name:      "reviews",
-				Namespace: "test-namespace",
-				Labels: map[string]string{
-					"app":     "reviews",
-					"version": "v1"},
-				Selector: map[string]string{"app": "reviews"},
-			},
-		},
-	}
-	return serviceList
-}
-
 func TestFailCrossNamespaceHost(t *testing.T) {
 	assert := assert.New(t)
 
-	// Note that a cross-namespace service should be visible in the registry, otherwise won't be visible
-	registryService := kubernetes.RegistryStatus{}
-	registryService.Hostname = "reviews.different-ns.svc.cluster.local"
-
 	vals, valid := NoDestinationChecker{
-		Namespace: "test-namespace",
-		WorkloadList: data.CreateWorkloadList("test-namespace",
-			data.CreateWorkloadListItem("reviewsv1", appVersionLabel("reviews", "v1")),
-			data.CreateWorkloadListItem("reviewsv2", appVersionLabel("reviews", "v2")),
-		),
-		ServiceList: fakeServicesReview(),
-		// Intentionally using the same serviceName, but different NS. This shouldn't fail to match the above workloads
-		DestinationRule: *data.CreateTestDestinationRule("test-namespace", "name", "reviews.different-ns.svc.cluster.local"),
-		RegistryStatus:  []*kubernetes.RegistryStatus{&registryService},
+		WorkloadsPerNamespace: map[string]models.WorkloadList{
+			"test-namespace": data.CreateWorkloadList("test-namespace",
+				data.CreateWorkloadListItem("reviewsv1", appVersionLabel("reviews", "v1")),
+				data.CreateWorkloadListItem("reviewsv2", appVersionLabel("reviews", "v2"))),
+		},
+		// Intentionally using the same serviceName, but different NS. This SHOULD fail to match the above workloads which are created in test-namespace
+		DestinationRule: data.CreateTestDestinationRule("test-namespace", "name", "reviews.different-ns.svc.cluster.local"),
+		// Note that a cross-namespace service should be visible in the registry, otherwise won't be visible
+		RegistryServices: append(data.CreateFakeRegistryServices("reviews.test-namespace.svc.cluster.local", "test-namespace", "test-namespace"),
+			data.CreateFakeRegistryServicesLabels("reviews", "different-ns")...),
 	}.Check()
 
 	assert.True(valid)
-	assert.Empty(vals)
+	assert.NotEmpty(vals)
+	assert.Equal(2, len(vals))
+	assert.Equal(models.Unknown, vals[0].Severity)
+	assert.NoError(validations.ConfirmIstioCheckMessage("destinationrules.nodest.subsetlabels", vals[0]))
+	assert.Equal("spec/subsets[0]", vals[0].Path)
+	assert.Equal(models.Unknown, vals[1].Severity)
+	assert.NoError(validations.ConfirmIstioCheckMessage("destinationrules.nodest.subsetlabels", vals[1]))
+	assert.Equal("spec/subsets[1]", vals[1].Path)
 }
 
 func TestSNIProxyExample(t *testing.T) {
@@ -423,13 +457,12 @@ func TestSNIProxyExample(t *testing.T) {
 	assert := assert.New(t)
 
 	dr := data.CreateEmptyDestinationRule("test", "disable-mtls-for-sni-proxy", "sni-proxy.local")
-	se := data.AddPortDefinitionToServiceEntry(data.CreateEmptyPortDefinition(8443, "tcp", "TCP"),
+	se := data.AddPortDefinitionToServiceEntry(data.CreateEmptyServicePortDefinition(8443, "tcp", "TCP"),
 		data.CreateEmptyMeshExternalServiceEntry("sni-proxy", "test", []string{"sni-proxy.local"}))
 
 	vals, valid := NoDestinationChecker{
-		Namespace:       "test",
-		ServiceEntries:  kubernetes.ServiceEntryHostnames([]networking_v1alpha3.ServiceEntry{*se}),
-		DestinationRule: *dr,
+		ServiceEntries:  []*networking_v1.ServiceEntry{se},
+		DestinationRule: dr,
 	}.Check()
 
 	assert.True(valid)
@@ -443,13 +476,12 @@ func TestWildcardServiceEntry(t *testing.T) {
 	assert := assert.New(t)
 
 	dr := data.CreateEmptyDestinationRule("test", "disable-mtls-for-sni-proxy", "sni-proxy.local")
-	se := data.AddPortDefinitionToServiceEntry(data.CreateEmptyPortDefinition(8443, "tcp", "TCP"),
+	se := data.AddPortDefinitionToServiceEntry(data.CreateEmptyServicePortDefinition(8443, "tcp", "TCP"),
 		data.CreateEmptyMeshExternalServiceEntry("sni-proxy", "test", []string{"*.local"}))
 
 	vals, valid := NoDestinationChecker{
-		Namespace:       "test",
-		ServiceEntries:  kubernetes.ServiceEntryHostnames([]networking_v1alpha3.ServiceEntry{*se}),
-		DestinationRule: *dr,
+		ServiceEntries:  []*networking_v1.ServiceEntry{se},
+		DestinationRule: dr,
 	}.Check()
 
 	assert.True(valid)
@@ -466,9 +498,8 @@ func TestExportedInternalServiceEntry(t *testing.T) {
 	se := data.CreateEmptyMeshInternalServiceEntry("details-se", "bookinfo3", []string{"details.bookinfo2.svc.cluster.local"})
 
 	vals, valid := NoDestinationChecker{
-		Namespace:       "bookinfo",
-		ServiceEntries:  kubernetes.ServiceEntryHostnames([]networking_v1alpha3.ServiceEntry{*se}),
-		DestinationRule: *dr,
+		ServiceEntries:  []*networking_v1.ServiceEntry{se},
+		DestinationRule: dr,
 	}.Check()
 
 	assert.True(valid)
@@ -485,9 +516,8 @@ func TestWildcardExportedInternalServiceEntry(t *testing.T) {
 	se := data.CreateEmptyMeshInternalServiceEntry("details-se", "bookinfo3", []string{"*.bookinfo2.svc.cluster.local"})
 
 	vals, valid := NoDestinationChecker{
-		Namespace:       "bookinfo",
-		ServiceEntries:  kubernetes.ServiceEntryHostnames([]networking_v1alpha3.ServiceEntry{*se}),
-		DestinationRule: *dr,
+		ServiceEntries:  []*networking_v1.ServiceEntry{se},
+		DestinationRule: dr,
 	}.Check()
 
 	assert.True(valid)
@@ -504,9 +534,8 @@ func TestExportedInternalServiceEntryFail(t *testing.T) {
 	se := data.CreateEmptyMeshInternalServiceEntry("details-se", "bookinfo3", []string{"details.bookinfo3.svc.cluster.local"})
 
 	vals, valid := NoDestinationChecker{
-		Namespace:       "bookinfo",
-		ServiceEntries:  kubernetes.ServiceEntryHostnames([]networking_v1alpha3.ServiceEntry{*se}),
-		DestinationRule: *dr,
+		ServiceEntries:  []*networking_v1.ServiceEntry{se},
+		DestinationRule: dr,
 	}.Check()
 
 	assert.False(valid)
@@ -526,9 +555,8 @@ func TestWildcardExportedInternalServiceEntryFail(t *testing.T) {
 	se := data.CreateEmptyMeshInternalServiceEntry("details-se", "bookinfo3", []string{"*.bookinfo3.svc.cluster.local"})
 
 	vals, valid := NoDestinationChecker{
-		Namespace:       "bookinfo",
-		ServiceEntries:  kubernetes.ServiceEntryHostnames([]networking_v1alpha3.ServiceEntry{*se}),
-		DestinationRule: *dr,
+		ServiceEntries:  []*networking_v1.ServiceEntry{se},
+		DestinationRule: dr,
 	}.Check()
 
 	assert.False(valid)
@@ -548,9 +576,8 @@ func TestExportedNonFQDNInternalServiceEntryFail(t *testing.T) {
 	se := data.CreateEmptyMeshInternalServiceEntry("details-se", "bookinfo3", []string{"details"})
 
 	vals, valid := NoDestinationChecker{
-		Namespace:       "bookinfo",
-		ServiceEntries:  kubernetes.ServiceEntryHostnames([]networking_v1alpha3.ServiceEntry{*se}),
-		DestinationRule: *dr,
+		ServiceEntries:  []*networking_v1.ServiceEntry{se},
+		DestinationRule: dr,
 	}.Check()
 
 	assert.False(valid)
@@ -562,9 +589,8 @@ func TestExportedNonFQDNInternalServiceEntryFail(t *testing.T) {
 	dr = data.CreateEmptyDestinationRule("bookinfo", "details", "details")
 
 	vals, valid = NoDestinationChecker{
-		Namespace:       "bookinfo",
-		ServiceEntries:  kubernetes.ServiceEntryHostnames([]networking_v1alpha3.ServiceEntry{*se}),
-		DestinationRule: *dr,
+		ServiceEntries:  []*networking_v1.ServiceEntry{se},
+		DestinationRule: dr,
 	}.Check()
 
 	assert.False(valid)
@@ -584,9 +610,8 @@ func TestExportedExternalServiceEntry(t *testing.T) {
 	se := data.CreateEmptyMeshExternalServiceEntry("details-se", "bookinfo3", []string{"www.myhost.com"})
 
 	vals, valid := NoDestinationChecker{
-		Namespace:       "bookinfo",
-		ServiceEntries:  kubernetes.ServiceEntryHostnames([]networking_v1alpha3.ServiceEntry{*se}),
-		DestinationRule: *dr,
+		ServiceEntries:  []*networking_v1.ServiceEntry{se},
+		DestinationRule: dr,
 	}.Check()
 
 	assert.True(valid)
@@ -603,14 +628,14 @@ func TestExportedExternalServiceEntryFail(t *testing.T) {
 	se := data.CreateEmptyMeshExternalServiceEntry("details-se", "bookinfo3", []string{"www.myhost.com"})
 
 	vals, valid := NoDestinationChecker{
-		Namespace:       "bookinfo",
-		ServiceEntries:  kubernetes.ServiceEntryHostnames([]networking_v1alpha3.ServiceEntry{*se}),
-		DestinationRule: *dr,
+		ServiceEntries:  []*networking_v1.ServiceEntry{se},
+		DestinationRule: dr,
+		PolicyAllowAny:  true,
 	}.Check()
 
 	assert.False(valid)
 	assert.NotEmpty(vals)
-	assert.Equal(models.ErrorSeverity, vals[0].Severity)
+	assert.Equal(models.WarningSeverity, vals[0].Severity)
 	assert.NoError(validations.ConfirmIstioCheckMessage("destinationrules.nodest.matchingregistry", vals[0]))
 	assert.Equal("spec/host", vals[0].Path)
 }
@@ -619,21 +644,43 @@ func TestNoLabelsInSubset(t *testing.T) {
 	assert := assert.New(t)
 
 	vals, valid := NoDestinationChecker{
-		Namespace: "test-namespace",
-		WorkloadList: data.CreateWorkloadList("test-namespace",
-			data.CreateWorkloadListItem("reviewsv1", appVersionLabel("reviews", "v1")),
-			data.CreateWorkloadListItem("reviewsv2", appVersionLabel("reviews", "v2")),
-		),
-		ServiceList:     fakeServicesReview(),
-		DestinationRule: *data.CreateNoLabelsDestinationRule("test-namespace", "name", "reviews"),
+		WorkloadsPerNamespace: map[string]models.WorkloadList{
+			"test-namespace": data.CreateWorkloadList("test-namespace",
+				data.CreateWorkloadListItem("reviewsv1", appVersionLabel("reviews", "v1")),
+				data.CreateWorkloadListItem("reviewsv2", appVersionLabel("reviews", "v2"))),
+		},
+		RegistryServices: data.CreateFakeRegistryServicesLabels("reviews", "test-namespace"),
+		DestinationRule:  data.CreateNoLabelsDestinationRule("test-namespace", "name", "reviews"),
 	}.Check()
 
 	assert.True(valid)
 	assert.NotEmpty(vals)
+	assert.Equal(models.Unknown, vals[0].Severity)
+	assert.NoError(validations.ConfirmIstioCheckMessage("destinationrules.nodest.subsetnolabels", vals[0]))
+	assert.Equal("spec/subsets[0]", vals[0].Path)
+}
+
+func TestSubsetWithoutLabels(t *testing.T) {
+	assert := assert.New(t)
+
+	vals, valid := NoDestinationChecker{
+		WorkloadsPerNamespace: map[string]models.WorkloadList{
+			"test-namespace": data.CreateWorkloadList("test-namespace",
+				data.CreateWorkloadListItem("reviewsv1", appVersionLabel("reviews", "v1")),
+				data.CreateWorkloadListItem("reviewsv2", appVersionLabel("reviews", "v2"))),
+		},
+		RegistryServices: data.CreateFakeRegistryServicesLabels("reviews", "test-namespace"),
+		DestinationRule:  data.CreateNoSubsetLabelsDestinationRule("test-namespace", "name", "reviews"),
+	}.Check()
+
+	assert.True(valid)
+	assert.Len(vals, 2)
 	assert.Equal(models.WarningSeverity, vals[0].Severity)
 	assert.NoError(validations.ConfirmIstioCheckMessage("destinationrules.nodest.subsetnolabels", vals[0]))
 	assert.Equal("spec/subsets[0]", vals[0].Path)
-
+	assert.Equal(models.WarningSeverity, vals[1].Severity)
+	assert.NoError(validations.ConfirmIstioCheckMessage("destinationrules.nodest.subsetnolabels", vals[1]))
+	assert.Equal("spec/subsets[1]", vals[1].Path)
 }
 
 func TestValidServiceRegistry(t *testing.T) {
@@ -643,64 +690,83 @@ func TestValidServiceRegistry(t *testing.T) {
 	assert := assert.New(t)
 
 	dr := data.CreateEmptyDestinationRule("test", "test-exported", "ratings.mesh2-bookinfo.svc.mesh1-imports.local")
-
 	vals, valid := NoDestinationChecker{
-		Namespace:       "test",
-		DestinationRule: *dr,
+		DestinationRule: dr,
 	}.Check()
 
 	assert.False(valid)
 	assert.NotEmpty(vals)
 
-	registryService := kubernetes.RegistryStatus{}
-	registryService.Hostname = "ratings.mesh2-bookinfo.svc.mesh1-imports.local"
-
 	vals, valid = NoDestinationChecker{
-		Namespace:       "test",
-		DestinationRule: *dr,
-		RegistryStatus:  []*kubernetes.RegistryStatus{&registryService},
+		DestinationRule:  dr,
+		RegistryServices: data.CreateFakeRegistryServices("ratings.mesh2-bookinfo.svc.mesh1-imports.local", "test", "*"),
 	}.Check()
 
 	assert.True(valid)
 	assert.Empty(vals)
 
-	registryService = kubernetes.RegistryStatus{}
-	registryService.Hostname = "ratings2.mesh2-bookinfo.svc.mesh1-imports.local"
-
 	vals, valid = NoDestinationChecker{
-		Namespace:       "test",
-		DestinationRule: *dr,
-		RegistryStatus:  []*kubernetes.RegistryStatus{&registryService},
+		DestinationRule:  dr,
+		RegistryServices: data.CreateFakeRegistryServices("ratings2.mesh2-bookinfo.svc.mesh1-imports.local", "test", "."),
 	}.Check()
 
 	assert.False(valid)
 	assert.NotEmpty(vals)
-
-	registryService = kubernetes.RegistryStatus{}
-	registryService.Hostname = "ratings.bookinfo.svc.cluster.local"
 
 	dr = data.CreateEmptyDestinationRule("test", "test-exported", "ratings.bookinfo.svc.cluster.local")
 
 	vals, valid = NoDestinationChecker{
-		Namespace:       "test",
-		DestinationRule: *dr,
-		RegistryStatus:  []*kubernetes.RegistryStatus{&registryService},
+		DestinationRule:  dr,
+		RegistryServices: data.CreateFakeRegistryServices("ratings.bookinfo.svc.cluster.local", "test", "test"),
 	}.Check()
 
 	assert.True(valid)
 	assert.Empty(vals)
 
-	registryService = kubernetes.RegistryStatus{}
-	registryService.Hostname = "ratings2.bookinfo.svc.cluster.local"
-
 	vals, valid = NoDestinationChecker{
-		Namespace:       "test",
-		DestinationRule: *dr,
-		RegistryStatus:  []*kubernetes.RegistryStatus{&registryService},
+		DestinationRule:  dr,
+		RegistryServices: data.CreateFakeRegistryServices("ratings2.bookinfo.svc.cluster.local", "test", "test"),
 	}.Check()
 
 	assert.False(valid)
 	assert.NotEmpty(vals)
+}
+
+func TestServiceEntryLabelsMatchSubsets(t *testing.T) {
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	assert := assert.New(t)
+
+	dr := data.CreateDestinationRuleWithLabel("bookinfo", "details", "details.bookinfo.svc.cluster.local", "cluster", "global")
+	se := data.AddEndpointToServiceEntry("details.bookinfo.svc.cluster.local", "cluster", "global", data.CreateEmptyMeshInternalServiceEntry("details-se", "bookinfo", []string{"details.bookinfo.svc.cluster.local"}))
+
+	vals, valid := NoDestinationChecker{
+		ServiceEntries:  []*networking_v1.ServiceEntry{se},
+		DestinationRule: dr,
+	}.Check()
+
+	assert.True(valid)
+	assert.Empty(vals)
+}
+
+func TestServiceEntryLabelsNoMatchingSubsets(t *testing.T) {
+	conf := config.NewConfig()
+	config.Set(conf)
+
+	assert := assert.New(t)
+
+	dr := data.CreateDestinationRuleWithLabel("bookinfo", "details", "details.bookinfo.svc.cluster.local", "cluster", "global")
+	se := data.AddEndpointToServiceEntry("details.bookinfo.svc.cluster.local", "cluster", "wrong", data.CreateEmptyMeshInternalServiceEntry("details-se", "bookinfo", []string{"details.bookinfo.svc.cluster.local"}))
+
+	vals, _ := NoDestinationChecker{
+		ServiceEntries:  []*networking_v1.ServiceEntry{se},
+		DestinationRule: dr,
+	}.Check()
+
+	assert.NotEmpty(vals)
+	assert.NoError(validations.ConfirmIstioCheckMessage("destinationrules.nodest.subsetlabels", vals[0]))
+	assert.Equal("spec/subsets[0]", vals[0].Path)
 }
 
 func yamlFixtureLoaderFor1(file string) *validations.YamlFixtureLoader {

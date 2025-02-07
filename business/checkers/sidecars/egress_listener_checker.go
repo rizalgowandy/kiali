@@ -4,16 +4,17 @@ import (
 	"fmt"
 	"strings"
 
-	networking_v1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
 
 	"github.com/kiali/kiali/kubernetes"
+	"github.com/kiali/kiali/log"
 	"github.com/kiali/kiali/models"
 )
 
 type EgressHostChecker struct {
-	Sidecar        networking_v1alpha3.Sidecar
-	ServiceEntries map[string][]string
-	ServiceList    models.ServiceList
+	Sidecar          *networking_v1.Sidecar
+	ServiceEntries   map[string][]string
+	RegistryServices []*kubernetes.RegistryService
 }
 
 type HostWithIndex struct {
@@ -61,10 +62,7 @@ func (elc EgressHostChecker) validateHost(host string, egrIdx, hostIdx int) ([]*
 	checks := make([]*models.IstioCheck, 0)
 	sns := elc.Sidecar.Namespace
 
-	hostNs, dnsName, valid := getHostComponents(host)
-	if !valid {
-		return append(checks, buildCheck("sidecar.egress.invalidhostformat", egrIdx, hostIdx)), false
-	}
+	hostNs, dnsName := getHostComponents(host)
 
 	// Don't show any validation for common scenarios like */*, ~/* and ./*
 	if (hostNs == "*" || hostNs == "~" || hostNs == ".") && dnsName == "*" {
@@ -76,7 +74,7 @@ func (elc EgressHostChecker) validateHost(host string, egrIdx, hostIdx int) ([]*
 		return checks, true
 	}
 
-	fqdn := kubernetes.ParseHost(dnsName, sns, elc.Sidecar.ClusterName)
+	fqdn := kubernetes.ParseHost(dnsName, sns)
 
 	// Lookup for matching services
 	if !elc.HasMatchingService(fqdn, sns) {
@@ -91,20 +89,20 @@ func (elc EgressHostChecker) HasMatchingService(host kubernetes.Host, itemNamesp
 	if host.IsWildcard() && host.Namespace == itemNamespace {
 		return true
 	}
-	if elc.ServiceList.HasMatchingServices(host.Service) {
+	if kubernetes.HasMatchingServiceEntries(host.String(), elc.ServiceEntries) {
 		return true
 	}
-	return kubernetes.HasMatchingServiceEntries(host.String(), elc.ServiceEntries)
+	return kubernetes.HasMatchingRegistryService(itemNamespace, host.String(), elc.RegistryServices)
 }
 
-func getHostComponents(host string) (string, string, bool) {
+func getHostComponents(host string) (string, string) {
 	hParts := strings.Split(host, "/")
-
-	if len(hParts) != 2 {
-		return "", "", false
+	if len(hParts) < 2 {
+		// This should not happen because config CRD will prevent creating wrong hosts
+		log.Errorf("host %s does not match namespace/dnsName format", host)
+		return "", ""
 	}
-
-	return hParts[0], hParts[1], true
+	return hParts[0], hParts[1]
 }
 
 func buildCheck(code string, egrIdx, hostIdx int) *models.IstioCheck {

@@ -1,40 +1,44 @@
 package config
 
 import (
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"gopkg.in/yaml.v2"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/kiali/kiali/config/dashboards"
 	"github.com/kiali/kiali/config/security"
 	"github.com/kiali/kiali/log"
+	"github.com/kiali/kiali/util"
 )
 
-// Environment variables that can override the ConfigMap yaml values
+// Files found in /kiali-override-secrets that override the ConfigMap yaml values
 const (
 	// External services auth
-	EnvGrafanaPassword    = "GRAFANA_PASSWORD"
-	EnvGrafanaToken       = "GRAFANA_TOKEN"
-	EnvPrometheusPassword = "PROMETHEUS_PASSWORD"
-	EnvPrometheusToken    = "PROMETHEUS_TOKEN"
-	EnvTracingPassword    = "TRACING_PASSWORD"
-	EnvTracingToken       = "TRACING_TOKEN"
+	SecretFileGrafanaUsername    = "grafana-username"
+	SecretFileGrafanaPassword    = "grafana-password"
+	SecretFileGrafanaToken       = "grafana-token"
+	SecretFilePrometheusUsername = "prometheus-username"
+	SecretFilePrometheusPassword = "prometheus-password"
+	SecretFilePrometheusToken    = "prometheus-token"
+	SecretFileTracingUsername    = "tracing-username"
+	SecretFileTracingPassword    = "tracing-password"
+	SecretFileTracingToken       = "tracing-token"
+
+	// External services auth for custom dashboards
+	SecretFileCustomDashboardsPrometheusUsername = "customdashboards-prometheus-username"
+	SecretFileCustomDashboardsPrometheusPassword = "customdashboards-prometheus-password"
+	SecretFileCustomDashboardsPrometheusToken    = "customdashboards-prometheus-token"
 
 	// Login Token signing key used to prepare the token for user login
-	EnvLoginTokenSigningKey = "LOGIN_TOKEN_SIGNING_KEY"
-)
-
-// The versions that Kiali requires
-const (
-	IstioVersionSupported   = ">= 1.0"
-	MaistraVersionSupported = ">= 0.7.0"
-	OSSMVersionSupported    = ">= 1.0"
-	Iter8VersionSupported   = ">= 0.2"
+	SecretFileLoginTokenSigningKey = "login-token-signing-key"
 )
 
 // The valid auth strategies and values for cookie handling
@@ -44,12 +48,6 @@ const (
 	AuthStrategyToken     = "token"
 	AuthStrategyOpenId    = "openid"
 	AuthStrategyHeader    = "header"
-
-	TokenCookieName             = "kiali-token"
-	AuthStrategyOpenshiftIssuer = "kiali-openshift"
-	AuthStrategyTokenIssuer     = "kiali-token"
-	AuthStrategyOpenIdIssuer    = "kiali-open-id"
-	AuthStrategyHeaderIssuer    = "kiali-header"
 
 	// These constants are used for external services auth (Prometheus, Grafana ...) ; not for Kiali auth
 	AuthTypeBasic  = "basic"
@@ -67,25 +65,128 @@ const (
 	DashboardsDiscoveryAuto    = "auto"
 )
 
+const (
+	// DefaultClusterID is generally not for use outside of test-code. In general you should use config.Get().KubernetesConfig.ClusterName
+	DefaultClusterID = "Kubernetes"
+)
+
+const (
+	AmbientAnnotation         = "ambient.istio.io/redirection"
+	AmbientAnnotationEnabled  = "enabled"
+	Waypoint                  = "waypoint"
+	WaypointFor               = "istio.io/waypoint-for"
+	WaypointForAll            = "all"
+	WaypointForNone           = "none"
+	WaypointForService        = "service"
+	WaypointForWorkload       = "workload"
+	WaypointGatewayLabel      = "gateway.networking.k8s.io/gateway-name"
+	WaypointLabel             = "gateway.istio.io/managed"
+	WaypointLabelValue        = "istio.io-mesh-controller"
+	WaypointUseLabel          = "istio.io/use-waypoint"
+	WaypointUseNamespaceLabel = "istio.io/use-waypoint-namespace"
+	Ztunnel                   = "ztunnel"
+)
+
+// TracingProvider is the type of tracing provider that Kiali will connect to.
+type TracingProvider string
+
+const (
+	JaegerProvider TracingProvider = "jaeger"
+	TempoProvider  TracingProvider = "tempo"
+)
+
+// TracingCollectorType is the type of collector that Kiali will export traces to.
+// These are traces that kiali generates for itself.
+type TracingCollectorType string
+
+const (
+	OTELCollectorType TracingCollectorType = "otel"
+)
+
+var validPathRegEx = regexp.MustCompile(`^\/[a-zA-Z0-9\-\._~!\$&\'()\*\+\,;=:@%/]*$`)
+
+// FeatureName is the enum type used for named features that can be disabled via KialiFeatureFlags.DisabledFeatures
+type FeatureName string
+
+const (
+	FeatureLogView FeatureName = "logs-tab"
+)
+
+func (fn FeatureName) IsValid() error {
+	switch fn {
+	case FeatureLogView:
+		return nil
+	}
+	return fmt.Errorf("Invalid feature name: %v", fn)
+}
+
 // Global configuration for the application.
-var configuration Config
-var rwMutex sync.RWMutex
+var (
+	configuration Config
+	rwMutex       sync.RWMutex
+)
+
+// Defines where the files are located that contain the secrets content
+var overrideSecretsDir = "/kiali-override-secrets"
+
+// Cluster is used to manually specify a cluster that there is no remote secret for.
+type Cluster struct {
+	// Name of the cluster. Must be unique and match what is in telemetry.
+	Name string `yaml:"name,omitempty"`
+
+	// SecretName is the name of the secret that contains the credentials necessary to connect to the remote cluster.
+	// This secret must exist in the Kiali deployment namespace. If no secret name is provided, then it's
+	// assumed that this cluster is inaccessible.
+	SecretName string `yaml:"secret_name,omitempty"`
+}
+
+// Metrics provides metrics configuration for the Kiali server.
+type Metrics struct {
+	Enabled bool `yaml:"enabled,omitempty"`
+	Port    int  `yaml:"port,omitempty"`
+}
+
+// OpenTelemetry collector configuration for tracing
+type OtelCollector struct {
+	CAName     string `yaml:"ca_name,omitempty"`
+	Protocol   string `yaml:"protocol,omitempty"` // http or https or grpc
+	SkipVerify bool   `yaml:"skip_verify,omitempty"`
+	TLSEnabled bool   `yaml:"tls_enabled,omitempty"`
+}
+
+// Tracing provides tracing configuration for the Kiali server.
+type Tracing struct {
+	CollectorType TracingCollectorType `yaml:"collector_type,omitempty"` // Possible value "otel"
+	CollectorURL  string               `yaml:"collector_url,omitempty"`  // Endpoint for Kiali server traces
+	Enabled       bool                 `yaml:"enabled,omitempty"`
+	Otel          OtelCollector        `yaml:"otel,omitempty"`
+	// Sampling rate for Kiali server traces. >= 1.0 always samples and <= 0 never samples.
+	SamplingRate float64 `yaml:"sampling_rate,omitempty"`
+}
+
+// Observability provides configuration for tracing and metrics exported by the Kiali server.
+type Observability struct {
+	Metrics Metrics `yaml:"metrics,omitempty"`
+	Tracing Tracing `yaml:"tracing,omitempty"`
+}
 
 // Server configuration
 type Server struct {
-	Address                    string `yaml:",omitempty"`
-	AuditLog                   bool   `yaml:"audit_log,omitempty"` // When true, allows additional audit logging on Write operations
-	CORSAllowAll               bool   `yaml:"cors_allow_all,omitempty"`
-	GzipEnabled                bool   `yaml:"gzip_enabled,omitempty"`
-	MetricsEnabled             bool   `yaml:"metrics_enabled,omitempty"`
-	MetricsPort                int    `yaml:"metrics_port,omitempty"`
-	Port                       int    `yaml:",omitempty"`
-	StaticContentRootDirectory string `yaml:"static_content_root_directory,omitempty"`
-	WebFQDN                    string `yaml:"web_fqdn,omitempty"`
-	WebPort                    string `yaml:"web_port,omitempty"`
-	WebRoot                    string `yaml:"web_root,omitempty"`
-	WebHistoryMode             string `yaml:"web_history_mode,omitempty"`
-	WebSchema                  string `yaml:"web_schema,omitempty"`
+	Address                    string        `yaml:",omitempty"`
+	AuditLog                   bool          `yaml:"audit_log,omitempty"` // When true, allows additional audit logging on Write operations
+	CORSAllowAll               bool          `yaml:"cors_allow_all,omitempty"`
+	GzipEnabled                bool          `yaml:"gzip_enabled,omitempty"`
+	Observability              Observability `yaml:"observability,omitempty"`
+	Port                       int           `yaml:",omitempty"`
+	Profiler                   Profiler      `yaml:"profiler,omitempty"`
+	StaticContentRootDirectory string        `yaml:"static_content_root_directory,omitempty"`
+	RequireAuth                bool          `yaml:"require_auth,omitempty"` // when true, unauthenticated access to api/ endpoint is not allowed
+	WebFQDN                    string        `yaml:"web_fqdn,omitempty"`
+	WebPort                    string        `yaml:"web_port,omitempty"`
+	WebRoot                    string        `yaml:"web_root,omitempty"`
+	WebHistoryMode             string        `yaml:"web_history_mode,omitempty"`
+	WebSchema                  string        `yaml:"web_schema,omitempty"`
+	WriteTimeout               time.Duration `yaml:"write_timeout,omitempty"`
 }
 
 // Auth provides authentication data for external services
@@ -115,16 +216,14 @@ type ThanosProxy struct {
 
 // PrometheusConfig describes configuration of the Prometheus component
 type PrometheusConfig struct {
-	Auth Auth `yaml:"auth,omitempty"`
-	// Cache duration per query expressed in seconds
-	CacheDuration int `yaml:"cache_duration,omitempty"`
-	// Enable cache for Prometheus queries
-	CacheEnabled bool `yaml:"cache_enabled,omitempty"`
-	// Global cache expiration expressed in seconds
-	CacheExpiration int               `yaml:"cache_expiration,omitempty"`
+	Auth            Auth              `yaml:"auth,omitempty"`
+	CacheDuration   int               `yaml:"cache_duration,omitempty"`   // Cache duration per query expressed in seconds
+	CacheEnabled    bool              `yaml:"cache_enabled,omitempty"`    // Enable cache for Prometheus queries
+	CacheExpiration int               `yaml:"cache_expiration,omitempty"` // Global cache expiration expressed in seconds
 	CustomHeaders   map[string]string `yaml:"custom_headers,omitempty"`
 	HealthCheckUrl  string            `yaml:"health_check_url,omitempty"`
 	IsCore          bool              `yaml:"is_core,omitempty"`
+	QueryScope      map[string]string `yaml:"query_scope,omitempty"`
 	ThanosProxy     ThanosProxy       `yaml:"thanos_proxy,omitempty"`
 	URL             string            `yaml:"url,omitempty"`
 }
@@ -143,11 +242,13 @@ type CustomDashboardsConfig struct {
 type GrafanaConfig struct {
 	Auth           Auth                     `yaml:"auth"`
 	Dashboards     []GrafanaDashboardConfig `yaml:"dashboards"`
-	Enabled        bool                     `yaml:"enabled"` // Enable or disable Grafana support in Kiali
+	Enabled        bool                     `yaml:"enabled"`      // Enable or disable Grafana support in Kiali
+	ExternalURL    string                   `yaml:"external_url"` // replaces the old url
 	HealthCheckUrl string                   `yaml:"health_check_url,omitempty"`
-	InClusterURL   string                   `yaml:"in_cluster_url"`
+	InternalURL    string                   `yaml:"internal_url"` // replaces the old in_cluster_url
 	IsCore         bool                     `yaml:"is_core,omitempty"`
-	URL            string                   `yaml:"url"`
+	XInClusterURL  string                   `yaml:"in_cluster_url,omitempty" json:"InClusterURL,omitempty"` // DEPRECATED!
+	XURL           string                   `yaml:"url,omitempty" json:"URL,omitempty"`                     // DEPRECATED!
 }
 
 type GrafanaDashboardConfig struct {
@@ -163,36 +264,64 @@ type GrafanaVariablesConfig struct {
 	Workload  string `yaml:"workload" json:"workload,omitempty"`
 }
 
+type TempoConfig struct {
+	CacheCapacity int    `yaml:"cache_capacity" json:"cache_capacity,omitempty"`
+	CacheEnabled  bool   `yaml:"cache_enabled" json:"cache_enabled,omitempty"`
+	DatasourceUID string `yaml:"datasource_uid" json:"datasource_uid,omitempty"`
+	OrgID         string `yaml:"org_id" json:"org_id,omitempty"`
+	URLFormat     string `yaml:"url_format" json:"url_format,omitempty"`
+}
+
 // TracingConfig describes configuration used for tracing links
 type TracingConfig struct {
-	Auth                 Auth     `yaml:"auth"`
-	Enabled              bool     `yaml:"enabled"` // Enable Jaeger in Kiali
-	InClusterURL         string   `yaml:"in_cluster_url"`
-	IsCore               bool     `yaml:"is_core,omitempty"`
-	NamespaceSelector    bool     `yaml:"namespace_selector"`
-	URL                  string   `yaml:"url"`
-	UseGRPC              bool     `yaml:"use_grpc"`
-	WhiteListIstioSystem []string `yaml:"whitelist_istio_system"`
+	Auth                 Auth              `yaml:"auth"`
+	CustomHeaders        map[string]string `yaml:"custom_headers,omitempty"`
+	Enabled              bool              `yaml:"enabled"`      // Enable Tracing in Kiali
+	ExternalURL          string            `yaml:"external_url"` // replaces the old url
+	HealthCheckUrl       string            `yaml:"health_check_url,omitempty"`
+	GrpcPort             int               `yaml:"grpc_port,omitempty"`
+	InternalURL          string            `yaml:"internal_url"` // replaces the old in_cluster_url
+	IsCore               bool              `yaml:"is_core,omitempty"`
+	Provider             TracingProvider   `yaml:"provider,omitempty"` // jaeger | tempo
+	TempoConfig          TempoConfig       `yaml:"tempo_config,omitempty"`
+	NamespaceSelector    bool              `yaml:"namespace_selector"`
+	QueryScope           map[string]string `yaml:"query_scope,omitempty"`
+	QueryTimeout         int               `yaml:"query_timeout,omitempty"`
+	UseGRPC              bool              `yaml:"use_grpc"`
+	WhiteListIstioSystem []string          `yaml:"whitelist_istio_system"`
+	XInClusterURL        string            `yaml:"in_cluster_url,omitempty" json:"InClusterURL,omitempty"` // DEPRECATED!
+	XURL                 string            `yaml:"url,omitempty" json:"URL,omitempty"`                     // DEPRECATED!
+}
+
+// RegistryConfig contains configuration for connecting to an external istiod.
+// This is used when Kiali should connect to the istiod via a url instead of port forwarding.
+type RegistryConfig struct {
+	IstiodURL string `yaml:"istiod_url"`
+	// TODO: Support auth options
 }
 
 // IstioConfig describes configuration used for istio links
 type IstioConfig struct {
-	ComponentStatuses                 ComponentStatuses   `yaml:"component_status,omitempty"`
-	ConfigMapName                     string              `yaml:"config_map_name,omitempty"`
-	EnvoyAdminLocalPort               int                 `yaml:"envoy_admin_local_port,omitempty"`
-	IstioCanaryRevision               IstioCanaryRevision `yaml:"istio_canary_revision,omitempty"`
-	IstioIdentityDomain               string              `yaml:"istio_identity_domain,omitempty"`
-	IstioInjectionAnnotation          string              `yaml:"istio_injection_annotation,omitempty"`
-	IstioSidecarInjectorConfigMapName string              `yaml:"istio_sidecar_injector_config_map_name,omitempty"`
-	IstioSidecarAnnotation            string              `yaml:"istio_sidecar_annotation,omitempty"`
-	IstiodDeploymentName              string              `yaml:"istiod_deployment_name,omitempty"`
-	RootNamespace                     string              `yaml:"root_namespace,omitempty"`
-	UrlServiceVersion                 string              `yaml:"url_service_version"`
-}
-
-type IstioCanaryRevision struct {
-	Current string `yaml:"current,omitempty"`
-	Upgrade string `yaml:"upgrade,omitempty"`
+	ComponentStatuses                 ComponentStatuses `yaml:"component_status,omitempty"`
+	ConfigMapName                     string            `yaml:"config_map_name,omitempty"`
+	EnvoyAdminLocalPort               int               `yaml:"envoy_admin_local_port,omitempty"`
+	GatewayAPIClasses                 []GatewayAPIClass `yaml:"gateway_api_classes,omitempty"`
+	IstioAPIEnabled                   bool              `yaml:"istio_api_enabled"`
+	IstioIdentityDomain               string            `yaml:"istio_identity_domain,omitempty"`
+	IstioInjectionAnnotation          string            `yaml:"istio_injection_annotation,omitempty"`
+	IstioSidecarInjectorConfigMapName string            `yaml:"istio_sidecar_injector_config_map_name,omitempty"`
+	IstioSidecarAnnotation            string            `yaml:"istio_sidecar_annotation,omitempty"`
+	IstiodDeploymentName              string            `yaml:"istiod_deployment_name,omitempty"`
+	IstiodPodMonitoringPort           int               `yaml:"istiod_pod_monitoring_port,omitempty"`
+	// IstiodPollingIntervalSeconds is how often in seconds Kiali will poll istiod(s) for
+	// proxy status and registry services. Polling is not performed if IstioAPIEnabled is false.
+	IstiodPollingIntervalSeconds int             `yaml:"istiod_polling_interval_seconds,omitempty"`
+	Registry                     *RegistryConfig `yaml:"registry,omitempty"`
+	RootNamespace                string          `yaml:"root_namespace,omitempty"`
+	UrlServiceVersion            string          `yaml:"url_service_version"`
+	// ValidationReconcileInterval sets how often Kiali will validate Istio configuration.
+	// Validations cannot be disabled at the moment but you can set this to a long period of time.
+	ValidationReconcileInterval *time.Duration `yaml:"validation_reconcile_interval,omitempty"`
 }
 
 type ComponentStatuses struct {
@@ -201,22 +330,16 @@ type ComponentStatuses struct {
 }
 
 type ComponentStatus struct {
-	AppLabel  string `yaml:"app_label,omitempty"`
-	IsCore    bool   `yaml:"is_core,omitempty"`
-	IsProxy   bool   `yaml:"is_proxy,omitempty"`
-	Namespace string `yaml:"namespace,omitempty"`
+	AppLabel       string `yaml:"app_label,omitempty"`
+	IsCore         bool   `yaml:"is_core,omitempty"`
+	IsProxy        bool   `yaml:"is_proxy,omitempty"`
+	IsMultiCluster bool   `yaml:"is_multicluster,omitempty"`
+	Namespace      string `yaml:"namespace,omitempty"`
 }
 
-type Iter8Config struct {
-	Enabled bool `yaml:"enabled"`
-	// Define which namespace Iter8 is installed on, default to iter8
-	Namespace string `yaml:"namespace"`
-}
-
-// Extensions struct describes configuration for Kiali add-ons (extensions)
-// New add-on/extension configuration should create a specific config and be located under this
-type Extensions struct {
-	Iter8 Iter8Config `yaml:"iter_8,omitempty"`
+type GatewayAPIClass struct {
+	Name      string `yaml:"name,omitempty" json:"name,omitempty"`
+	ClassName string `yaml:"class_name,omitempty" json:"className,omitempty"`
 }
 
 // ExternalServices holds configurations for other systems that Kiali depends on
@@ -240,10 +363,16 @@ func (lt *LoginToken) Obfuscate() {
 
 // IstioLabels holds configuration about the labels required by Istio
 type IstioLabels struct {
-	AppLabelName       string `yaml:"app_label_name,omitempty" json:"appLabelName"`
-	InjectionLabelName string `yaml:"injection_label,omitempty" json:"injectionLabelName"`
-	InjectionLabelRev  string `yaml:"injection_label_rev,omitempty" json:"injectionLabelRev"`
-	VersionLabelName   string `yaml:"version_label_name,omitempty" json:"versionLabelName"`
+	AmbientNamespaceLabel       string `yaml:"ambient_namespace_label,omitempty" json:"ambientNamespaceLabel"`
+	AmbientNamespaceLabelValue  string `yaml:"ambient_namespace_label_value,omitempty" json:"ambientNamespaceLabelValue"`
+	AmbientWaypointGatewayLabel string `yaml:"ambient_waypoint_gateway_label,omitempty" json:"ambientWaypointGatewayLabel"`
+	AmbientWaypointLabel        string `yaml:"ambient_waypoint_label,omitempty" json:"ambientWaypointLabel"`
+	AmbientWaypointLabelValue   string `yaml:"ambient_waypoint_label_value,omitempty" json:"ambientWaypointLabelValue"`
+	AmbientWaypointUseLabel     string `yaml:"ambient_waypoint_use_label,omitempty" json:"ambientWaypointUseLabel"`
+	AppLabelName                string `yaml:"app_label_name,omitempty" json:"appLabelName"`
+	InjectionLabelName          string `yaml:"injection_label_name,omitempty" json:"injectionLabelName"`
+	InjectionLabelRev           string `yaml:"injection_label_rev,omitempty" json:"injectionLabelRev"`
+	VersionLabelName            string `yaml:"version_label_name,omitempty" json:"versionLabelName"`
 }
 
 // AdditionalDisplayItem holds some display-related configuration, like which annotations are to be displayed
@@ -259,34 +388,19 @@ type KubernetesConfig struct {
 	// Cache duration expressed in seconds
 	// Cache uses watchers to sync with the backend, after a CacheDuration watchers are closed and re-opened
 	CacheDuration int `yaml:"cache_duration,omitempty"`
-	// Enable cache for kubernetes and istio resources
-	CacheEnabled bool `yaml:"cache_enabled,omitempty"`
-	// Kiali can cache VirtualService,DestinationRule,Gateway and ServiceEntry Istio resources if they are present
-	// on this list of Istio types. Other Istio types are not yet supported.
-	CacheIstioTypes []string `yaml:"cache_istio_types,omitempty"`
-	// List of namespaces or regex defining namespaces to include in a cache
-	CacheNamespaces []string `yaml:"cache_namespaces,omitempty"`
 	// Cache duration expressed in seconds
 	// Kiali cache list of namespaces per user, this is typically short lived cache compared with the duration of the
 	// namespace cache defined by previous CacheDuration parameter
 	CacheTokenNamespaceDuration int `yaml:"cache_token_namespace_duration,omitempty"`
+	// ClusterName is the name of the kubernetes cluster that Kiali is running in.
+	// If empty, then it will default to 'Kubernetes'.
+	ClusterName string `yaml:"cluster_name,omitempty"`
 	// List of controllers that won't be used for Workload calculation
 	// Kiali queries Deployment,ReplicaSet,ReplicationController,DeploymentConfig,StatefulSet,Job and CronJob controllers
 	// Deployment and ReplicaSet will be always queried, but ReplicationController,DeploymentConfig,StatefulSet,Job and CronJobs
 	// can be skipped from Kiali workloads query if they are present in this list
 	ExcludeWorkloads []string `yaml:"excluded_workloads,omitempty"`
 	QPS              float32  `yaml:"qps,omitempty"`
-}
-
-// ApiConfig contains API specific configuration.
-type ApiConfig struct {
-	Namespaces ApiNamespacesConfig
-}
-
-// ApiNamespacesConfig provides a list of regex strings defining namespaces to blacklist.
-type ApiNamespacesConfig struct {
-	Exclude       []string
-	LabelSelector string `yaml:"label_selector,omitempty" json:"labelSelector"`
 }
 
 // AuthConfig provides details on how users are to authenticate
@@ -298,7 +412,8 @@ type AuthConfig struct {
 
 // OpenShiftConfig contains specific configuration for authentication when on OpenShift
 type OpenShiftConfig struct {
-	ClientIdPrefix string `yaml:"client_id_prefix,omitempty"`
+	CAFile                string `yaml:"ca_file,omitempty"`
+	InsecureSkipVerifyTLS bool   `yaml:"insecure_skip_verify_tls,omitempty"`
 }
 
 // OpenIdConfig contains specific configuration for authentication using an OpenID provider
@@ -323,32 +438,124 @@ type OpenIdConfig struct {
 
 // DeploymentConfig provides details on how Kiali was deployed.
 type DeploymentConfig struct {
-	AccessibleNamespaces []string `yaml:"accessible_namespaces"`
-	Namespace            string   `yaml:"namespace,omitempty"` // Kiali deployment namespace
-	ViewOnlyMode         bool     `yaml:"view_only_mode,omitempty"`
+	AccessibleNamespaces []string                 // this is no longer part of the actual config - we will generate this in Unmarshal()
+	ClusterWideAccess    bool                     `yaml:"cluster_wide_access,omitempty"`
+	DiscoverySelectors   DiscoverySelectorsConfig `yaml:"discovery_selectors,omitempty"`
+	InstanceName         string                   `yaml:"instance_name"`
+	Namespace            string                   `yaml:"namespace,omitempty"` // Kiali deployment namespace
+	ViewOnlyMode         bool                     `yaml:"view_only_mode,omitempty"`
+	// RemoteSecretPath is used to identify the remote cluster Kiali will connect to as its "local cluster".
+	// This is to support installing Kiali in the control plane, but observing only the data plane in the remote cluster.
+	// Experimental feature. See: https://github.com/kiali/kiali/issues/3002
+	RemoteSecretPath string `yaml:"remote_secret_path,omitempty"`
+}
+
+// we need to play games with a custom unmarshaller/marshaller for metav1.LabelSelector because it has no yaml struct tags so
+// it is not processing it the way we want by default (it isn't using camelCase; the fields are lowercase - e.g. matchlabels/matchexpressions)
+type (
+	DiscoverySelectorType  metav1.LabelSelector
+	DiscoverySelectorsType []*DiscoverySelectorType
+)
+
+func (dst *DiscoverySelectorType) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	// Define a temporary struct to map YAML fields to Go struct fields
+	type Alias metav1.LabelSelector
+	aux := &struct {
+		MatchLabels      map[string]string                 `yaml:"matchLabels"`
+		MatchExpressions []metav1.LabelSelectorRequirement `yaml:"matchExpressions"`
+		*Alias
+	}{
+		Alias: (*Alias)(dst),
+	}
+
+	// Unmarshal into the temporary struct
+	if err := unmarshal(&aux); err != nil {
+		return err
+	}
+
+	// Map the fields from the temporary struct to the actual fields
+	dst.MatchLabels = aux.MatchLabels
+	dst.MatchExpressions = aux.MatchExpressions
+
+	return nil
+}
+
+func (dst DiscoverySelectorType) MarshalYAML() (interface{}, error) {
+	return map[string]interface{}{
+		"matchLabels":      dst.MatchLabels,
+		"matchExpressions": dst.MatchExpressions,
+	}, nil
+}
+
+type DiscoverySelectorsConfig struct {
+	Default   DiscoverySelectorsType            `yaml:"default,omitempty"`
+	Overrides map[string]DiscoverySelectorsType `yaml:"overrides,omitempty"`
+}
+
+// ExtensionConfig provides details on a registered Extension
+type ExtensionConfig struct {
+	Enabled bool   `yaml:"enabled,omitempty"`
+	Name    string `yaml:"name"` // same name used in metrics "extension" attribute
 }
 
 // GraphFindOption defines a single Graph Find/Hide Option
 type GraphFindOption struct {
+	AutoSelect  bool   `yaml:"auto_select,omitempty" json:"autoSelect,omitempty"`
 	Description string `yaml:"description,omitempty" json:"description,omitempty"`
 	Expression  string `yaml:"expression,omitempty" json:"expression,omitempty"`
 }
 
+// GraphSettings affect the graph visualization.
+// Animation: animation type point (default) | dash
+// FontLabel: font used for node text (edge label font is determined from this value) TODO: Cytoscape only - remove when cytoscape is removed
+// MinFontBadge: smallest effective font (zoomed font) before removing node badges TODO: Cytoscape only - remove when cytoscape is removed
+// MinFontLabel: smallest effective node text font (zoomed font) before removing labels TODO: Cytoscape only - remove when cytoscape is removed
+type GraphSettings struct {
+	Animation    string  `yaml:"animation,omitempty" json:"animation,omitempty"`
+	FontLabel    float32 `yaml:"font_label,omitempty" json:"fontLabel,omitempty"`
+	MinFontBadge float32 `yaml:"min_font_badge,omitempty" json:"minFontBadge,omitempty"`
+	MinFontLabel float32 `yaml:"min_font_label,omitempty" json:"minFontLabel,omitempty"`
+}
+
 // GraphTraffic defines the protocol-specific rates used to determine traffic for graph generation.
+// ambient options : none | total (traffic) | waypoint (only) | ztunnel (only)
 // grpc options : none | sent (messages) | received (messages) | requests (default) | total (messages)
 // http options : none | requests (default)
 // tcp options  : none | sent (bytes, default) | received (bytes) | total (bytes)
 type GraphTraffic struct {
-	Grpc string `yaml:"grpc,omitempty" json:"grpc,omitempty"`
-	Http string `yaml:"http,omitempty" json:"http,omitempty"`
-	Tcp  string `yaml:"tcp,omitempty" json:"tcp,omitempty"`
+	Ambient string `yaml:"ambient,omitempty" json:"ambient,omitempty"`
+	Grpc    string `yaml:"grpc,omitempty" json:"grpc,omitempty"`
+	Http    string `yaml:"http,omitempty" json:"http,omitempty"`
+	Tcp     string `yaml:"tcp,omitempty" json:"tcp,omitempty"`
 }
 
 // GraphUIDefaults defines UI Defaults specific to the UI Graph
 type GraphUIDefaults struct {
 	FindOptions []GraphFindOption `yaml:"find_options,omitempty" json:"findOptions,omitempty"`
 	HideOptions []GraphFindOption `yaml:"hide_options,omitempty" json:"hideOptions,omitempty"`
+	Impl        string            `yaml:"impl,omitempty" json:"impl,omitempty"` // TODO: remove when cytoscape is removed
+	Settings    GraphSettings     `yaml:"settings,omitempty" json:"settings,omitempty"`
 	Traffic     GraphTraffic      `yaml:"traffic,omitempty" json:"traffic,omitempty"`
+}
+
+// I18nUIDefaults defines UI Defaults specific to the I18n settings
+type I18nUIDefaults struct {
+	Language     string `yaml:"language,omitempty" json:"language,omitempty"`
+	ShowSelector bool   `yaml:"show_selector,omitempty" json:"showSelector"`
+}
+
+// ListUIDefaults defines UI Defaults specific to the UI List pages
+type ListUIDefaults struct {
+	IncludeHealth         bool `yaml:"include_health,omitempty" json:"includeHealth"`
+	IncludeIstioResources bool `yaml:"include_istio_resources,omitempty" json:"includeIstioResources"`
+	IncludeValidations    bool `yaml:"include_validations,omitempty" json:"includeValidations"`
+	ShowIncludeToggles    bool `yaml:"show_include_toggles,omitempty" json:"showIncludeToggles"`
+}
+
+// MeshUIDefaults defines UI Defaults specific to the UI Mesh page
+type MeshUIDefaults struct {
+	FindOptions []GraphFindOption `yaml:"find_options,omitempty" json:"findOptions,omitempty"`
+	HideOptions []GraphFindOption `yaml:"hide_options,omitempty" json:"hideOptions,omitempty"`
 }
 
 // Aggregation represents label's allowed aggregations, transformed from aggregation in MonitoringDashboard config resource
@@ -365,6 +572,9 @@ type MetricsDefaults struct {
 // UIDefaults defines default settings configured for the UI
 type UIDefaults struct {
 	Graph             GraphUIDefaults `yaml:"graph,omitempty" json:"graph,omitempty"`
+	I18n              I18nUIDefaults  `yaml:"i18n,omitempty" json:"i18n,omitempty"`
+	List              ListUIDefaults  `yaml:"list,omitempty" json:"list,omitempty"`
+	Mesh              MeshUIDefaults  `yaml:"mesh,omitempty" json:"mesh,omitempty"`
 	MetricsPerRefresh string          `yaml:"metrics_per_refresh,omitempty" json:"metricsPerRefresh,omitempty"`
 	MetricsInbound    MetricsDefaults `yaml:"metrics_inbound,omitempty" json:"metricsInbound,omitempty"`
 	MetricsOutbound   MetricsDefaults `yaml:"metrics_outbound,omitempty" json:"metricsOutbound,omitempty"`
@@ -374,22 +584,47 @@ type UIDefaults struct {
 
 // Validations defines default settings configured for the Validations subsystem
 type Validations struct {
-	Ignore []string `yaml:"ignore,omitempty" json:"ignore,omitempty"`
+	Ignore                   []string `yaml:"ignore,omitempty" json:"ignore,omitempty"`
+	SkipWildcardGatewayHosts bool     `yaml:"skip_wildcard_gateway_hosts,omitempty"`
 }
 
-// CertificatesInformationIndicators defines configuration to enable the feature and to grant read permissions to a list of secrets
-type CertificatesInformationIndicators struct {
-	Enabled bool     `yaml:"enabled,omitempty" json:"enabled"`
-	Secrets []string `yaml:"secrets,omitempty" json:"secrets,omitempty"`
+// Clustering defines configuration around multi-cluster functionality.
+type Clustering struct {
+	// Clusters is a list of clusters that cannot be autodetected by the Kiali Server.
+	// Remote clusters are specified here if ‘autodetect_secrets.enabled’ is false or
+	// if the Kiali Server does not have access to the remote cluster’s secret.
+	Clusters  []Cluster  `yaml:"clusters" json:"clusters"`
+	KialiURLs []KialiURL `yaml:"kiali_urls" json:"kiali_urls"`
+}
+
+// IsZero implements: https://pkg.go.dev/gopkg.in/yaml.v2#IsZeroer so that
+// tests can patch the Clustering struct and have it be recognized as non-zero
+// while keeping the omitempty yaml tag.
+func (c Clustering) IsZero() bool {
+	return c.Clusters == nil && c.KialiURLs == nil
+}
+
+type FeatureFlagClustering struct {
+	EnableExecProvider bool `yaml:"enable_exec_provider,omitempty" json:"enable_exec_provider"`
+}
+
+// KialiURL defines a cluster name, namespace and instance name properties to URL.
+type KialiURL struct {
+	ClusterName  string `yaml:"cluster_name,omitempty"`
+	InstanceName string `yaml:"instance_name,omitempty"`
+	Namespace    string `yaml:"namespace,omitempty"`
+	URL          string `yaml:"url,omitempty"`
 }
 
 // KialiFeatureFlags available from the CR
 type KialiFeatureFlags struct {
-	CertificatesInformationIndicators CertificatesInformationIndicators `yaml:"certificates_information_indicators,omitempty" json:"certificatesInformationIndicators"`
-	IstioInjectionAction              bool                              `yaml:"istio_injection_action,omitempty" json:"istioInjectionAction"`
-	IstioUpgradeAction                bool                              `yaml:"istio_upgrade_action,omitempty" json:"istioUpgradeAction"`
-	UIDefaults                        UIDefaults                        `yaml:"ui_defaults,omitempty" json:"uiDefaults,omitempty"`
-	Validations                       Validations                       `yaml:"validations,omitempty" json:"validations,omitempty"`
+	Clustering            FeatureFlagClustering `yaml:"clustering,omitempty" json:"clustering,omitempty"`
+	DisabledFeatures      []string              `yaml:"disabled_features,omitempty" json:"disabledFeatures,omitempty"`
+	IstioAnnotationAction bool                  `yaml:"istio_annotation_action,omitempty" json:"istioAnnotationAction"`
+	IstioInjectionAction  bool                  `yaml:"istio_injection_action,omitempty" json:"istioInjectionAction"`
+	IstioUpgradeAction    bool                  `yaml:"istio_upgrade_action,omitempty" json:"istioUpgradeAction"`
+	UIDefaults            UIDefaults            `yaml:"ui_defaults,omitempty" json:"uiDefaults,omitempty"`
+	Validations           Validations           `yaml:"validations,omitempty" json:"validations,omitempty"`
 }
 
 // Tolerance config
@@ -414,14 +649,19 @@ type HealthConfig struct {
 	Rate []Rate `yaml:"rate,omitempty" json:"rate,omitempty"`
 }
 
+// Profiler provides settings about the profiler that can be used to debug the Kiali server internals.
+type Profiler struct {
+	Enabled bool `yaml:"enabled,omitempty"`
+}
+
 // Config defines full YAML configuration.
 type Config struct {
 	AdditionalDisplayDetails []AdditionalDisplayItem             `yaml:"additional_display_details,omitempty"`
-	API                      ApiConfig                           `yaml:"api,omitempty"`
 	Auth                     AuthConfig                          `yaml:"auth,omitempty"`
+	Clustering               Clustering                          `yaml:"clustering,omitempty"`
 	CustomDashboards         dashboards.MonitoringDashboardsList `yaml:"custom_dashboards,omitempty"`
 	Deployment               DeploymentConfig                    `yaml:"deployment,omitempty"`
-	Extensions               Extensions                          `yaml:"extensions,omitempty"`
+	Extensions               []ExtensionConfig                   `yaml:"extensions,omitempty"`
 	ExternalServices         ExternalServices                    `yaml:"external_services,omitempty"`
 	HealthConfig             HealthConfig                        `yaml:"health_config,omitempty" json:"healthConfig,omitempty"`
 	Identity                 security.Identity                   `yaml:",omitempty"`
@@ -440,17 +680,6 @@ func NewConfig() (c *Config) {
 	c = &Config{
 		InCluster:      true,
 		IstioNamespace: "istio-system",
-		API: ApiConfig{
-			Namespaces: ApiNamespacesConfig{
-				Exclude: []string{
-					"istio-operator",
-					"kube.*",
-					"openshift.*",
-					"ibm.*",
-					"kial-operator",
-				},
-			},
-		},
 		Auth: AuthConfig{
 			Strategy: "token",
 			OpenId: OpenIdConfig{
@@ -470,20 +699,17 @@ func NewConfig() (c *Config) {
 				UsernameClaim:           "sub",
 			},
 			OpenShift: OpenShiftConfig{
-				ClientIdPrefix: "kiali",
+				InsecureSkipVerifyTLS: false,
 			},
 		},
 		CustomDashboards: dashboards.GetBuiltInMonitoringDashboards(),
 		Deployment: DeploymentConfig{
-			AccessibleNamespaces: []string{"**"},
-			Namespace:            "istio-system",
-			ViewOnlyMode:         false,
-		},
-		Extensions: Extensions{
-			Iter8: Iter8Config{
-				Enabled:   false,
-				Namespace: "iter8",
-			},
+			ClusterWideAccess:  true,
+			DiscoverySelectors: DiscoverySelectorsConfig{Default: nil, Overrides: nil},
+			InstanceName:       "kiali",
+			Namespace:          "istio-system",
+			RemoteSecretPath:   "/kiali-remote-secret/kiali",
+			ViewOnlyMode:       false,
 		},
 		ExternalServices: ExternalServices{
 			CustomDashboards: CustomDashboardsConfig{
@@ -491,7 +717,7 @@ func NewConfig() (c *Config) {
 				DiscoveryAutoThreshold: 10,
 				Enabled:                true,
 				IsCore:                 false,
-				NamespaceLabel:         "kubernetes_namespace",
+				NamespaceLabel:         "namespace",
 				Prometheus: PrometheusConfig{
 					ThanosProxy: ThanosProxy{
 						Enabled: false,
@@ -502,80 +728,93 @@ func NewConfig() (c *Config) {
 				Auth: Auth{
 					Type: AuthTypeNone,
 				},
-				Enabled:      true,
-				InClusterURL: "http://grafana.istio-system:3000",
-				IsCore:       false,
+				Enabled:     true,
+				InternalURL: "http://grafana.istio-system:3000",
+				IsCore:      false,
 			},
 			Istio: IstioConfig{
 				ComponentStatuses: ComponentStatuses{
 					Enabled: true,
-					Components: []ComponentStatus{
-						{
-							AppLabel: "istio-egressgateway",
-							IsCore:   false,
-							IsProxy:  true,
-						},
-						{
-							AppLabel: "istio-ingressgateway",
-							IsCore:   true,
-							IsProxy:  true,
-						},
-						{
-							AppLabel: "istiod",
-							IsCore:   true,
-							IsProxy:  false,
-						},
-					},
+					// Leaving default Components values empty
+					// Istio components are auto discovered and status is checked
+					// Components config is left for custom components status check
+					Components: []ComponentStatus{},
 				},
-				ConfigMapName:                     "istio",
+				ConfigMapName:                     "",
 				EnvoyAdminLocalPort:               15000,
+				IstioAPIEnabled:                   true,
 				IstioIdentityDomain:               "svc.cluster.local",
 				IstioInjectionAnnotation:          "sidecar.istio.io/inject",
-				IstioSidecarInjectorConfigMapName: "istio-sidecar-injector",
+				IstioSidecarInjectorConfigMapName: "",
 				IstioSidecarAnnotation:            "sidecar.istio.io/status",
-				IstiodDeploymentName:              "istiod",
+				IstiodDeploymentName:              "",
+				IstiodPodMonitoringPort:           15014,
+				IstiodPollingIntervalSeconds:      20,
 				RootNamespace:                     "istio-system",
-				UrlServiceVersion:                 "http://istiod:15014/version",
+				UrlServiceVersion:                 "",
+				ValidationReconcileInterval:       util.AsPtr(time.Minute),
+				GatewayAPIClasses:                 []GatewayAPIClass{},
 			},
 			Prometheus: PrometheusConfig{
 				Auth: Auth{
 					Type: AuthTypeNone,
 				},
+				// 1/2 Prom Scrape Interval
+				CacheDuration: 7,
+				CacheEnabled:  true,
+				// Prom Cache expires and it forces to repopulate cache
+				CacheExpiration: 300,
+				CustomHeaders:   map[string]string{},
+				QueryScope:      map[string]string{},
 				ThanosProxy: ThanosProxy{
 					Enabled:         false,
 					RetentionPeriod: "7d",
 					ScrapeInterval:  "30s",
 				},
-				CacheEnabled: true,
-				// 1/2 Prom Scrape Interval
-				CacheDuration: 7,
-				// Prom Cache expires and it forces to repopulate cache
-				CacheExpiration: 300,
-				CustomHeaders:   map[string]string{},
-				URL:             "http://prometheus.istio-system:9090",
+				URL: "http://prometheus.istio-system:9090",
 			},
 			Tracing: TracingConfig{
 				Auth: Auth{
 					Type: AuthTypeNone,
 				},
-				Enabled:              true,
-				InClusterURL:         "http://tracing.istio-system:16685/jaeger",
-				IsCore:               false,
-				NamespaceSelector:    true,
-				URL:                  "",
+				CustomHeaders:     map[string]string{},
+				Enabled:           false,
+				ExternalURL:       "",
+				GrpcPort:          9095,
+				InternalURL:       "http://tracing.istio-system:16685/jaeger",
+				IsCore:            false,
+				Provider:          JaegerProvider,
+				NamespaceSelector: true,
+				QueryScope:        map[string]string{},
+				QueryTimeout:      5,
+				TempoConfig: TempoConfig{
+					CacheCapacity: 200,
+					CacheEnabled:  true,
+				},
 				UseGRPC:              true,
 				WhiteListIstioSystem: []string{"jaeger-query", "istio-ingressgateway"},
 			},
 		},
 		IstioLabels: IstioLabels{
-			AppLabelName:       "app",
-			InjectionLabelName: "istio-injection",
-			InjectionLabelRev:  "istio.io/rev",
-			VersionLabelName:   "version",
+			AmbientNamespaceLabel:       "istio.io/dataplane-mode",
+			AmbientNamespaceLabelValue:  "ambient",
+			AmbientWaypointGatewayLabel: WaypointGatewayLabel,
+			AmbientWaypointLabel:        WaypointLabel,
+			AmbientWaypointLabelValue:   WaypointLabelValue,
+			AmbientWaypointUseLabel:     WaypointUseLabel,
+			AppLabelName:                "app",
+			InjectionLabelName:          "istio-injection",
+			InjectionLabelRev:           "istio.io/rev",
+			VersionLabelName:            "version",
 		},
 		KialiFeatureFlags: KialiFeatureFlags{
-			IstioInjectionAction: true,
-			IstioUpgradeAction:   false,
+			Clustering: FeatureFlagClustering{
+				EnableExecProvider: false,
+			},
+			DisabledFeatures:      []string{},
+			IstioAnnotationAction: true,
+			IstioInjectionAction:  true,
+			IstioUpgradeAction:    false,
 			UIDefaults: UIDefaults{
 				Graph: GraphUIDefaults{
 					FindOptions: []GraphFindOption{
@@ -591,6 +830,10 @@ func NewConfig() (c *Config) {
 							Description: "Find: unknown nodes",
 							Expression:  "name = unknown",
 						},
+						{
+							Description: "Find: nodes with the 2 top rankings",
+							Expression:  "rank <= 2",
+						},
 					},
 					HideOptions: []GraphFindOption{
 						{
@@ -601,34 +844,64 @@ func NewConfig() (c *Config) {
 							Description: "Hide: unknown nodes",
 							Expression:  "name = unknown",
 						},
+						{
+							Description: "Hide: nodes ranked lower than the 2 top rankings",
+							Expression:  "rank > 2",
+						},
+					},
+					Impl: "pf",
+					Settings: GraphSettings{
+						Animation:    "point",
+						FontLabel:    13,
+						MinFontBadge: 7,
+						MinFontLabel: 10,
 					},
 					Traffic: GraphTraffic{
-						Grpc: "requests",
-						Http: "requests",
-						Tcp:  "sent",
+						Ambient: "total",
+						Grpc:    "requests",
+						Http:    "requests",
+						Tcp:     "sent",
+					},
+				},
+				I18n: I18nUIDefaults{
+					Language:     "en",
+					ShowSelector: false,
+				},
+				List: ListUIDefaults{
+					IncludeHealth:         true,
+					IncludeIstioResources: true,
+					IncludeValidations:    true,
+					ShowIncludeToggles:    false,
+				},
+				Mesh: MeshUIDefaults{
+					FindOptions: []GraphFindOption{
+						{
+							Description: "Find: unhealthy nodes",
+							Expression:  "! healthy",
+						},
+					},
+					HideOptions: []GraphFindOption{
+						{
+							Description: "Hide: healthy nodes",
+							Expression:  "healthy",
+						},
 					},
 				},
 				MetricsInbound:    MetricsDefaults{},
 				MetricsOutbound:   MetricsDefaults{},
 				MetricsPerRefresh: "1m",
 				Namespaces:        make([]string, 0),
-				RefreshInterval:   "15s",
+				RefreshInterval:   "60s",
 			},
 			Validations: Validations{
 				Ignore: make([]string, 0),
-			},
-			CertificatesInformationIndicators: CertificatesInformationIndicators{
-				Enabled: true,
-				Secrets: []string{"cacerts", "istio-ca-secret"},
 			},
 		},
 		KubernetesConfig: KubernetesConfig{
 			Burst:                       200,
 			CacheDuration:               5 * 60,
-			CacheEnabled:                true,
-			CacheIstioTypes:             []string{"AuthorizationPolicy", "DestinationRule", "EnvoyFilter", "Gateway", "PeerAuthentication", "RequestAuthentication", "ServiceEntry", "Sidecar", "VirtualService", "WorkloadEntry", "WorkloadGroup"},
-			CacheNamespaces:             []string{".*"},
 			CacheTokenNamespaceDuration: 10,
+			ClusterName:                 "", // leave this unset as a flag that we need to fetch the information
 			ExcludeWorkloads:            []string{"CronJob", "DeploymentConfig", "Job", "ReplicationController"},
 			QPS:                         175,
 		},
@@ -637,16 +910,35 @@ func NewConfig() (c *Config) {
 			SigningKey:        "kiali",
 		},
 		Server: Server{
-			AuditLog:                   true,
-			GzipEnabled:                true,
-			MetricsEnabled:             true,
-			MetricsPort:                9090,
+			AuditLog:    true,
+			GzipEnabled: true,
+			Observability: Observability{
+				Metrics: Metrics{
+					Enabled: true,
+					Port:    9090,
+				},
+				Tracing: Tracing{
+					CollectorType: OTELCollectorType,
+					CollectorURL:  "jaeger-collector.istio-system:4318",
+					Enabled:       false,
+					Otel: OtelCollector{
+						CAName:     "",
+						Protocol:   "http",
+						SkipVerify: true,
+						TLSEnabled: false,
+					},
+					// Sample half of traces.
+					SamplingRate: 0.5,
+				},
+			},
 			Port:                       20001,
+			RequireAuth:                false,
 			StaticContentRootDirectory: "/opt/kiali/console",
 			WebFQDN:                    "",
 			WebRoot:                    "/",
 			WebHistoryMode:             "browser",
 			WebSchema:                  "",
+			WriteTimeout:               30,
 		},
 	}
 
@@ -692,6 +984,21 @@ func (conf *Config) AddHealthDefault() {
 	conf.HealthConfig.Rate = append(conf.HealthConfig.Rate, healthConfig.Rate...)
 }
 
+// AllNamespacesAccessible determines if kiali has access to all namespaces.
+func (conf *Config) AllNamespacesAccessible() bool {
+	return conf.Deployment.ClusterWideAccess
+}
+
+// IsServerHTTPS returns true if the server endpoint should use HTTPS. If false, only plaintext HTTP is supported.
+func (conf *Config) IsServerHTTPS() bool {
+	return conf.Identity.CertFile != "" && conf.Identity.PrivateKeyFile != ""
+}
+
+func (conf *Config) IsRBACDisabled() bool {
+	return conf.Auth.Strategy == AuthStrategyAnonymous ||
+		(conf.Auth.Strategy == AuthStrategyOpenId && conf.Auth.OpenId.DisableRBAC)
+}
+
 // Get the global Config
 func Get() (conf *Config) {
 	rwMutex.RLock()
@@ -710,20 +1017,26 @@ func Set(conf *Config) {
 	configuration = *conf
 }
 
-// String marshals the given Config into a YAML string
-// WARNING: do NOT use the result of this function to retrieve any configuration: some fields are obfuscated for security reasons.
-func (conf Config) String() (str string) {
-	obf := conf
+func (conf Config) Obfuscate() (obf Config) {
+	obf = conf
 	obf.ExternalServices.Grafana.Auth.Obfuscate()
 	obf.ExternalServices.Prometheus.Auth.Obfuscate()
 	obf.ExternalServices.Tracing.Auth.Obfuscate()
+	obf.ExternalServices.CustomDashboards.Prometheus.Auth.Obfuscate()
 	obf.Identity.Obfuscate()
 	obf.LoginToken.Obfuscate()
 	obf.Auth.OpenId.ClientSecret = "xxx"
+	return
+}
+
+// String marshals the given Config into a YAML string
+// WARNING: do NOT use the result of this function to retrieve any configuration: some fields are obfuscated for security reasons.
+func (conf Config) String() (str string) {
+	obf := conf.Obfuscate()
 	str, err := Marshal(&obf)
 	if err != nil {
 		str = fmt.Sprintf("Failed to marshal config to string. err=%v", err)
-		log.Debugf(str)
+		log.Debugf("%s", str)
 	}
 
 	return
@@ -760,52 +1073,115 @@ func Unmarshal(yamlString string) (conf *Config, err error) {
 		return nil, fmt.Errorf("failed to parse yaml data. error=%v", err)
 	}
 
+	// Determine what the accessible namespaces are. These are namespaces we must have permission to see
+	// when not in cluster-wide access mode. These are only necessary when we are not in cluster-wide access mode.
+	// We do not set this when in cluster-wide mode because in that case we have access to see everything.
+	// Note that in past versions "accessible_namespaces" came over in the yaml itself, but that is no longer the case.
+	// Accessible namespaces can now be derived from discovery selectors so long as they are specified in a specific way.
+	// See the comments found in extractAccessibleNamespaceList for more details.
+	if !conf.Deployment.ClusterWideAccess {
+		conf.Deployment.AccessibleNamespaces, err = conf.extractAccessibleNamespaceList()
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	conf.prepareDashboards()
 
+	// TODO: Still support deprecated settings, but remove this support in future versions
+	if conf.ExternalServices.Grafana.XInClusterURL != "" {
+		conf.ExternalServices.Grafana.InternalURL = conf.ExternalServices.Grafana.XInClusterURL
+		log.Info("DEPRECATION NOTICE: 'external_services.grafana.in_cluster_url' has been deprecated - switch to 'external_services.grafana.internal_url'")
+	}
+	if conf.ExternalServices.Grafana.XURL != "" {
+		conf.ExternalServices.Grafana.ExternalURL = conf.ExternalServices.Grafana.XURL
+		log.Info("DEPRECATION NOTICE: 'external_services.grafana.url' has been deprecated - switch to 'external_services.grafana.external_url'")
+	}
+	if conf.ExternalServices.Tracing.XInClusterURL != "" {
+		conf.ExternalServices.Tracing.InternalURL = conf.ExternalServices.Tracing.XInClusterURL
+		log.Info("DEPRECATION NOTICE: 'external_services.tracing.in_cluster_url' has been deprecated - switch to 'external_services.tracing.internal_url'")
+	}
+	if conf.ExternalServices.Tracing.XURL != "" {
+		conf.ExternalServices.Tracing.ExternalURL = conf.ExternalServices.Tracing.XURL
+		log.Info("DEPRECATION NOTICE: 'external_services.tracing.url' has been deprecated - switch to 'external_services.tracing.external_url'")
+	}
+
 	// Some config settings (such as sensitive settings like passwords) are overrideable
-	// via environment variables. This allows a user to store sensitive values in secrets
-	// and mount those secrets to environment variables rather than storing them directly
-	// in the config map itself.
+	// via secrets mounted on the file system rather than storing them directly in the config map itself.
+	// The names of the files in /kiali-override-secrets denote which credentials they are.
 	type overridesType struct {
 		configValue *string
-		envVarName  string
+		fileName    string
 	}
 
 	overrides := []overridesType{
 		{
+			configValue: &conf.ExternalServices.Grafana.Auth.Username,
+			fileName:    SecretFileGrafanaUsername,
+		},
+		{
 			configValue: &conf.ExternalServices.Grafana.Auth.Password,
-			envVarName:  EnvGrafanaPassword,
+			fileName:    SecretFileGrafanaPassword,
 		},
 		{
 			configValue: &conf.ExternalServices.Grafana.Auth.Token,
-			envVarName:  EnvGrafanaToken,
+			fileName:    SecretFileGrafanaToken,
+		},
+		{
+			configValue: &conf.ExternalServices.Prometheus.Auth.Username,
+			fileName:    SecretFilePrometheusUsername,
 		},
 		{
 			configValue: &conf.ExternalServices.Prometheus.Auth.Password,
-			envVarName:  EnvPrometheusPassword,
+			fileName:    SecretFilePrometheusPassword,
 		},
 		{
 			configValue: &conf.ExternalServices.Prometheus.Auth.Token,
-			envVarName:  EnvPrometheusToken,
+			fileName:    SecretFilePrometheusToken,
+		},
+		{
+			configValue: &conf.ExternalServices.Tracing.Auth.Username,
+			fileName:    SecretFileTracingUsername,
 		},
 		{
 			configValue: &conf.ExternalServices.Tracing.Auth.Password,
-			envVarName:  EnvTracingPassword,
+			fileName:    SecretFileTracingPassword,
 		},
 		{
 			configValue: &conf.ExternalServices.Tracing.Auth.Token,
-			envVarName:  EnvTracingToken,
+			fileName:    SecretFileTracingToken,
 		},
 		{
 			configValue: &conf.LoginToken.SigningKey,
-			envVarName:  EnvLoginTokenSigningKey,
+			fileName:    SecretFileLoginTokenSigningKey,
+		},
+		{
+			configValue: &conf.ExternalServices.CustomDashboards.Prometheus.Auth.Username,
+			fileName:    SecretFileCustomDashboardsPrometheusUsername,
+		},
+		{
+			configValue: &conf.ExternalServices.CustomDashboards.Prometheus.Auth.Password,
+			fileName:    SecretFileCustomDashboardsPrometheusPassword,
+		},
+		{
+			configValue: &conf.ExternalServices.CustomDashboards.Prometheus.Auth.Token,
+			fileName:    SecretFileCustomDashboardsPrometheusToken,
 		},
 	}
 
 	for _, override := range overrides {
-		envVarValue := os.Getenv(override.envVarName)
-		if envVarValue != "" {
-			*override.configValue = envVarValue
+		fullFileName := overrideSecretsDir + "/" + override.fileName + "/value.txt"
+		b, err := os.ReadFile(fullFileName)
+		if err == nil {
+			fileContents := string(b)
+			if fileContents != "" {
+				*override.configValue = fileContents
+				log.Debugf("Credentials loaded from secret file [%s]", fullFileName)
+			} else {
+				log.Errorf("The credentials were empty in secret file [%s]", fullFileName)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			log.Errorf("Failed reading secret file [%s]: %v", fullFileName, err)
 		}
 	}
 
@@ -826,7 +1202,7 @@ func Marshal(conf *Config) (yamlString string, err error) {
 // LoadFromFile reads the YAML from the given file, parses the content, and returns its Config object representation.
 func LoadFromFile(filename string) (conf *Config, err error) {
 	log.Debugf("Reading YAML config from [%s]", filename)
-	fileContent, err := ioutil.ReadFile(filename)
+	fileContent, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load config file [%v]. error=%v", filename, err)
 	}
@@ -837,7 +1213,7 @@ func LoadFromFile(filename string) (conf *Config, err error) {
 	}
 
 	// Read OIDC secret, if present
-	if oidcSecret, oidcErr := ioutil.ReadFile(OidcClientSecretFile); oidcErr == nil {
+	if oidcSecret, oidcErr := os.ReadFile(OidcClientSecretFile); oidcErr == nil {
 		conf.Auth.OpenId.ClientSecret = string(oidcSecret)
 	} else {
 		if !os.IsNotExist(oidcErr) {
@@ -858,7 +1234,7 @@ func SaveToFile(filename string, conf *Config) (err error) {
 	}
 
 	log.Debugf("Writing YAML config to [%s]", filename)
-	err = ioutil.WriteFile(filename, []byte(fileContent), 0640)
+	err = os.WriteFile(filename, []byte(fileContent), 0o640)
 	return
 }
 
@@ -870,4 +1246,172 @@ func IsIstioNamespace(namespace string) bool {
 // IsRootNamespace returns true if the namespace is the root namespace
 func IsRootNamespace(namespace string) bool {
 	return namespace == configuration.ExternalServices.Istio.RootNamespace
+}
+
+// IsFeatureDisabled will return true if the named feature is to be disabled.
+func IsFeatureDisabled(featureName FeatureName) bool {
+	cfg := Get()
+	for _, f := range cfg.KialiFeatureFlags.DisabledFeatures {
+		if f == string(featureName) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsWaypoint returns true if the labels contain a waypoint proxy
+func IsWaypoint(labels map[string]string) bool {
+	return labels[WaypointLabel] == WaypointLabelValue
+}
+
+// GetSafeClusterName checks the input value provides a default cluster name if it's empty
+func GetSafeClusterName(cluster string) string {
+	if cluster == "" {
+		return Get().KubernetesConfig.ClusterName
+	}
+	return cluster
+}
+
+// Validate will ensure the config is valid. This should be called after the config
+// is initialized and before the config is used.
+func Validate(cfg Config) error {
+	if cfg.Server.Port < 0 {
+		return fmt.Errorf("server port is negative: %v", cfg.Server.Port)
+	}
+
+	if strings.Contains(cfg.Server.StaticContentRootDirectory, "..") {
+		return fmt.Errorf("server static content root directory must not contain '..': %v", cfg.Server.StaticContentRootDirectory)
+	}
+	if _, err := os.Stat(cfg.Server.StaticContentRootDirectory); os.IsNotExist(err) {
+		return fmt.Errorf("server static content root directory does not exist: %v", cfg.Server.StaticContentRootDirectory)
+	}
+
+	webRoot := cfg.Server.WebRoot
+	if !validPathRegEx.MatchString(webRoot) {
+		return fmt.Errorf("web root must begin with a / and contain valid URL path characters: %v", webRoot)
+	}
+	if webRoot != "/" && strings.HasSuffix(webRoot, "/") {
+		return fmt.Errorf("web root must not contain a trailing /: %v", webRoot)
+	}
+	if strings.Contains(webRoot, "/../") {
+		return fmt.Errorf("for security purposes, web root must not contain '/../': %v", webRoot)
+	}
+
+	// log some messages to let the administrator know when credentials are configured certain ways
+	auth := cfg.Auth
+	log.Infof("Using authentication strategy [%v]", auth.Strategy)
+	if auth.Strategy == AuthStrategyAnonymous {
+		log.Warningf("Kiali auth strategy is configured for anonymous access - users will not be authenticated.")
+	} else if auth.Strategy != AuthStrategyOpenId &&
+		auth.Strategy != AuthStrategyOpenshift &&
+		auth.Strategy != AuthStrategyToken &&
+		auth.Strategy != AuthStrategyHeader {
+		return fmt.Errorf("Invalid authentication strategy [%v]", auth.Strategy)
+	}
+
+	// Check the ciphering key for sessions
+	signingKey := cfg.LoginToken.SigningKey
+	if err := validateSigningKey(signingKey, auth.Strategy); err != nil {
+		return err
+	}
+
+	// log a warning if the user is ignoring some validations
+	if len(cfg.KialiFeatureFlags.Validations.Ignore) > 0 {
+		log.Infof("Some validation errors will be ignored %v. If these errors do occur, they will still be logged. If you think the validation errors you see are incorrect, please report them to the Kiali team if you have not done so already and provide the details of your scenario. This will keep Kiali validations strong for the whole community.", cfg.KialiFeatureFlags.Validations.Ignore)
+	}
+
+	// log a info message if the user is disabling some features
+	if len(cfg.KialiFeatureFlags.DisabledFeatures) > 0 {
+		log.Infof("Some features are disabled: [%v]", strings.Join(cfg.KialiFeatureFlags.DisabledFeatures, ","))
+		for _, fn := range cfg.KialiFeatureFlags.DisabledFeatures {
+			if err := FeatureName(fn).IsValid(); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Check the observability section
+	observTracing := cfg.Server.Observability.Tracing
+	// If collector is not defined it would be the default "otel"
+	if observTracing.Enabled && observTracing.CollectorType != OTELCollectorType {
+		return fmt.Errorf("error in configuration options getting the observability exporter. Invalid collector type [%s]", observTracing.CollectorType)
+	}
+
+	// Check the tracing section
+	cfgTracing := cfg.ExternalServices.Tracing
+	if cfgTracing.Enabled && cfgTracing.Provider != JaegerProvider && cfgTracing.Provider != TempoProvider {
+		return fmt.Errorf("error in configuration options for the external services tracing provider. Invalid provider type [%s]", cfgTracing.Provider)
+	}
+
+	return nil
+}
+
+func validateSigningKey(signingKey string, authStrategy string) error {
+	if authStrategy != AuthStrategyAnonymous {
+		if len(signingKey) != 16 && len(signingKey) != 24 && len(signingKey) != 32 {
+			return errors.New("signing key for sessions must be 16, 24 or 32 bytes length")
+		}
+	}
+
+	return nil
+}
+
+// extractAccessibleNamespaceList will take the default set of discovery selectors from the config and build a
+// list of namespace names by using all discovery selectors that look for matches of the label "kubernetes.io/metadata.name".
+// This means if a matchLabels wants to match a value on the label "kubernetes.io/metadata.name" or a single matchExpressions
+// wants to match key="kubernetes.io/metadata.name" with operator="In" with a single value defined, the value is assumed
+// to be an accessible namespace that will be added to the list that is returned. Note you can have multiple values for
+// an "In" expression - each value will be considered an accessible namespace.
+// Examples:
+//
+//	default:
+//	- matchLabels:
+//	    kubernetes.io/metadata.name: an-accessible-namespace
+//	- matchExpressions:
+//	  - key: kubernetes.io/metadata.name
+//	    operator: In
+//	    values: ["another-accessible-namespace"]
+//	- matchExpressions:
+//	  - key: kubernetes.io/metadata.name
+//	    operator: In
+//	    values: ["accessible-1", "accessible-2", "a-third-accessible-namespace"]
+//
+// When the Kiali Server is not in Cluster Wide Access mode, it is assumed (required, in fact) that all the
+// default discovery selectors only use match criteria as explained above.
+// This function therefore is used to obtain a list of accessible namespaces from the discovery selectors when CWA=false.
+func (config *Config) extractAccessibleNamespaceList() ([]string, error) {
+	errs := make([]string, 0)
+	namespaceNames := make([]string, 0)
+	for _, selector := range config.Deployment.DiscoverySelectors.Default {
+		if len(selector.MatchLabels) > 0 && len(selector.MatchExpressions) > 0 {
+			errs = append(errs, fmt.Sprintf("invalid accessible namespace discovery selector: one label selector cannot have both an equality-based and a set-based selector: %v", selector))
+		} else if len(selector.MatchLabels) > 1 {
+			errs = append(errs, fmt.Sprintf("invalid accessible namespace discovery selector: matchLabel selector must match one and only one label named kubernetes.io/metadata.name: %v", selector))
+		} else if len(selector.MatchExpressions) > 1 {
+			errs = append(errs, fmt.Sprintf("invalid accessible namespace discovery selectors: matchExpressions selector must match one and only one label named kubernetes.io/metadata.name using the IN operator: %v", selector))
+		} else if len(selector.MatchLabels) == 1 {
+			if namespaceName, ok := selector.MatchLabels["kubernetes.io/metadata.name"]; ok {
+				namespaceNames = append(namespaceNames, namespaceName)
+			} else {
+				errs = append(errs, fmt.Sprintf("invalid accessible namespace discovery selector: matchLabel selector must match the label named kubernetes.io/metadata.name: %v", selector))
+			}
+		} else if len(selector.MatchExpressions) == 1 {
+			expr := selector.MatchExpressions[0]
+			if len(expr.Values) > 0 {
+				if expr.Key == "kubernetes.io/metadata.name" && expr.Operator == metav1.LabelSelectorOpIn {
+					namespaceNames = append(namespaceNames, expr.Values...)
+				} else {
+					errs = append(errs, fmt.Sprintf("invalid accessible namespace discovery selectors: matchExpressions selector must match the label named kubernetes.io/metadata.name using the IN operator: %v", selector))
+				}
+			} else {
+				errs = append(errs, fmt.Sprintf("invalid accessible namespace discovery selectors: matchExpressions selector must match at least one value for label named kubernetes.io/metadata.name using the IN operator: %v", selector))
+			}
+		}
+	}
+
+	if len(errs) == 0 {
+		return namespaceNames, nil
+	} else {
+		return namespaceNames, errors.New(strings.Join(errs, "\n"))
+	}
 }

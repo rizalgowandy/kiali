@@ -1,7 +1,12 @@
 package business
 
 import (
+	"bufio"
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"regexp"
 	"sort"
 	"strconv"
@@ -11,36 +16,85 @@ import (
 
 	"github.com/nitishm/engarde/pkg/parser"
 	osapps_v1 "github.com/openshift/api/apps/v1"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
+	security_v1 "istio.io/client-go/pkg/apis/security/v1"
 	apps_v1 "k8s.io/api/apps/v1"
 	batch_v1 "k8s.io/api/batch/v1"
-	batch_v1beta1 "k8s.io/api/batch/v1beta1"
 	core_v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
+	"github.com/kiali/kiali/business/checkers"
 	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/grafana"
 	"github.com/kiali/kiali/kubernetes"
+	"github.com/kiali/kiali/kubernetes/cache"
 	"github.com/kiali/kiali/log"
 	"github.com/kiali/kiali/models"
+	"github.com/kiali/kiali/observability"
 	"github.com/kiali/kiali/prometheus"
+	"github.com/kiali/kiali/util/sliceutil"
 )
+
+func NewWorkloadService(
+	userClients map[string]kubernetes.ClientInterface,
+	kialiSAclients map[string]kubernetes.ClientInterface,
+	prom prometheus.ClientInterface,
+	cache cache.KialiCache,
+	layer *Layer,
+	config *config.Config,
+	grafana *grafana.Service,
+) *WorkloadService {
+	excludedWorkloads := make(map[string]bool)
+	for _, w := range config.KubernetesConfig.ExcludeWorkloads {
+		excludedWorkloads[w] = true
+	}
+
+	return &WorkloadService{
+		businessLayer:     layer,
+		cache:             cache,
+		config:            config,
+		excludedWorkloads: excludedWorkloads,
+		prom:              prom,
+		userClients:       userClients,
+		kialiSAClients:    kialiSAclients,
+	}
+}
 
 // WorkloadService deals with fetching istio/kubernetes workloads related content and convert to kiali model
 type WorkloadService struct {
-	prom          prometheus.ClientInterface
-	k8s           kubernetes.ClientInterface
+	// Careful not to call the workload service from here as that would be an infinite loop.
 	businessLayer *Layer
+	// The global kiali cache. This should be passed into the workload service rather than created inside of it.
+	cache cache.KialiCache
+	// The global kiali config.
+	config            *config.Config
+	excludedWorkloads map[string]bool
+	grafana           *grafana.Service
+	prom              prometheus.ClientInterface
+	userClients       map[string]kubernetes.ClientInterface
+	kialiSAClients    map[string]kubernetes.ClientInterface
 }
 
 type WorkloadCriteria struct {
+	Cluster               string
 	Namespace             string
+	WorkloadName          string
+	WorkloadGVK           schema.GroupVersionKind
 	IncludeIstioResources bool
+	IncludeServices       bool
+	IncludeHealth         bool
+	IncludeWaypoints      bool
+	RateInterval          string
+	QueryTime             time.Time
 }
 
 // PodLog reports log entries
 type PodLog struct {
-	Entries []LogEntry `json:"entries,omitempty"`
+	Entries        []LogEntry `json:"entries,omitempty"`
+	LinesTruncated bool       `json:"linesTruncated,omitempty"`
 }
 
 // AccessLogEntry provides parsed info from a single proxy access log entry
@@ -53,39 +107,127 @@ type AccessLogEntry struct {
 type LogEntry struct {
 	Message       string            `json:"message,omitempty"`
 	Severity      string            `json:"severity,omitempty"`
+	OriginalTime  time.Time         `json:"-"`
 	Timestamp     string            `json:"timestamp,omitempty"`
 	TimestampUnix int64             `json:"timestampUnix,omitempty"`
 	AccessLog     *parser.AccessLog `json:"accessLog,omitempty"`
 }
 
+type filterOpts struct {
+	app    regexp.Regexp
+	destWk regexp.Regexp
+	destNs regexp.Regexp
+	srcWk  regexp.Regexp
+	srcNs  regexp.Regexp
+}
+
 // LogOptions holds query parameter values
 type LogOptions struct {
 	Duration *time.Duration
-	IsProxy  bool // fetching logs for Istio Proxy (Envoy access log)
+	LogType  models.LogType
+	MaxLines *int
 	core_v1.PodLogOptions
+	filter filterOpts
 }
 
-var (
-	excludedWorkloads map[string]bool
+// Matches an ISO8601 full date
+var severityRegexp = regexp.MustCompile(`(?i)ERROR|WARN|DEBUG|TRACE`)
 
-	// Matches an ISO8601 full date
-	severityRegexp = regexp.MustCompile(`(?i)ERROR|WARN|DEBUG|TRACE`)
-)
-
-func isWorkloadIncluded(workload string) bool {
-	if excludedWorkloads == nil {
+func (in *WorkloadService) isWorkloadIncluded(workload string) bool {
+	if in.excludedWorkloads == nil {
 		return true
 	}
-	return !excludedWorkloads[workload]
+	return !in.excludedWorkloads[workload]
+}
+
+// isWorkloadValid returns true if it is a known workload type and it is not configured as excluded
+func (in *WorkloadService) isWorkloadValid(workloadType string) bool {
+	_, knownWorkloadType := controllerOrder[workloadType]
+	return knownWorkloadType && in.isWorkloadIncluded(workloadType)
+}
+
+// @TODO do validations per cluster
+func (in *WorkloadService) getWorkloadValidations(authpolicies []*security_v1.AuthorizationPolicy, workloadsPerNamespace map[string]models.WorkloadList) models.IstioValidations {
+	validations := checkers.WorkloadChecker{
+		AuthorizationPolicies: authpolicies,
+		WorkloadsPerNamespace: workloadsPerNamespace,
+	}.Check()
+
+	return validations
+}
+
+// GetAllWorkloads fetches all workloads across every namespace in the cluster.
+func (in *WorkloadService) GetAllWorkloads(ctx context.Context, cluster string) (models.Workloads, error) {
+	var end observability.EndFunc
+	ctx, end = observability.StartSpan(ctx, "GetAllWorkloads",
+		observability.Attribute("package", "business"),
+		observability.Attribute("cluster", cluster),
+	)
+	defer end()
+
+	namespaces, err := in.businessLayer.Namespace.GetClusterNamespaces(ctx, cluster)
+	if err != nil {
+		return nil, err
+	}
+
+	var workloads models.Workloads
+	for _, namespace := range namespaces {
+		w, err := in.fetchWorkloadsFromCluster(ctx, cluster, namespace.Name, "")
+		if err != nil {
+			return nil, err
+		}
+
+		workloads = append(workloads, w...)
+	}
+
+	return workloads, nil
+}
+
+// GetAllGateways fetches all gateway workloads across every namespace in the cluster.
+func (in *WorkloadService) GetAllGateways(ctx context.Context, cluster string) (models.Workloads, error) {
+	workloads, err := in.GetAllWorkloads(ctx, cluster)
+	if err != nil {
+		return nil, err
+	}
+
+	return sliceutil.Filter(workloads, func(w *models.Workload) bool {
+		return w.IsGateway()
+	}), nil
 }
 
 // GetWorkloadList is the API handler to fetch the list of workloads in a given namespace.
-func (in *WorkloadService) GetWorkloadList(criteria WorkloadCriteria) (models.WorkloadList, error) {
+func (in *WorkloadService) GetWorkloadList(ctx context.Context, criteria WorkloadCriteria) (models.WorkloadList, error) {
+	var end observability.EndFunc
+	ctx, end = observability.StartSpan(ctx, "GetWorkloadList",
+		observability.Attribute("package", "business"),
+		observability.Attribute("includeHealth", criteria.IncludeHealth),
+		observability.Attribute("includeIstioResources", criteria.IncludeIstioResources),
+		observability.Attribute("cluster", criteria.Cluster),
+		observability.Attribute("namespace", criteria.Namespace),
+		observability.Attribute("rateInterval", criteria.RateInterval),
+		observability.Attribute("queryTime", criteria.QueryTime),
+	)
+	defer end()
+
+	namespace := criteria.Namespace
+	cluster := criteria.Cluster
+
 	workloadList := &models.WorkloadList{
-		Namespace: models.Namespace{Name: criteria.Namespace, CreationTimestamp: time.Time{}},
-		Workloads: []models.WorkloadListItem{},
+		Namespace:   namespace,
+		Workloads:   []models.WorkloadListItem{},
+		Validations: models.IstioValidations{},
 	}
+
+	if _, ok := in.userClients[cluster]; !ok {
+		return *workloadList, fmt.Errorf("Cluster [%s] is not found or is not accessible for Kiali", cluster)
+	}
+
+	if _, err := in.businessLayer.Namespace.GetClusterNamespace(ctx, namespace, cluster); err != nil {
+		return *workloadList, err
+	}
+
 	var ws models.Workloads
+	// var authpolicies []*security_v1.AuthorizationPolicy
 	var err error
 
 	nFetches := 1
@@ -97,37 +239,38 @@ func (in *WorkloadService) GetWorkloadList(criteria WorkloadCriteria) (models.Wo
 	wg.Add(nFetches)
 	errChan := make(chan error, nFetches)
 
-	go func() {
+	go func(ctx context.Context) {
 		defer wg.Done()
 		var err2 error
-		ws, err2 = fetchWorkloads(in.businessLayer, criteria.Namespace, "")
+		ws, err2 = in.fetchWorkloadsFromCluster(ctx, cluster, namespace, "")
 		if err2 != nil {
-			log.Errorf("Error fetching Workloads per namespace %s: %s", criteria.Namespace, err2)
+			log.Errorf("Error fetching Workloads per namespace %s: %s", namespace, err2)
 			errChan <- err2
 		}
-	}()
+	}(ctx)
 
 	istioConfigCriteria := IstioConfigCriteria{
-		Namespace:                     criteria.Namespace,
 		IncludeAuthorizationPolicies:  true,
 		IncludeEnvoyFilters:           true,
 		IncludeGateways:               true,
+		IncludeK8sGateways:            true,
 		IncludePeerAuthentications:    true,
 		IncludeRequestAuthentications: true,
 		IncludeSidecars:               true,
+		IncludeWorkloadGroups:         true,
 	}
-	var istioConfigList models.IstioConfigList
+	var istioConfigMap models.IstioConfigMap
 
 	if criteria.IncludeIstioResources {
-		go func() {
+		go func(ctx context.Context) {
 			defer wg.Done()
 			var err2 error
-			istioConfigList, err2 = in.businessLayer.IstioConfig.GetIstioConfigList(istioConfigCriteria)
+			istioConfigMap, err2 = in.businessLayer.IstioConfig.GetIstioConfigMap(ctx, namespace, istioConfigCriteria)
 			if err2 != nil {
-				log.Errorf("Error fetching Istio Config per namespace %s: %s", criteria.Namespace, err2)
+				log.Errorf("Error fetching Istio Config per namespace %s: %s", namespace, err2)
 				errChan <- err2
 			}
-		}()
+		}(ctx)
 	}
 
 	wg.Wait()
@@ -137,22 +280,44 @@ func (in *WorkloadService) GetWorkloadList(criteria WorkloadCriteria) (models.Wo
 	}
 
 	for _, w := range ws {
-		wItem := &models.WorkloadListItem{}
+		wItem := &models.WorkloadListItem{Health: *models.EmptyWorkloadHealth()}
 		wItem.ParseWorkload(w)
-		if criteria.IncludeIstioResources {
-			wSelector := labels.Set(wItem.Labels).AsSelector().String()
-			wItem.IstioReferences = FilterUniqueIstioReferences(FilterWorkloadReferences(wSelector, istioConfigList))
+		if istioConfigList, ok := istioConfigMap[cluster]; ok && criteria.IncludeIstioResources {
+			wItem.IstioReferences = FilterUniqueIstioReferences(FilterWorkloadReferences(in.config, wItem.Labels, istioConfigList, cluster))
+		}
+		if criteria.IncludeHealth {
+			wItem.Health, err = in.businessLayer.Health.GetWorkloadHealth(ctx, namespace, cluster, wItem.Name, criteria.RateInterval, criteria.QueryTime, w)
+			if err != nil {
+				log.Errorf("Error fetching Health in namespace %s for workload %s: %s", namespace, wItem.Name, err)
+			}
+		}
+		wItem.Cluster = cluster
+		wItem.Namespace = namespace
+		if w.IsWaypoint() {
+			wItem.Ambient = "waypoint"
 		}
 		workloadList.Workloads = append(workloadList.Workloads, *wItem)
 	}
+
+	for _, istioConfigList := range istioConfigMap {
+		// @TODO multi cluster validations
+		authpolicies := istioConfigList.AuthorizationPolicies
+		allWorkloads := map[string]models.WorkloadList{}
+		allWorkloads[namespace] = *workloadList
+		validations := in.getWorkloadValidations(authpolicies, allWorkloads)
+		validations.StripIgnoredChecks()
+		workloadList.Validations = workloadList.Validations.MergeValidations(validations)
+	}
+
 	return *workloadList, nil
 }
 
-func FilterWorkloadReferences(wSelector string, istioConfigList models.IstioConfigList) []*models.IstioValidationKey {
+func FilterWorkloadReferences(config *config.Config, wLabels map[string]string, istioConfigList models.IstioConfigList, cluster string) []*models.IstioValidationKey {
 	wkdReferences := make([]*models.IstioValidationKey, 0)
-	gwFiltered := kubernetes.FilterGateways(wSelector, istioConfigList.Gateways)
+	wSelector := labels.Set(wLabels).AsSelector().String()
+	gwFiltered := kubernetes.FilterGatewaysBySelector(wSelector, istioConfigList.Gateways)
 	for _, g := range gwFiltered {
-		ref := models.BuildKey(g.Kind, g.Name, g.Namespace)
+		ref := models.BuildKey(kubernetes.Gateways, g.Name, g.Namespace, cluster)
 		exist := false
 		for _, r := range wkdReferences {
 			exist = exist || *r == ref
@@ -161,9 +326,20 @@ func FilterWorkloadReferences(wSelector string, istioConfigList models.IstioConf
 			wkdReferences = append(wkdReferences, &ref)
 		}
 	}
-	apFiltered := kubernetes.FilterAuthorizationPolicies(wSelector, istioConfigList.AuthorizationPolicies)
+	k8sGwFiltered := kubernetes.FilterK8sGatewaysByLabel(istioConfigList.K8sGateways, wLabels[config.IstioLabels.AmbientWaypointGatewayLabel])
+	for _, g := range k8sGwFiltered {
+		ref := models.BuildKey(kubernetes.K8sGateways, g.Name, g.Namespace, cluster)
+		exist := false
+		for _, r := range wkdReferences {
+			exist = exist || *r == ref
+		}
+		if !exist {
+			wkdReferences = append(wkdReferences, &ref)
+		}
+	}
+	apFiltered := kubernetes.FilterAuthorizationPoliciesBySelector(wSelector, istioConfigList.AuthorizationPolicies)
 	for _, a := range apFiltered {
-		ref := models.BuildKey(a.Kind, a.Name, a.Namespace)
+		ref := models.BuildKey(kubernetes.AuthorizationPolicies, a.Name, a.Namespace, cluster)
 		exist := false
 		for _, r := range wkdReferences {
 			exist = exist || *r == ref
@@ -172,9 +348,9 @@ func FilterWorkloadReferences(wSelector string, istioConfigList models.IstioConf
 			wkdReferences = append(wkdReferences, &ref)
 		}
 	}
-	paFiltered := kubernetes.FilterPeerAuthentications(wSelector, istioConfigList.PeerAuthentications)
+	paFiltered := kubernetes.FilterPeerAuthenticationsBySelector(wSelector, istioConfigList.PeerAuthentications)
 	for _, p := range paFiltered {
-		ref := models.BuildKey(p.Kind, p.Name, p.Namespace)
+		ref := models.BuildKey(kubernetes.PeerAuthentications, p.Name, p.Namespace, cluster)
 		exist := false
 		for _, r := range wkdReferences {
 			exist = exist || *r == ref
@@ -183,9 +359,9 @@ func FilterWorkloadReferences(wSelector string, istioConfigList models.IstioConf
 			wkdReferences = append(wkdReferences, &ref)
 		}
 	}
-	scFiltered := kubernetes.FilterSidecars(wSelector, istioConfigList.Sidecars)
+	scFiltered := kubernetes.FilterSidecarsBySelector(wSelector, istioConfigList.Sidecars)
 	for _, s := range scFiltered {
-		ref := models.BuildKey(s.Kind, s.Name, s.Namespace)
+		ref := models.BuildKey(kubernetes.Sidecars, s.Name, s.Namespace, cluster)
 		exist := false
 		for _, r := range wkdReferences {
 			exist = exist || *r == ref
@@ -194,9 +370,9 @@ func FilterWorkloadReferences(wSelector string, istioConfigList models.IstioConf
 			wkdReferences = append(wkdReferences, &ref)
 		}
 	}
-	raFiltered := kubernetes.FilterRequestAuthentications(wSelector, istioConfigList.RequestAuthentications)
+	raFiltered := kubernetes.FilterRequestAuthenticationsBySelector(wSelector, istioConfigList.RequestAuthentications)
 	for _, ra := range raFiltered {
-		ref := models.BuildKey(ra.Kind, ra.Name, ra.Namespace)
+		ref := models.BuildKey(kubernetes.RequestAuthentications, ra.Name, ra.Namespace, cluster)
 		exist := false
 		for _, r := range wkdReferences {
 			exist = exist || *r == ref
@@ -205,9 +381,20 @@ func FilterWorkloadReferences(wSelector string, istioConfigList models.IstioConf
 			wkdReferences = append(wkdReferences, &ref)
 		}
 	}
-	efFiltered := kubernetes.FilterEnvoyFilters(wSelector, istioConfigList.EnvoyFilters)
+	efFiltered := kubernetes.FilterEnvoyFiltersBySelector(wSelector, istioConfigList.EnvoyFilters)
 	for _, ef := range efFiltered {
-		ref := models.BuildKey(ef.Kind, ef.Name, ef.Namespace)
+		ref := models.BuildKey(kubernetes.EnvoyFilters, ef.Name, ef.Namespace, cluster)
+		exist := false
+		for _, r := range wkdReferences {
+			exist = exist || *r == ref
+		}
+		if !exist {
+			wkdReferences = append(wkdReferences, &ref)
+		}
+	}
+	wgFiltered := kubernetes.FilterWorkloadGroupsBySelector(wSelector, istioConfigList.WorkloadGroups)
+	for _, wg := range wgFiltered {
+		ref := models.BuildKey(kubernetes.WorkloadGroups, wg.Name, wg.Namespace, cluster)
 		exist := false
 		for _, r := range wkdReferences {
 			exist = exist || *r == ref
@@ -229,9 +416,9 @@ func FilterUniqueIstioReferences(refs []*models.IstioValidationKey) []*models.Is
 	filtered := make([]*models.IstioValidationKey, 0)
 	for k := range refMap {
 		filtered = append(filtered, &models.IstioValidationKey{
-			ObjectType: k.ObjectType,
-			Name:       k.Name,
-			Namespace:  k.Namespace,
+			ObjectGVK: k.ObjectGVK,
+			Name:      k.Name,
+			Namespace: k.Namespace,
 		})
 	}
 	return filtered
@@ -239,13 +426,28 @@ func FilterUniqueIstioReferences(refs []*models.IstioValidationKey) []*models.Is
 
 // GetWorkload is the API handler to fetch details of a specific workload.
 // If includeServices is set true, the Workload will fetch all services related
-func (in *WorkloadService) GetWorkload(namespace string, workloadName string, workloadType string, includeServices bool) (*models.Workload, error) {
-	ns, err := in.businessLayer.Namespace.GetNamespace(namespace)
+func (in *WorkloadService) GetWorkload(ctx context.Context, criteria WorkloadCriteria) (*models.Workload, error) {
+	var end observability.EndFunc
+	ctx, end = observability.StartSpan(ctx, "GetWorkload",
+		observability.Attribute("package", "business"),
+		observability.Attribute("cluster", criteria.Cluster),
+		observability.Attribute("namespace", criteria.Namespace),
+		observability.Attribute("workloadName", criteria.WorkloadName),
+		observability.Attribute("workloadType", criteria.WorkloadGVK.String()),
+		observability.Attribute("includeServices", criteria.IncludeServices),
+		observability.Attribute("rateInterval", criteria.RateInterval),
+		observability.Attribute("queryTime", criteria.QueryTime),
+	)
+	defer end()
+
+	ns, err := in.businessLayer.Namespace.GetClusterNamespace(ctx, criteria.Namespace, criteria.Cluster)
 	if err != nil {
 		return nil, err
 	}
 
-	workload, err2 := fetchWorkload(in.businessLayer, namespace, workloadName, workloadType)
+	criteria.IncludeWaypoints = true
+	workload, err2 := in.fetchWorkload(ctx, criteria)
+
 	if err2 != nil {
 		return nil, err2
 	}
@@ -255,22 +457,25 @@ func (in *WorkloadService) GetWorkload(namespace string, workloadName string, wo
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		conf := config.Get()
+		conf := in.config
 		app := workload.Labels[conf.IstioLabels.AppLabelName]
 		version := workload.Labels[conf.IstioLabels.VersionLabelName]
-		runtimes = NewDashboardsService(ns, workload).GetCustomDashboardRefs(namespace, app, version, workload.Pods)
+		runtimes = NewDashboardsService(in.config, in.grafana, ns, workload).GetCustomDashboardRefs(criteria.Namespace, app, version, workload.Pods)
 	}()
 
-	if includeServices {
+	// WorkloadGroup.Labels can be empty
+	if criteria.IncludeServices && len(workload.Labels) > 0 {
 		var services *models.ServiceList
 		var err error
 
-		criteria := ServiceCriteria{
-			Namespace:              namespace,
+		serviceCriteria := ServiceCriteria{
+			Cluster:                criteria.Cluster,
+			Namespace:              criteria.Namespace,
 			ServiceSelector:        labels.Set(workload.Labels).String(),
+			IncludeHealth:          false,
 			IncludeOnlyDefinitions: true,
 		}
-		services, err = in.businessLayer.Svc.GetServiceList(criteria)
+		services, err = in.businessLayer.Svc.GetServiceList(ctx, serviceCriteria)
 		if err != nil {
 			return nil, err
 		}
@@ -283,54 +488,58 @@ func (in *WorkloadService) GetWorkload(namespace string, workloadName string, wo
 	return workload, nil
 }
 
-func (in *WorkloadService) UpdateWorkload(namespace string, workloadName string, workloadType string, includeServices bool, jsonPatch string) (*models.Workload, error) {
+func (in *WorkloadService) UpdateWorkload(ctx context.Context, cluster string, namespace string, workloadName string, workloadGVK schema.GroupVersionKind, includeServices bool, jsonPatch string, patchType string) (*models.Workload, error) {
+	var end observability.EndFunc
+	ctx, end = observability.StartSpan(ctx, "UpdateWorkload",
+		observability.Attribute("package", "business"),
+		observability.Attribute("cluster", cluster),
+		observability.Attribute("namespace", namespace),
+		observability.Attribute("workloadName", workloadName),
+		observability.Attribute("workloadKind", workloadGVK.Kind),
+		observability.Attribute("workloadGroupVersion", workloadGVK.GroupVersion().String()),
+		observability.Attribute("includeServices", includeServices),
+		observability.Attribute("jsonPatch", jsonPatch),
+		observability.Attribute("patchType", patchType),
+	)
+	defer end()
+
 	// Identify controller and apply patch to workload
-	err := updateWorkload(in.businessLayer, namespace, workloadName, workloadType, jsonPatch)
+	err := in.updateWorkload(ctx, cluster, namespace, workloadName, workloadGVK, jsonPatch, patchType)
 	if err != nil {
 		return nil, err
 	}
 
-	// Cache is stopped after a Create/Update/Delete operation to force a refresh
-	if kialiCache != nil && err == nil {
-		kialiCache.RefreshNamespace(namespace)
+	// Cache is stopped after a Create/Update/Delete operation to force a refresh.
+	// Refresh once after all the updates have gone through since Update Workload will update
+	// every single workload type of that matches name/namespace and we only want to refresh once.
+	cache, err := in.cache.GetKubeCache(cluster)
+	if err != nil {
+		return nil, err
 	}
+	cache.Refresh(namespace)
 
 	// After the update we fetch the whole workload
-	return in.GetWorkload(namespace, workloadName, workloadType, includeServices)
+	return in.GetWorkload(ctx, WorkloadCriteria{Cluster: cluster, Namespace: namespace, WorkloadName: workloadName, WorkloadGVK: workloadGVK, IncludeServices: includeServices})
 }
 
-func (in *WorkloadService) GetPods(namespace string, labelSelector string) (models.Pods, error) {
-	var err error
-	var ps []core_v1.Pod
-	// Check if namespace is cached
-	if IsNamespaceCached(namespace) {
-		// Cache uses Kiali ServiceAccount, check if user can access to the namespace
-		if _, err = in.businessLayer.Namespace.GetNamespace(namespace); err == nil {
-			ps, err = kialiCache.GetPods(namespace, labelSelector)
-		}
-	} else {
-		ps, err = in.k8s.GetPods(namespace, labelSelector)
+func (in *WorkloadService) GetPod(cluster, namespace, name string) (*models.Pod, error) {
+	k8s, ok := in.userClients[cluster]
+	if !ok {
+		return nil, fmt.Errorf("cluster [%s] is not found or is not accessible for Kiali", cluster)
 	}
 
+	// This isn't using the cache for some reason but it never has.
+	p, err := k8s.GetPod(namespace, name)
 	if err != nil {
 		return nil, err
 	}
-	pods := models.Pods{}
-	pods.Parse(ps)
-	return pods, nil
-}
 
-func (in *WorkloadService) GetPod(namespace, name string) (*models.Pod, error) {
-	p, err := in.k8s.GetPod(namespace, name)
-	if err != nil {
-		return nil, err
-	}
 	pod := models.Pod{}
 	pod.Parse(p)
 	return &pod, nil
 }
 
-func (in *WorkloadService) BuildLogOptionsCriteria(container, duration, isProxy, sinceTime, tailLines string) (*LogOptions, error) {
+func (in *WorkloadService) BuildLogOptionsCriteria(container, duration string, logType models.LogType, sinceTime, maxLines string) (*LogOptions, error) {
 	opts := &LogOptions{}
 	opts.PodLogOptions = core_v1.PodLogOptions{Timestamps: true}
 
@@ -340,178 +549,219 @@ func (in *WorkloadService) BuildLogOptionsCriteria(container, duration, isProxy,
 
 	if duration != "" {
 		duration, err := time.ParseDuration(duration)
-
 		if err != nil {
-			return nil, fmt.Errorf("Invalid duration [%s]: %v", duration, err)
+			return nil, fmt.Errorf("invalid duration [%s]: %v", duration, err)
 		}
 
 		opts.Duration = &duration
 	}
 
-	opts.IsProxy = isProxy == "true"
+	opts.LogType = logType
 
 	if sinceTime != "" {
 		numTime, err := strconv.ParseInt(sinceTime, 10, 64)
-
 		if err != nil {
-			return nil, fmt.Errorf("Invalid sinceTime [%s]: %v", sinceTime, err)
+			return nil, fmt.Errorf("invalid sinceTime [%s]: %v", sinceTime, err)
 		}
 
 		opts.SinceTime = &meta_v1.Time{Time: time.Unix(numTime, 0)}
 	}
 
-	if tailLines != "" {
-		if numLines, err := strconv.ParseInt(tailLines, 10, 64); err == nil {
+	if maxLines != "" {
+		if numLines, err := strconv.Atoi(maxLines); err == nil {
 			if numLines > 0 {
-				opts.TailLines = &numLines
+				opts.MaxLines = &numLines
 			}
 		} else {
-			return nil, fmt.Errorf("Invalid tailLines [%s]: %v", tailLines, err)
+			return nil, fmt.Errorf("invalid maxLines [%s]: %v", maxLines, err)
 		}
 	}
 
 	return opts, nil
 }
 
-func (in *WorkloadService) getParsedLogs(namespace, name string, opts *LogOptions) (*PodLog, error) {
-	k8sOpts := opts.PodLogOptions
-	// the k8s API does not support "endTime/beforeTime". So for bounded time ranges we need to
-	// 1) discard the logs after sinceTime+duration
-	// 2) manually apply tailLines to the remaining logs
-	isBounded := opts.Duration != nil
-	tailLines := k8sOpts.TailLines
-	if isBounded {
-		k8sOpts.TailLines = nil
+func parseLogLine(line string, isProxy bool, engardeParser *parser.Parser) *LogEntry {
+	entry := LogEntry{
+		Message:       "",
+		Timestamp:     "",
+		TimestampUnix: 0,
+		Severity:      "INFO",
 	}
 
-	podLog, err := in.k8s.GetPodLogs(namespace, name, &k8sOpts)
+	splitted := strings.SplitN(line, " ", 2)
+	if len(splitted) != 2 {
+		log.Debugf("Skipping unexpected log line [%s]", line)
+		return nil
+	}
 
+	// k8s promises RFC3339 or RFC3339Nano timestamp, ensure RFC3339
+	// Split by blanks, to get the miliseconds for sorting, try RFC3339Nano
+	entry.Timestamp = splitted[0]
+
+	entry.Message = strings.TrimSpace(splitted[1])
+	if entry.Message == "" {
+		log.Debugf("Skipping empty log line [%s]", line)
+		return nil
+	}
+
+	// If we are past the requested time window then stop processing
+	parsedTimestamp, err := time.Parse(time.RFC3339Nano, entry.Timestamp)
+	entry.OriginalTime = parsedTimestamp
 	if err != nil {
-		return nil, err
+		log.Debugf("Failed to parse log timestamp (skipping) [%s], %s", entry.Timestamp, err.Error())
+		return nil
 	}
 
-	lines := strings.Split(podLog.Logs, "\n")
-	entries := make([]LogEntry, 0)
-
-	var startTime *time.Time
-	var endTime *time.Time
-	if k8sOpts.SinceTime != nil {
-		startTime = &k8sOpts.SinceTime.Time
+	severity := severityRegexp.FindString(line)
+	if severity != "" {
+		entry.Severity = strings.ToUpper(severity)
 	}
 
-	engardeParser := parser.New(parser.IstioProxyAccessLogsPattern)
-
-	for _, line := range lines {
-		entry := LogEntry{
-			Message:       "",
-			Timestamp:     "",
-			TimestampUnix: 0,
-			Severity:      "INFO",
-		}
-
-		splitted := strings.SplitN(line, " ", 2)
-		if len(splitted) != 2 {
-			log.Debugf("Skipping unexpected log line [%s]", line)
-			continue
-		}
-
-		// k8s promises RFC3339 or RFC3339Nano timestamp, ensure RFC3339
-		splittedTimestamp := strings.Split(splitted[0], ".")
-		if len(splittedTimestamp) == 1 {
-			entry.Timestamp = splittedTimestamp[0]
-		} else {
-			entry.Timestamp = fmt.Sprintf("%sZ", splittedTimestamp[0])
-		}
-
-		entry.Message = strings.TrimSpace(splitted[1])
-		if entry.Message == "" {
-			log.Debugf("Skipping empty log line [%s]", line)
-			continue
-		}
-
-		// If we are past the requested time window then stop processing
-		parsedTimestamp, err := time.Parse(time.RFC3339, entry.Timestamp)
-		if err == nil {
-			if startTime == nil {
-				startTime = &parsedTimestamp
+	// If this is an istio access log, then parse it out. Prefer the access log time over the k8s time
+	// as it is the actual time as opposed to the k8s store time.
+	if isProxy {
+		al, err := engardeParser.Parse(entry.Message)
+		// engardeParser.Parse will not throw errors even if no fields
+		// were parsed out. Checking here that some fields were actually
+		// set before setting the AccessLog to an empty object. See issue #4346.
+		if err != nil || isAccessLogEmpty(al) {
+			if err != nil {
+				log.Debugf("AccessLog parse failure: %s", err.Error())
 			}
-
-			if isBounded {
-				if endTime == nil {
-					end := parsedTimestamp.Add(*opts.Duration)
-					endTime = &end
-				}
-
-				if parsedTimestamp.After(*endTime) {
-					break
-				}
+			// try to parse out the time manually
+			tokens := strings.SplitN(entry.Message, " ", 2)
+			timestampToken := strings.Trim(tokens[0], "[]")
+			t, err := time.Parse(time.RFC3339, timestampToken)
+			if err == nil {
+				parsedTimestamp = t
 			}
 		} else {
-			log.Debugf("Failed to parse log timestamp (skipping) [%s], %s", entry.Timestamp, err.Error())
-			continue
-		}
-
-		severity := severityRegexp.FindString(line)
-		if severity != "" {
-			entry.Severity = strings.ToUpper(severity)
-		}
-
-		// If this is an istio access log, then parse it out. Prefer the access log time over the k8s time
-		// as it is the actual time as opposed to the k8s store time.
-		if opts.IsProxy {
-			al, err := engardeParser.Parse(entry.Message)
-			// engardeParser.Parse will not throw errors even if no fields
-			// were parsed out. Checking here that some fields were actually
-			// set before setting the AccessLog to an empty object. See issue #4346.
-			if err != nil || isAccessLogEmpty(al) {
-				if err != nil {
-					log.Debugf("AccessLog parse failure: %s", err.Error())
-				}
-				// try to parse out the time manually
-				tokens := strings.SplitN(entry.Message, " ", 2)
-				timestampToken := strings.Trim(tokens[0], "[]")
-				t, err := time.Parse(time.RFC3339, timestampToken)
-				if err == nil {
-					parsedTimestamp = t
-				}
-			} else {
-				entry.AccessLog = al
-				t, err := time.Parse(time.RFC3339, al.Timestamp)
-				if err == nil {
-					parsedTimestamp = t
-				}
-
-				// clear accessLog fields we don't need in the returned JSON
-				entry.AccessLog.MixerStatus = ""
-				entry.AccessLog.OriginalMessage = ""
-				entry.AccessLog.ParseError = ""
+			entry.AccessLog = al
+			t, err := time.Parse(time.RFC3339, al.Timestamp)
+			if err == nil {
+				parsedTimestamp = t
 			}
+
+			// clear accessLog fields we don't need in the returned JSON
+			entry.AccessLog.MixerStatus = ""
+			entry.AccessLog.OriginalMessage = ""
+			entry.AccessLog.ParseError = ""
 		}
-
-		// override the timestamp with a simpler format
-		timestamp := fmt.Sprintf("%d-%02d-%02d %02d:%02d:%02d",
-			parsedTimestamp.Year(), parsedTimestamp.Month(), parsedTimestamp.Day(),
-			parsedTimestamp.Hour(), parsedTimestamp.Minute(), parsedTimestamp.Second())
-		entry.Timestamp = timestamp
-		entry.TimestampUnix = parsedTimestamp.Unix()
-
-		entries = append(entries, entry)
 	}
 
-	if isBounded && tailLines != nil && len(entries) > int(*tailLines) {
-		entries = entries[len(entries)-int(*tailLines):]
-	}
+	// override the timestamp with a simpler format
+	timestamp := parseTimestamp(parsedTimestamp)
+	entry.Timestamp = timestamp
+	entry.TimestampUnix = parsedTimestamp.UnixMilli()
 
-	message := PodLog{
-		Entries: entries,
-	}
-
-	return &message, err
+	return &entry
 }
 
-// GetPodLogs returns pod logs given the provided options
-func (in *WorkloadService) GetPodLogs(namespace, name string, opts *LogOptions) (*PodLog, error) {
-	return in.getParsedLogs(namespace, name, opts)
+func parseZtunnelLine(line, name string) *LogEntry {
+	entry := LogEntry{
+		Message:       "",
+		Timestamp:     "",
+		TimestampUnix: 0,
+		Severity:      "INFO",
+	}
+
+	splitted := strings.SplitN(line, " ", 2)
+	if len(splitted) != 2 {
+		log.Debugf("Skipping unexpected log line [%s]", line)
+		return nil
+	}
+
+	msgSplit := strings.Split(line, "\t")
+
+	if len(msgSplit) < 5 {
+		log.Debugf("Error splitting log line [%s]", line)
+		entry.Message = fmt.Sprintf("[%s] %s", name, line)
+		return &entry
+	}
+
+	entry.Message = fmt.Sprintf("[%s] %s", name, msgSplit[4])
+	if entry.Message == "" {
+		log.Debugf("Skipping empty log line [%s]", line)
+		entry.Message = fmt.Sprintf("[%s] %s", name, line)
+		return &entry
+	}
+
+	// k8s promises RFC3339 or RFC3339Nano timestamp, ensure RFC3339
+	// Split by blanks, to get the milliseconds for sorting, try RFC3339Nano
+	ts := strings.Split(msgSplit[0], " ") // Sometime timestamp is duplicated
+	entry.Timestamp = ts[0]
+
+	// If we are past the requested time window then stop processing
+	parsedTimestamp, err := time.Parse(time.RFC3339Nano, entry.Timestamp)
+	entry.OriginalTime = parsedTimestamp
+	if err != nil {
+		log.Debugf("Failed to parse log timestamp (skipping) [%s], %s", entry.Timestamp, err.Error())
+		return nil
+	}
+
+	if splitted[1] != "" {
+		entry.Severity = strings.ToUpper(splitted[1])
+	}
+
+	// override the timestamp with a simpler format
+	timestamp := parseTimestamp(parsedTimestamp)
+	entry.Timestamp = timestamp
+	entry.TimestampUnix = parsedTimestamp.UnixMilli()
+
+	// Process some access log data
+	// More validations can be done. Data is in format direction=outbound
+	// Also, more data could be added?
+	al := parser.AccessLog{}
+	al.Timestamp = timestamp
+	if len(msgSplit) > 4 {
+		accessLog := strings.Split(msgSplit[4], " ")
+		for _, field := range accessLog {
+			parsed := strings.SplitN(field, "=", 2)
+			if len(parsed) == 2 {
+				parsed[1] = strings.Replace(parsed[1], "\"", "", -1)
+				switch parsed[0] {
+				case "src.identity":
+					al.UpstreamCluster = parsed[1]
+				case "duration":
+					al.Duration = parsed[1]
+				case "bytes_recv":
+					al.BytesReceived = parsed[1]
+				case "bytes_sent":
+					al.BytesSent = parsed[1]
+				case "dst.service":
+					al.RequestedServer = parsed[1]
+				case "error":
+					al.ParseError = parsed[1]
+				case "dst.addr":
+					al.UpstreamService = parsed[1]
+				case "src.addr":
+					al.DownstreamRemote = parsed[1]
+				}
+			}
+		}
+	}
+
+	entry.AccessLog = &al
+
+	return &entry
+}
+
+func parseTimestamp(parsedTimestamp time.Time) string {
+	precision := strings.Split(parsedTimestamp.String(), ".")
+	var milliseconds string
+	if len(precision) > 1 {
+		ms := precision[1]
+		milliseconds = ms[:3]
+		splittedms := strings.Fields(milliseconds) // This is needed to avoid invalid dates in ms like 200
+		milliseconds = splittedms[0]
+	} else {
+		milliseconds = "000"
+	}
+
+	timestamp := fmt.Sprintf("%d-%02d-%02d %02d:%02d:%02d.%s",
+		parsedTimestamp.Year(), parsedTimestamp.Month(), parsedTimestamp.Day(),
+		parsedTimestamp.Hour(), parsedTimestamp.Minute(), parsedTimestamp.Second(), milliseconds)
+	return timestamp
 }
 
 func isAccessLogEmpty(al *parser.AccessLog) bool {
@@ -546,7 +796,7 @@ func isAccessLogEmpty(al *parser.AccessLog) bool {
 		al.UserAgent == "")
 }
 
-func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (models.Workloads, error) {
+func (in *WorkloadService) fetchWorkloadsFromCluster(ctx context.Context, cluster string, namespace string, labelSelector string) (models.Workloads, error) {
 	var pods []core_v1.Pod
 	var repcon []core_v1.ReplicationController
 	var dep []apps_v1.Deployment
@@ -554,74 +804,76 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 	var depcon []osapps_v1.DeploymentConfig
 	var fulset []apps_v1.StatefulSet
 	var jbs []batch_v1.Job
-	var conjbs []batch_v1beta1.CronJob
+	var conjbs []batch_v1.CronJob
 	var daeset []apps_v1.DaemonSet
+	var wgroups []*networking_v1.WorkloadGroup
+	var wentries []*networking_v1.WorkloadEntry
+	var sidecars []*networking_v1.Sidecar
 
 	ws := models.Workloads{}
 
 	// Check if user has access to the namespace (RBAC) in cache scenarios and/or
 	// if namespace is accessible from Kiali (Deployment.AccessibleNamespaces)
-	if _, err := layer.Namespace.GetNamespace(namespace); err != nil {
+	if _, err := in.businessLayer.Namespace.GetClusterNamespace(ctx, namespace, cluster); err != nil {
 		return nil, err
 	}
 
-	wg := sync.WaitGroup{}
-	wg.Add(9)
-	errChan := make(chan error, 9)
+	// we've already established the user has access to the namespace; use SA client to obtain namespace resource info
+	client, ok := in.kialiSAClients[cluster]
+	if !ok {
+		return nil, fmt.Errorf("Cluster [%s] is not found or is not accessible for Kiali", cluster)
+	}
 
+	kubeCache := in.cache.GetKubeCaches()[cluster]
+	if kubeCache == nil {
+		return nil, fmt.Errorf("Cluster [%s] is not found or is not accessible for Kiali", cluster)
+	}
+
+	wg := sync.WaitGroup{}
+	wg.Add(12)
+	errChan := make(chan error, 12)
+
+	// Pods are always fetched
 	go func() {
 		defer wg.Done()
 		var err error
-		// Check if namespace is cached
-		// Namespace access is checked in the upper caller
-		if IsNamespaceCached(namespace) {
-			pods, err = kialiCache.GetPods(namespace, labelSelector)
-		} else {
-			pods, err = layer.k8s.GetPods(namespace, labelSelector)
-		}
+		pods, err = kubeCache.GetPods(namespace, labelSelector)
 		if err != nil {
 			log.Errorf("Error fetching Pods per namespace %s: %s", namespace, err)
 			errChan <- err
 		}
 	}()
 
+	// Deployments are always fetched
 	go func() {
 		defer wg.Done()
 		var err error
-		// Check if namespace is cached
-		// Namespace access is checked in the upper caller
-		if IsNamespaceCached(namespace) {
-			dep, err = kialiCache.GetDeployments(namespace)
-		} else {
-			dep, err = layer.k8s.GetDeployments(namespace)
-		}
+		dep, err = kubeCache.GetDeployments(namespace)
 		if err != nil {
 			log.Errorf("Error fetching Deployments per namespace %s: %s", namespace, err)
 			errChan <- err
 		}
 	}()
 
+	// ReplicaSets are always fetched
 	go func() {
 		defer wg.Done()
 		var err error
-		// Check if namespace is cached
-		// Namespace access is checked in the upper caller
-		if IsNamespaceCached(namespace) {
-			repset, err = kialiCache.GetReplicaSets(namespace)
-		} else {
-			repset, err = layer.k8s.GetReplicaSets(namespace)
-		}
+		repset, err = kubeCache.GetReplicaSets(namespace)
 		if err != nil {
 			log.Errorf("Error fetching ReplicaSets per namespace %s: %s", namespace, err)
 			errChan <- err
 		}
 	}()
 
+	// ReplicaControllers are fetched only when included
 	go func() {
 		defer wg.Done()
+
 		var err error
-		if isWorkloadIncluded(kubernetes.ReplicationControllerType) {
-			repcon, err = layer.k8s.GetReplicationControllers(namespace)
+		if in.isWorkloadIncluded(kubernetes.ReplicationControllerType) {
+			// No Cache for ReplicationControllers
+			repcon, err = client.GetReplicationControllers(namespace)
 			if err != nil {
 				log.Errorf("Error fetching GetReplicationControllers per namespace %s: %s", namespace, err)
 				errChan <- err
@@ -629,11 +881,14 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 		}
 	}()
 
+	// DeploymentConfigs are fetched only when included
 	go func() {
 		defer wg.Done()
+
 		var err error
-		if layer.k8s.IsOpenShift() && isWorkloadIncluded(kubernetes.DeploymentConfigType) {
-			depcon, err = layer.k8s.GetDeploymentConfigs(namespace)
+		if client.IsOpenShift() && in.isWorkloadIncluded(kubernetes.DeploymentConfigType) {
+			// No cache for DeploymentConfigs
+			depcon, err = client.GetDeploymentConfigs(ctx, namespace)
 			if err != nil {
 				log.Errorf("Error fetching DeploymentConfigs per namespace %s: %s", namespace, err)
 				errChan <- err
@@ -641,15 +896,13 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 		}
 	}()
 
+	// StatefulSets are fetched only when included
 	go func() {
 		defer wg.Done()
+
 		var err error
-		if isWorkloadIncluded(kubernetes.StatefulSetType) {
-			if IsNamespaceCached(namespace) {
-				fulset, err = kialiCache.GetStatefulSets(namespace)
-			} else {
-				fulset, err = layer.k8s.GetStatefulSets(namespace)
-			}
+		if in.isWorkloadIncluded(kubernetes.StatefulSetType) {
+			fulset, err = kubeCache.GetStatefulSets(namespace)
 			if err != nil {
 				log.Errorf("Error fetching StatefulSets per namespace %s: %s", namespace, err)
 				errChan <- err
@@ -657,11 +910,14 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 		}
 	}()
 
+	// CronJobs are fetched only when included
 	go func() {
 		defer wg.Done()
+
 		var err error
-		if isWorkloadIncluded(kubernetes.CronJobType) {
-			conjbs, err = layer.k8s.GetCronJobs(namespace)
+		if in.isWorkloadIncluded(kubernetes.CronJobType) {
+			// No cache for Cronjobs
+			conjbs, err = client.GetCronJobs(namespace)
 			if err != nil {
 				log.Errorf("Error fetching CronJobs per namespace %s: %s", namespace, err)
 				errChan <- err
@@ -669,11 +925,14 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 		}
 	}()
 
+	// Jobs are fetched only when included
 	go func() {
 		defer wg.Done()
+
 		var err error
-		if isWorkloadIncluded(kubernetes.JobType) {
-			jbs, err = layer.k8s.GetJobs(namespace)
+		if in.isWorkloadIncluded(kubernetes.JobType) {
+			// No cache for Jobs
+			jbs, err = client.GetJobs(namespace)
 			if err != nil {
 				log.Errorf("Error fetching Jobs per namespace %s: %s", namespace, err)
 				errChan <- err
@@ -681,17 +940,54 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 		}
 	}()
 
+	// DaemonSets are fetched only when included
+	go func() {
+		defer wg.Done()
+
+		var err error
+		if in.isWorkloadIncluded(kubernetes.DaemonSetType) {
+			daeset, err = kubeCache.GetDaemonSets(namespace)
+			if err != nil {
+				log.Errorf("Error fetching DaemonSets per namespace %s: %s", namespace, err)
+			}
+		}
+	}()
+
+	// WorkloadGroups are fetched only when included
 	go func() {
 		defer wg.Done()
 		var err error
-		if isWorkloadIncluded(kubernetes.DaemonSetType) {
-			if IsNamespaceCached(namespace) {
-				daeset, err = kialiCache.GetDaemonSets(namespace)
-			} else {
-				daeset, err = layer.k8s.GetDaemonSets(namespace)
-			}
+		if in.isWorkloadIncluded(kubernetes.WorkloadGroupType) {
+			wgroups, err = kubeCache.GetWorkloadGroups(namespace, labelSelector)
 			if err != nil {
-				log.Errorf("Error fetching DaemonSets per namespace %s: %s", namespace, err)
+				log.Errorf("Error fetching WorkloadGroups per namespace %s: %s", namespace, err)
+				errChan <- err
+			}
+		}
+	}()
+
+	// WorkloadEntries are fetched only when included
+	go func() {
+		defer wg.Done()
+		var err error
+		if in.isWorkloadIncluded(kubernetes.WorkloadEntryType) {
+			wentries, err = kubeCache.GetWorkloadEntries(namespace, labelSelector)
+			if err != nil {
+				log.Errorf("Error fetching WorkloadEntries per namespace %s: %s", namespace, err)
+				errChan <- err
+			}
+		}
+	}()
+
+	// Sidecars are fetched only when included
+	go func() {
+		defer wg.Done()
+		var err error
+		if in.isWorkloadIncluded(kubernetes.SidecarType) {
+			sidecars, err = kubeCache.GetSidecars(namespace, "")
+			if err != nil {
+				log.Errorf("Error fetching Sidecars per namespace %s: %s", namespace, err)
+				errChan <- err
 			}
 		}
 	}()
@@ -702,19 +998,24 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 		return ws, err
 	}
 
-	// Key: name of controller; Value: type of controller
-	controllers := map[string]string{}
+	// Key: name of controller; Value: GroupVersionKind of controller
+	controllers := map[string]schema.GroupVersionKind{}
 
 	// Find controllers from pods
 	for _, pod := range pods {
 		if len(pod.OwnerReferences) != 0 {
 			for _, ref := range pod.OwnerReferences {
-				if ref.Controller != nil && *ref.Controller {
+				refGV, err := schema.ParseGroupVersion(ref.APIVersion)
+				if err != nil {
+					log.Errorf("could not parse OwnerReference api version %q: %v", ref.APIVersion, err)
+					continue
+				}
+				if ref.Controller != nil && *ref.Controller && in.isWorkloadIncluded(ref.Kind) {
 					if _, exist := controllers[ref.Name]; !exist {
-						controllers[ref.Name] = ref.Kind
+						controllers[ref.Name] = refGV.WithKind(ref.Kind)
 					} else {
-						if controllers[ref.Name] != ref.Kind {
-							controllers[ref.Name] = controllerPriority(controllers[ref.Name], ref.Kind)
+						if controllers[ref.Name] != refGV.WithKind(ref.Kind) {
+							controllers[ref.Name] = refGV.WithKind(controllerPriority(controllers[ref.Name].Kind, ref.Kind))
 						}
 					}
 				}
@@ -722,20 +1023,27 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 		} else {
 			if _, exist := controllers[pod.Name]; !exist {
 				// Pod without controller
-				controllers[pod.Name] = "Pod"
+				controllers[pod.Name] = kubernetes.Pods
 			}
+		}
+	}
+
+	// Find controllers from WorkloadGroups
+	for _, wgroup := range wgroups {
+		if _, exist := controllers[wgroup.Name]; !exist {
+			controllers[wgroup.Name] = kubernetes.WorkloadGroups
 		}
 	}
 
 	// Resolve ReplicaSets from Deployments
 	// Resolve ReplicationControllers from DeploymentConfigs
 	// Resolve Jobs from CronJobs
-	for cname, ctype := range controllers {
-		if ctype == kubernetes.ReplicaSetType {
+	for controllerName, controllerGVK := range controllers {
+		if controllerGVK == kubernetes.ReplicaSets {
 			found := false
 			iFound := -1
 			for i, rs := range repset {
-				if rs.Name == cname {
+				if rs.Name == controllerName {
 					iFound = i
 					found = true
 					break
@@ -744,24 +1052,35 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 			if found && len(repset[iFound].OwnerReferences) > 0 {
 				for _, ref := range repset[iFound].OwnerReferences {
 					if ref.Controller != nil && *ref.Controller {
-						// Delete the child ReplicaSet and add the parent controller
-						if _, exist := controllers[ref.Name]; !exist {
-							controllers[ref.Name] = ref.Kind
-						} else {
-							if controllers[ref.Name] != ref.Kind {
-								controllers[ref.Name] = controllerPriority(controllers[ref.Name], ref.Kind)
-							}
+						refGV, err := schema.ParseGroupVersion(ref.APIVersion)
+						if err != nil {
+							log.Errorf("could not parse OwnerReference api version %q: %v", ref.APIVersion, err)
+							continue
 						}
-						delete(controllers, cname)
+						if _, exist := controllers[ref.Name]; !exist {
+							// For valid owner controllers, delete the child ReplicaSet and add the parent controller,
+							// otherwise (for custom controllers), defer to the replica set.
+							if in.isWorkloadValid(ref.Kind) {
+								controllers[ref.Name] = refGV.WithKind(ref.Kind)
+								delete(controllers, controllerName)
+							} else {
+								log.Debugf("Add ReplicaSet to workload list for custom controller [%s][%s]", ref.Name, ref.Kind)
+							}
+						} else {
+							if controllers[ref.Name] != refGV.WithKind(ref.Kind) {
+								controllers[ref.Name] = refGV.WithKind(controllerPriority(controllers[ref.Name].Kind, ref.Kind))
+							}
+							delete(controllers, controllerName)
+						}
 					}
 				}
 			}
 		}
-		if ctype == kubernetes.ReplicationControllerType {
+		if controllerGVK == kubernetes.ReplicationControllers {
 			found := false
 			iFound := -1
 			for i, rc := range repcon {
-				if rc.Name == cname {
+				if rc.Name == controllerName {
 					iFound = i
 					found = true
 					break
@@ -769,25 +1088,30 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 			}
 			if found && len(repcon[iFound].OwnerReferences) > 0 {
 				for _, ref := range repcon[iFound].OwnerReferences {
+					refGV, err := schema.ParseGroupVersion(ref.APIVersion)
+					if err != nil {
+						log.Errorf("could not parse OwnerReference api version %q: %v", ref.APIVersion, err)
+						continue
+					}
 					if ref.Controller != nil && *ref.Controller {
 						// Delete the child ReplicationController and add the parent controller
 						if _, exist := controllers[ref.Name]; !exist {
-							controllers[ref.Name] = ref.Kind
+							controllers[ref.Name] = refGV.WithKind(ref.Kind)
 						} else {
-							if controllers[ref.Name] != ref.Kind {
-								controllers[ref.Name] = controllerPriority(controllers[ref.Name], ref.Kind)
+							if controllers[ref.Name] != refGV.WithKind(ref.Kind) {
+								controllers[ref.Name] = refGV.WithKind(controllerPriority(controllers[ref.Name].Kind, ref.Kind))
 							}
 						}
-						delete(controllers, cname)
+						delete(controllers, controllerName)
 					}
 				}
 			}
 		}
-		if ctype == kubernetes.JobType {
+		if controllerGVK == kubernetes.Jobs {
 			found := false
 			iFound := -1
 			for i, jb := range jbs {
-				if jb.Name == cname {
+				if jb.Name == controllerName {
 					iFound = i
 					found = true
 					break
@@ -795,13 +1119,18 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 			}
 			if found && len(jbs[iFound].OwnerReferences) > 0 {
 				for _, ref := range jbs[iFound].OwnerReferences {
+					refGV, err := schema.ParseGroupVersion(ref.APIVersion)
+					if err != nil {
+						log.Errorf("could not parse OwnerReference api version %q: %v", ref.APIVersion, err)
+						continue
+					}
 					if ref.Controller != nil && *ref.Controller {
 						// Delete the child Job and add the parent controller
 						if _, exist := controllers[ref.Name]; !exist {
-							controllers[ref.Name] = ref.Kind
+							controllers[ref.Name] = refGV.WithKind(ref.Kind)
 						} else {
-							if controllers[ref.Name] != ref.Kind {
-								controllers[ref.Name] = controllerPriority(controllers[ref.Name], ref.Kind)
+							if controllers[ref.Name] != refGV.WithKind(ref.Kind) {
+								controllers[ref.Name] = refGV.WithKind(controllerPriority(controllers[ref.Name].Kind, ref.Kind))
 							}
 						}
 						// Jobs are special as deleting CronJob parent doesn't delete children
@@ -814,7 +1143,7 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 							}
 						}
 						if cnExist {
-							delete(controllers, cname)
+							delete(controllers, controllerName)
 						}
 					}
 				}
@@ -837,7 +1166,7 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 			selectorCheck = selector.Matches(labels.Set(d.Spec.Template.Labels))
 		}
 		if _, exist := controllers[d.Name]; !exist && selectorCheck {
-			controllers[d.Name] = "Deployment"
+			controllers[d.Name] = kubernetes.Deployments
 		}
 	}
 	for _, rs := range repset {
@@ -846,7 +1175,7 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 			selectorCheck = selector.Matches(labels.Set(rs.Spec.Template.Labels))
 		}
 		if _, exist := controllers[rs.Name]; !exist && len(rs.OwnerReferences) == 0 && selectorCheck {
-			controllers[rs.Name] = "ReplicaSet"
+			controllers[rs.Name] = kubernetes.ReplicaSets
 		}
 	}
 	for _, dc := range depcon {
@@ -855,7 +1184,7 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 			selectorCheck = selector.Matches(labels.Set(dc.Spec.Template.Labels))
 		}
 		if _, exist := controllers[dc.Name]; !exist && selectorCheck {
-			controllers[dc.Name] = "DeploymentConfig"
+			controllers[dc.Name] = kubernetes.DeploymentConfigs
 		}
 	}
 	for _, rc := range repcon {
@@ -864,7 +1193,7 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 			selectorCheck = selector.Matches(labels.Set(rc.Spec.Template.Labels))
 		}
 		if _, exist := controllers[rc.Name]; !exist && len(rc.OwnerReferences) == 0 && selectorCheck {
-			controllers[rc.Name] = "ReplicationController"
+			controllers[rc.Name] = kubernetes.ReplicationControllers
 		}
 	}
 	for _, fs := range fulset {
@@ -873,7 +1202,7 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 			selectorCheck = selector.Matches(labels.Set(fs.Spec.Template.Labels))
 		}
 		if _, exist := controllers[fs.Name]; !exist && selectorCheck {
-			controllers[fs.Name] = "StatefulSet"
+			controllers[fs.Name] = kubernetes.StatefulSets
 		}
 	}
 	for _, ds := range daeset {
@@ -882,30 +1211,32 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 			selectorCheck = selector.Matches(labels.Set(ds.Spec.Template.Labels))
 		}
 		if _, exist := controllers[ds.Name]; !exist && selectorCheck {
-			controllers[ds.Name] = "DaemonSet"
+			controllers[ds.Name] = kubernetes.DaemonSets
 		}
 	}
 
 	// Build workloads from controllers
-	var cnames []string
+	var controllerNames []string
 	for k := range controllers {
-		cnames = append(cnames, k)
+		controllerNames = append(controllerNames, k)
 	}
-	sort.Strings(cnames)
-	for _, cname := range cnames {
+	sort.Strings(controllerNames)
+	for _, controllerName := range controllerNames {
 		w := &models.Workload{
 			Pods:     models.Pods{},
 			Services: []models.ServiceOverview{},
 		}
-		ctype := controllers[cname]
+		w.Cluster = cluster
+		w.Namespace = namespace
+		controllerGVK := controllers[controllerName]
 		// Flag to add a controller if it is found
 		cnFound := true
-		switch ctype {
-		case kubernetes.DeploymentType:
+		switch controllerGVK {
+		case kubernetes.Deployments:
 			found := false
 			iFound := -1
 			for i, dp := range dep {
-				if dp.Name == cname {
+				if dp.Name == controllerName {
 					found = true
 					iFound = i
 					break
@@ -913,17 +1244,17 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 			}
 			if found {
 				selector := labels.Set(dep[iFound].Spec.Template.Labels).AsSelector()
-				w.SetPods(kubernetes.FilterPodsForSelector(selector, pods))
+				w.SetPods(kubernetes.FilterPodsBySelector(selector, pods))
 				w.ParseDeployment(&dep[iFound])
 			} else {
-				log.Errorf("Workload %s is not found as Deployment", cname)
+				log.Errorf("Workload %s is not found as Deployment", controllerName)
 				cnFound = false
 			}
-		case kubernetes.ReplicaSetType:
+		case kubernetes.ReplicaSets:
 			found := false
 			iFound := -1
 			for i, rs := range repset {
-				if rs.Name == cname {
+				if rs.Name == controllerName {
 					found = true
 					iFound = i
 					break
@@ -931,17 +1262,17 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 			}
 			if found {
 				selector := labels.Set(repset[iFound].Spec.Template.Labels).AsSelector()
-				w.SetPods(kubernetes.FilterPodsForSelector(selector, pods))
+				w.SetPods(kubernetes.FilterPodsBySelector(selector, pods))
 				w.ParseReplicaSet(&repset[iFound])
 			} else {
-				log.Errorf("Workload %s is not found as ReplicaSet", cname)
+				log.Errorf("Workload %s is not found as ReplicaSet", controllerName)
 				cnFound = false
 			}
-		case kubernetes.ReplicationControllerType:
+		case kubernetes.ReplicationControllers:
 			found := false
 			iFound := -1
 			for i, rc := range repcon {
-				if rc.Name == cname {
+				if rc.Name == controllerName {
 					found = true
 					iFound = i
 					break
@@ -949,17 +1280,17 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 			}
 			if found {
 				selector := labels.Set(repcon[iFound].Spec.Template.Labels).AsSelector()
-				w.SetPods(kubernetes.FilterPodsForSelector(selector, pods))
+				w.SetPods(kubernetes.FilterPodsBySelector(selector, pods))
 				w.ParseReplicationController(&repcon[iFound])
 			} else {
-				log.Errorf("Workload %s is not found as ReplicationController", cname)
+				log.Errorf("Workload %s is not found as ReplicationController", controllerName)
 				cnFound = false
 			}
-		case kubernetes.DeploymentConfigType:
+		case kubernetes.DeploymentConfigs:
 			found := false
 			iFound := -1
 			for i, dc := range depcon {
-				if dc.Name == cname {
+				if dc.Name == controllerName {
 					found = true
 					iFound = i
 					break
@@ -967,17 +1298,17 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 			}
 			if found {
 				selector := labels.Set(depcon[iFound].Spec.Template.Labels).AsSelector()
-				w.SetPods(kubernetes.FilterPodsForSelector(selector, pods))
+				w.SetPods(kubernetes.FilterPodsBySelector(selector, pods))
 				w.ParseDeploymentConfig(&depcon[iFound])
 			} else {
-				log.Errorf("Workload %s is not found as DeploymentConfig", cname)
+				log.Errorf("Workload %s is not found as DeploymentConfig", controllerName)
 				cnFound = false
 			}
-		case kubernetes.StatefulSetType:
+		case kubernetes.StatefulSets:
 			found := false
 			iFound := -1
 			for i, fs := range fulset {
-				if fs.Name == cname {
+				if fs.Name == controllerName {
 					found = true
 					iFound = i
 					break
@@ -985,17 +1316,17 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 			}
 			if found {
 				selector := labels.Set(fulset[iFound].Spec.Template.Labels).AsSelector()
-				w.SetPods(kubernetes.FilterPodsForSelector(selector, pods))
+				w.SetPods(kubernetes.FilterPodsBySelector(selector, pods))
 				w.ParseStatefulSet(&fulset[iFound])
 			} else {
-				log.Errorf("Workload %s is not found as StatefulSet", cname)
+				log.Errorf("Workload %s is not found as StatefulSet", controllerName)
 				cnFound = false
 			}
-		case kubernetes.PodType:
+		case kubernetes.Pods:
 			found := false
 			iFound := -1
 			for i, pod := range pods {
-				if pod.Name == cname {
+				if pod.Name == controllerName {
 					found = true
 					iFound = i
 					break
@@ -1005,14 +1336,14 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 				w.SetPods([]core_v1.Pod{pods[iFound]})
 				w.ParsePod(&pods[iFound])
 			} else {
-				log.Errorf("Workload %s is not found as Pod", cname)
+				log.Errorf("Workload %s is not found as Pod", controllerName)
 				cnFound = false
 			}
-		case kubernetes.JobType:
+		case kubernetes.Jobs:
 			found := false
 			iFound := -1
 			for i, jb := range jbs {
-				if jb.Name == cname {
+				if jb.Name == controllerName {
 					found = true
 					iFound = i
 					break
@@ -1020,17 +1351,17 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 			}
 			if found {
 				selector := labels.Set(jbs[iFound].Spec.Template.Labels).AsSelector()
-				w.SetPods(kubernetes.FilterPodsForSelector(selector, pods))
+				w.SetPods(kubernetes.FilterPodsBySelector(selector, pods))
 				w.ParseJob(&jbs[iFound])
 			} else {
-				log.Errorf("Workload %s is not found as Job", cname)
+				log.Errorf("Workload %s is not found as Job", controllerName)
 				cnFound = false
 			}
-		case kubernetes.CronJobType:
+		case kubernetes.CronJobs:
 			found := false
 			iFound := -1
 			for i, cjb := range conjbs {
-				if cjb.Name == cname {
+				if cjb.Name == controllerName {
 					found = true
 					iFound = i
 					break
@@ -1038,17 +1369,17 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 			}
 			if found {
 				selector := labels.Set(conjbs[iFound].Spec.JobTemplate.Spec.Template.Labels).AsSelector()
-				w.SetPods(kubernetes.FilterPodsForSelector(selector, pods))
+				w.SetPods(kubernetes.FilterPodsBySelector(selector, pods))
 				w.ParseCronJob(&conjbs[iFound])
 			} else {
-				log.Warningf("Workload %s is not found as CronJob (CronJob could be deleted but children are still in the namespace)", cname)
+				log.Warningf("Workload %s is not found as CronJob (CronJob could be deleted but children are still in the namespace)", controllerName)
 				cnFound = false
 			}
-		case kubernetes.DaemonSetType:
+		case kubernetes.DaemonSets:
 			found := false
 			iFound := -1
 			for i, ds := range daeset {
-				if ds.Name == cname {
+				if ds.Name == controllerName {
 					found = true
 					iFound = i
 					break
@@ -1056,44 +1387,53 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 			}
 			if found {
 				selector := labels.Set(daeset[iFound].Spec.Template.Labels).AsSelector()
-				w.SetPods(kubernetes.FilterPodsForSelector(selector, pods))
+				w.SetPods(kubernetes.FilterPodsBySelector(selector, pods))
 				w.ParseDaemonSet(&daeset[iFound])
 			} else {
-				log.Errorf("Workload %s is not found as Deployment", cname)
+				log.Errorf("Workload %s is not found as DaemonSet", controllerName)
 				cnFound = false
 			}
-		default:
-			// ReplicaSet should be used to link Pods with a custom controller type i.e. Argo Rollout
-			cPods := kubernetes.FilterPodsForController(cname, kubernetes.ReplicaSetType, pods)
-			if len(cPods) == 0 {
-				// If no pods we're found for a ReplicaSet type, it's possible the controller
-				// is managing the pods itself i.e. the pod's have an owner ref directly to the controller type.
-				cPods = kubernetes.FilterPodsForController(cname, ctype, pods)
-			}
-			w.SetPods(cPods)
-
-			rsParsed := false
-			for _, rs := range repset {
-				if strings.HasPrefix(rs.Name, cname) {
-					w.ParseReplicaSetParent(&rs, cname, ctype)
-					rsParsed = true
+		case kubernetes.WorkloadGroups:
+			found := false
+			iFound := -1
+			for i, wgroup := range wgroups {
+				if wgroup.Name == controllerName {
+					found = true
+					iFound = i
 					break
 				}
 			}
-			if !rsParsed {
-				log.Debugf("Workload %s of type %s has not a ReplicaSet as a child controller, it may need a revisit", cname, ctype)
-				w.ParsePods(cname, ctype, cPods)
+			if found {
+				if wgroups[iFound].Spec.Metadata != nil {
+					selector := labels.Set(wgroups[iFound].Spec.Metadata.Labels).AsSelector()
+					w.ParseWorkloadGroup(wgroups[iFound], kubernetes.FilterWorkloadEntriesBySelector(selector, wentries), kubernetes.FilterSidecarsBySelector(selector.String(), sidecars))
+				} else {
+					w.ParseWorkloadGroup(wgroups[iFound], []*networking_v1.WorkloadEntry{}, []*networking_v1.Sidecar{})
+				}
+			} else {
+				log.Errorf("Workload %s is not found as WorkloadGroup", controllerName)
+				cnFound = false
 			}
+		default:
+			// This covers the scenario of a custom controller without replicaset, controlling pods directly.
+			// Note that a custom controller with replicaset(s) will return the replicaset(s) as the workloads.
+			var cPods []core_v1.Pod
+			cPods = kubernetes.FilterPodsByController(controllerName, controllerGVK, pods)
+			if len(cPods) > 0 {
+				w.ParsePods(controllerName, controllerGVK, cPods)
+				log.Debugf("Workload %s of type %s has no ReplicaSet as a child controller (this may be ok, but is unusual)", controllerName, controllerGVK)
+			}
+			w.SetPods(cPods)
 		}
 
 		// Add the Proxy Status to the workload
 		for _, pod := range w.Pods {
-			if pod.HasIstioSidecar() {
-				ps, err := layer.ProxyStatus.GetPodProxyStatus(namespace, pod.Name)
-				if err != nil {
-					log.Warningf("GetPodProxyStatus is failing for [namespace: %s] [pod: %s]: %s ", namespace, pod.Name, err.Error())
-				}
-				pod.ProxyStatus = castProxyStatus(ps)
+			if config.Get().ExternalServices.Istio.IstioAPIEnabled && (pod.HasIstioSidecar() || w.IsWaypoint()) {
+				pod.ProxyStatus = in.businessLayer.ProxyStatus.GetPodProxyStatus(cluster, namespace, pod.Name, !w.IsWaypoint())
+			}
+			// Add the Proxy Status to the workload
+			if pod.AmbientEnabled() {
+				w.WaypointWorkloads = in.GetWaypointsForWorkload(ctx, *w)
 			}
 		}
 
@@ -1104,7 +1444,7 @@ func fetchWorkloads(layer *Layer, namespace string, labelSelector string) (model
 	return ws, nil
 }
 
-func fetchWorkload(layer *Layer, namespace string, workloadName string, workloadType string) (*models.Workload, error) {
+func (in *WorkloadService) fetchWorkload(ctx context.Context, criteria WorkloadCriteria) (*models.Workload, error) {
 	var pods []core_v1.Pod
 	var repcon []core_v1.ReplicationController
 	var dep *apps_v1.Deployment
@@ -1112,184 +1452,255 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 	var depcon *osapps_v1.DeploymentConfig
 	var fulset *apps_v1.StatefulSet
 	var jbs []batch_v1.Job
-	var conjbs []batch_v1beta1.CronJob
+	var conjbs []batch_v1.CronJob
 	var ds *apps_v1.DaemonSet
+	var wgroup *networking_v1.WorkloadGroup
+	var wentries []*networking_v1.WorkloadEntry
+	var sidecars []*networking_v1.Sidecar
 
 	wl := &models.Workload{
+		WorkloadListItem: models.WorkloadListItem{
+			Cluster:   criteria.Cluster,
+			Namespace: criteria.Namespace,
+		},
 		Pods:              models.Pods{},
 		Services:          []models.ServiceOverview{},
 		Runtimes:          []models.Runtime{},
 		AdditionalDetails: []models.AdditionalItem{},
+		Health:            *models.EmptyWorkloadHealth(),
 	}
 
 	// Check if user has access to the namespace (RBAC) in cache scenarios and/or
 	// if namespace is accessible from Kiali (Deployment.AccessibleNamespaces)
-	if _, err := layer.Namespace.GetNamespace(namespace); err != nil {
+	if _, err := in.businessLayer.Namespace.GetClusterNamespace(ctx, criteria.Namespace, criteria.Cluster); err != nil {
 		return nil, err
 	}
 
 	// Flag used for custom controllers
 	// i.e. a third party framework creates its own "Deployment" controller with extra features
 	// on this case, Kiali will collect basic info from the ReplicaSet controller
-	_, knownWorkloadType := controllerOrder[workloadType]
+	_, knownWorkloadType := controllerOrder[criteria.WorkloadGVK.Kind]
 
 	wg := sync.WaitGroup{}
-	wg.Add(9)
-	errChan := make(chan error, 9)
+	wg.Add(12)
+	errChan := make(chan error, 12)
+
+	kialiCache, err := in.cache.GetKubeCache(criteria.Cluster)
+	if err != nil {
+		return nil, err
+	}
+
+	// we've already established the user has access to the namespace; use SA client to obtain namespace resource info
+	client, ok := in.kialiSAClients[criteria.Cluster]
+	if !ok {
+		return nil, fmt.Errorf("no SA client for cluster [%s]", criteria.Cluster)
+	}
 
 	// Pods are always fetched for all workload types
 	go func() {
 		defer wg.Done()
 		var err error
-		// Check if namespace is cached
-		// Namespace access is checked in the upper call
-		if IsNamespaceCached(namespace) {
-			pods, err = kialiCache.GetPods(namespace, "")
-		} else {
-			pods, err = layer.k8s.GetPods(namespace, "")
-		}
+		pods, err = kialiCache.GetPods(criteria.Namespace, "")
 		if err != nil {
-			log.Errorf("Error fetching Pods per namespace %s: %s", namespace, err)
+			log.Errorf("Error fetching Pods per namespace %s: %s", criteria.Namespace, err)
 			errChan <- err
 		}
 	}()
 
+	// fetch as WorkloadGroup when workloadType is WorkloadGroups or unspecified
 	go func() {
 		defer wg.Done()
 		var err error
-		// Check if workloadType is passed
-		if workloadType != "" && workloadType != kubernetes.DeploymentType {
+
+		if criteria.WorkloadGVK.Kind != "" && criteria.WorkloadGVK != kubernetes.WorkloadGroups {
 			return
 		}
-		// Check if namespace is cached
-		// Namespace access is checked in the upper call
-		if IsNamespaceCached(namespace) {
-			dep, err = kialiCache.GetDeployment(namespace, workloadName)
-		} else {
-			dep, err = layer.k8s.GetDeployment(namespace, workloadName)
+		wgroup, err = kialiCache.GetWorkloadGroup(criteria.Namespace, criteria.WorkloadName)
+		if err != nil {
+			if errors.IsNotFound(err) {
+				wgroup = nil
+			} else {
+				log.Errorf("Error fetching WorkloadGroup per namespace %s and name %s: %s", criteria.Namespace, criteria.WorkloadName, err)
+				errChan <- err
+			}
 		}
+	}()
+
+	// fetch as WorkloadEntries when workloadType is WorkloadGroups or unspecified
+	go func() {
+		defer wg.Done()
+		var err error
+
+		if criteria.WorkloadGVK.Kind != "" && criteria.WorkloadGVK != kubernetes.WorkloadGroups {
+			return
+		}
+		wentries, err = kialiCache.GetWorkloadEntries(criteria.Namespace, "")
+		if err != nil {
+			if errors.IsNotFound(err) {
+				wentries = nil
+			} else {
+				log.Errorf("Error fetching WorkloadEntry per namespace %s: %s", criteria.Namespace, err)
+				errChan <- err
+			}
+		}
+	}()
+
+	// fetch as Sidecars when workloadType is WorkloadGroups or unspecified
+	go func() {
+		defer wg.Done()
+		var err error
+
+		if criteria.WorkloadGVK.Kind != "" && criteria.WorkloadGVK != kubernetes.WorkloadGroups {
+			return
+		}
+		sidecars, err = kialiCache.GetSidecars(criteria.Namespace, "")
+		if err != nil {
+			if errors.IsNotFound(err) {
+				sidecars = nil
+			} else {
+				log.Errorf("Error fetching Sidecars per namespace %s: %s", criteria.Namespace, err)
+				errChan <- err
+			}
+		}
+	}()
+
+	// fetch as Deployment when workloadType is Deployment or unspecified
+	go func() {
+		defer wg.Done()
+		var err error
+
+		if criteria.WorkloadGVK.Kind != "" && criteria.WorkloadGVK != kubernetes.Deployments {
+			return
+		}
+		dep, err = kialiCache.GetDeployment(criteria.Namespace, criteria.WorkloadName)
 		if err != nil {
 			if errors.IsNotFound(err) {
 				dep = nil
 			} else {
-				log.Errorf("Error fetching Deployment per namespace %s and name %s: %s", namespace, workloadName, err)
+				log.Errorf("Error fetching Deployment per namespace %s and name %s: %s", criteria.Namespace, criteria.WorkloadName, err)
 				errChan <- err
 			}
 		}
 	}()
 
+	// fetch as ReplicaSet(s) when workloadType is ReplicaSet, unspecified, *or custom*
 	go func() {
 		defer wg.Done()
-		// Check if workloadType is passed
-		// Unknown workload type will fetch ReplicaSet list
-		if workloadType != "" && workloadType != kubernetes.ReplicaSetType && knownWorkloadType {
+
+		if criteria.WorkloadGVK.Kind != "" && criteria.WorkloadGVK != kubernetes.ReplicaSets && knownWorkloadType {
 			return
 		}
 		var err error
-		// Check if namespace is cached
-		// Namespace access is checked in the upper call
-		if IsNamespaceCached(namespace) {
-			repset, err = kialiCache.GetReplicaSets(namespace)
-		} else {
-			repset, err = layer.k8s.GetReplicaSets(namespace)
-		}
+		repset, err = kialiCache.GetReplicaSets(criteria.Namespace)
 		if err != nil {
-			log.Errorf("Error fetching ReplicaSets per namespace %s: %s", namespace, err)
+			log.Errorf("Error fetching ReplicaSets per namespace %s: %s", criteria.Namespace, err)
 			errChan <- err
 		}
 	}()
 
+	// fetch as ReplicationControllerType when included, and workloadType is ReplicationControllerType or unspecified
 	go func() {
 		defer wg.Done()
-		// Check if workloadType is passed
-		if workloadType != "" && workloadType != kubernetes.ReplicationControllerType {
+
+		if criteria.WorkloadGVK.Kind != "" && criteria.WorkloadGVK != kubernetes.ReplicationControllers {
 			return
 		}
+
 		var err error
-		if isWorkloadIncluded(kubernetes.ReplicationControllerType) {
-			repcon, err = layer.k8s.GetReplicationControllers(namespace)
+		if in.isWorkloadIncluded(kubernetes.ReplicationControllerType) {
+			// No cache for ReplicationControllers
+			repcon, err = client.GetReplicationControllers(criteria.Namespace)
 			if err != nil {
-				log.Errorf("Error fetching GetReplicationControllers per namespace %s: %s", namespace, err)
+				log.Errorf("Error fetching GetReplicationControllers per namespace %s: %s", criteria.Namespace, err)
 				errChan <- err
 			}
 		}
 	}()
 
+	// fetch as DeploymentConfigType when included, and workloadType is DeploymentConfigType or unspecified
 	go func() {
 		defer wg.Done()
-		// Check if workloadType is passed
-		if workloadType != "" && workloadType != kubernetes.DeploymentConfigType {
+
+		if criteria.WorkloadGVK.Kind != "" && criteria.WorkloadGVK != kubernetes.DeploymentConfigs {
 			return
 		}
+
 		var err error
-		if layer.k8s.IsOpenShift() && isWorkloadIncluded(kubernetes.DeploymentConfigType) {
-			depcon, err = layer.k8s.GetDeploymentConfig(namespace, workloadName)
+		if client.IsOpenShift() && in.isWorkloadIncluded(kubernetes.DeploymentConfigType) {
+			// No cache for deploymentConfigs
+			depcon, err = client.GetDeploymentConfig(ctx, criteria.Namespace, criteria.WorkloadName)
 			if err != nil {
 				depcon = nil
 			}
 		}
 	}()
 
+	// fetch as StatefulSetType when included, and workloadType is StatefulSetType or unspecified
 	go func() {
 		defer wg.Done()
-		// Check if workloadType is passed
-		if workloadType != "" && workloadType != kubernetes.StatefulSetType {
+
+		if criteria.WorkloadGVK.Kind != "" && criteria.WorkloadGVK != kubernetes.StatefulSets {
 			return
 		}
+
 		var err error
-		if isWorkloadIncluded(kubernetes.StatefulSetType) {
-			if IsNamespaceCached(namespace) {
-				fulset, err = kialiCache.GetStatefulSet(namespace, workloadName)
-			} else {
-				fulset, err = layer.k8s.GetStatefulSet(namespace, workloadName)
-			}
+		if in.isWorkloadIncluded(kubernetes.StatefulSetType) {
+			fulset, err = kialiCache.GetStatefulSet(criteria.Namespace, criteria.WorkloadName)
 			if err != nil {
 				fulset = nil
 			}
 		}
 	}()
 
+	// fetch as CronJobType when included, and workloadType is CronJobType or unspecified
 	go func() {
 		defer wg.Done()
-		// Check if workloadType is passed
-		if workloadType != "" && workloadType != kubernetes.CronJobType {
+
+		if criteria.WorkloadGVK.Kind != "" && criteria.WorkloadGVK != kubernetes.CronJobs {
 			return
 		}
+
 		var err error
-		if isWorkloadIncluded(kubernetes.CronJobType) {
-			conjbs, err = layer.k8s.GetCronJobs(namespace)
+		if in.isWorkloadIncluded(kubernetes.CronJobType) {
+			// No cache for CronJobs
+			conjbs, err = client.GetCronJobs(criteria.Namespace)
 			if err != nil {
-				log.Errorf("Error fetching CronJobs per namespace %s: %s", namespace, err)
+				log.Errorf("Error fetching CronJobs per namespace %s: %s", criteria.Namespace, err)
 				errChan <- err
 			}
 		}
 	}()
 
+	// fetch as JobType when included, and workloadType is JobType or unspecified
 	go func() {
 		defer wg.Done()
-		// Check if workloadType is passed
-		if workloadType != "" && workloadType != kubernetes.JobType {
+
+		if criteria.WorkloadGVK.Kind != "" && criteria.WorkloadGVK != kubernetes.Jobs {
 			return
 		}
+
 		var err error
-		if isWorkloadIncluded(kubernetes.JobType) {
-			jbs, err = layer.k8s.GetJobs(namespace)
+		if in.isWorkloadIncluded(kubernetes.JobType) {
+			// No cache for Jobs
+			jbs, err = client.GetJobs(criteria.Namespace)
 			if err != nil {
-				log.Errorf("Error fetching Jobs per namespace %s: %s", namespace, err)
+				log.Errorf("Error fetching Jobs per namespace %s: %s", criteria.Namespace, err)
 				errChan <- err
 			}
 		}
 	}()
 
+	// fetch as DaemonSetType when included, and workloadType is DaemonSetType or unspecified
 	go func() {
 		defer wg.Done()
-		// Check if workloadType is passed
-		if workloadType != "" && workloadType != kubernetes.DaemonSetType {
+
+		if criteria.WorkloadGVK.Kind != "" && criteria.WorkloadGVK != kubernetes.DaemonSets {
 			return
 		}
+
 		var err error
-		if isWorkloadIncluded(kubernetes.DaemonSetType) {
-			ds, err = layer.k8s.GetDaemonSet(namespace, workloadName)
+		if in.isWorkloadIncluded(kubernetes.DaemonSetType) {
+			ds, err = kialiCache.GetDaemonSet(criteria.Namespace, criteria.WorkloadName)
 			if err != nil {
 				ds = nil
 			}
@@ -1302,19 +1713,24 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 		return wl, err
 	}
 
-	// Key: name of controller; Value: type of controller
-	controllers := map[string]string{}
+	// Key: name of controller; Value: GVK of controller
+	controllers := map[string]schema.GroupVersionKind{}
 
 	// Find controllers from pods
 	for _, pod := range pods {
 		if len(pod.OwnerReferences) != 0 {
 			for _, ref := range pod.OwnerReferences {
-				if ref.Controller != nil && *ref.Controller {
+				refGV, err := schema.ParseGroupVersion(ref.APIVersion)
+				if err != nil {
+					log.Errorf("could not parse OwnerReference api version %q: %v", ref.APIVersion, err)
+					continue
+				}
+				if ref.Controller != nil && *ref.Controller && in.isWorkloadIncluded(ref.Kind) {
 					if _, exist := controllers[ref.Name]; !exist {
-						controllers[ref.Name] = ref.Kind
+						controllers[ref.Name] = refGV.WithKind(ref.Kind)
 					} else {
-						if controllers[ref.Name] != ref.Kind {
-							controllers[ref.Name] = controllerPriority(controllers[ref.Name], ref.Kind)
+						if controllers[ref.Name] != refGV.WithKind(ref.Kind) {
+							controllers[ref.Name] = refGV.WithKind(controllerPriority(controllers[ref.Name].String(), ref.Kind))
 						}
 					}
 				}
@@ -1322,20 +1738,27 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 		} else {
 			if _, exist := controllers[pod.Name]; !exist {
 				// Pod without controller
-				controllers[pod.Name] = "Pod"
+				controllers[pod.Name] = kubernetes.Pods
 			}
+		}
+	}
+
+	// Find controllers from WorkloadGroups
+	if wgroup != nil {
+		if _, exist := controllers[wgroup.Name]; !exist {
+			controllers[wgroup.Name] = kubernetes.WorkloadGroups
 		}
 	}
 
 	// Resolve ReplicaSets from Deployments
 	// Resolve ReplicationControllers from DeploymentConfigs
 	// Resolve Jobs from CronJobs
-	for cname, ctype := range controllers {
-		if ctype == kubernetes.ReplicaSetType {
+	for controllerName, controllerGVK := range controllers {
+		if controllerGVK == kubernetes.ReplicaSets {
 			found := false
 			iFound := -1
 			for i, rs := range repset {
-				if rs.Name == cname {
+				if rs.Name == controllerName {
 					iFound = i
 					found = true
 					break
@@ -1343,25 +1766,36 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 			}
 			if found && len(repset[iFound].OwnerReferences) > 0 {
 				for _, ref := range repset[iFound].OwnerReferences {
+					refGV, err := schema.ParseGroupVersion(ref.APIVersion)
+					if err != nil {
+						log.Errorf("could not parse OwnerReference api version %q: %v", ref.APIVersion, err)
+						continue
+					}
 					if ref.Controller != nil && *ref.Controller {
-						// Delete the child ReplicaSet and add the parent controller
+						// For valid owner controllers, delete the child ReplicaSet and add the parent controller,
+						// otherwise (for custom controllers), defer to the replica set.
 						if _, exist := controllers[ref.Name]; !exist {
-							controllers[ref.Name] = ref.Kind
-						} else {
-							if controllers[ref.Name] != ref.Kind {
-								controllers[ref.Name] = controllerPriority(controllers[ref.Name], ref.Kind)
+							if in.isWorkloadValid(ref.Kind) {
+								controllers[ref.Name] = refGV.WithKind(ref.Kind)
+								delete(controllers, controllerName)
+							} else {
+								log.Debugf("Use ReplicaSet as workload for custom controller [%s][%s]", ref.Name, ref.Kind)
 							}
+						} else {
+							if controllers[ref.Name] != refGV.WithKind(ref.Kind) {
+								controllers[ref.Name] = refGV.WithKind(controllerPriority(controllers[ref.Name].Kind, ref.Kind))
+							}
+							delete(controllers, controllerName)
 						}
-						delete(controllers, cname)
 					}
 				}
 			}
 		}
-		if ctype == kubernetes.ReplicationControllerType {
+		if controllerGVK == kubernetes.ReplicationControllers {
 			found := false
 			iFound := -1
 			for i, rc := range repcon {
-				if rc.Name == cname {
+				if rc.Name == controllerName {
 					iFound = i
 					found = true
 					break
@@ -1369,25 +1803,30 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 			}
 			if found && len(repcon[iFound].OwnerReferences) > 0 {
 				for _, ref := range repcon[iFound].OwnerReferences {
+					refGV, err := schema.ParseGroupVersion(ref.APIVersion)
+					if err != nil {
+						log.Errorf("could not parse OwnerReference api version %q: %v", ref.APIVersion, err)
+						continue
+					}
 					if ref.Controller != nil && *ref.Controller {
 						// Delete the child ReplicationController and add the parent controller
 						if _, exist := controllers[ref.Name]; !exist {
-							controllers[ref.Name] = ref.Kind
+							controllers[ref.Name] = refGV.WithKind(ref.Kind)
 						} else {
-							if controllers[ref.Name] != ref.Kind {
-								controllers[ref.Name] = controllerPriority(controllers[ref.Name], ref.Kind)
+							if controllers[ref.Name] != refGV.WithKind(ref.Kind) {
+								controllers[ref.Name] = refGV.WithKind(controllerPriority(controllers[ref.Name].String(), ref.Kind))
 							}
 						}
-						delete(controllers, cname)
+						delete(controllers, controllerName)
 					}
 				}
 			}
 		}
-		if ctype == kubernetes.JobType {
+		if controllerGVK == kubernetes.Jobs {
 			found := false
 			iFound := -1
 			for i, jb := range jbs {
-				if jb.Name == cname {
+				if jb.Name == controllerName {
 					iFound = i
 					found = true
 					break
@@ -1395,13 +1834,18 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 			}
 			if found && len(jbs[iFound].OwnerReferences) > 0 {
 				for _, ref := range jbs[iFound].OwnerReferences {
+					refGV, err := schema.ParseGroupVersion(ref.APIVersion)
+					if err != nil {
+						log.Errorf("could not parse OwnerReference api version %q: %v", ref.APIVersion, err)
+						continue
+					}
 					if ref.Controller != nil && *ref.Controller {
 						// Delete the child Job and add the parent controller
 						if _, exist := controllers[ref.Name]; !exist {
-							controllers[ref.Name] = ref.Kind
+							controllers[ref.Name] = refGV.WithKind(ref.Kind)
 						} else {
-							if controllers[ref.Name] != ref.Kind {
-								controllers[ref.Name] = controllerPriority(controllers[ref.Name], ref.Kind)
+							if controllers[ref.Name] != refGV.WithKind(ref.Kind) {
+								controllers[ref.Name] = refGV.WithKind(controllerPriority(controllers[ref.Name].String(), ref.Kind))
 							}
 						}
 						// Jobs are special as deleting CronJob parent doesn't delete children
@@ -1414,7 +1858,7 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 							}
 						}
 						if cnExist {
-							delete(controllers, cname)
+							delete(controllers, controllerName)
 						}
 					}
 				}
@@ -1425,68 +1869,79 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 	// Cornercase, check for controllers without pods, to show them as a workload
 	if dep != nil {
 		if _, exist := controllers[dep.Name]; !exist {
-			controllers[dep.Name] = kubernetes.DeploymentType
+			controllers[dep.Name] = kubernetes.Deployments
 		}
 	}
 	for _, rs := range repset {
 		if _, exist := controllers[rs.Name]; !exist && len(rs.OwnerReferences) == 0 {
-			controllers[rs.Name] = kubernetes.ReplicaSetType
+			controllers[rs.Name] = kubernetes.ReplicaSets
 		}
 	}
 	if depcon != nil {
 		if _, exist := controllers[depcon.Name]; !exist {
-			controllers[depcon.Name] = kubernetes.DeploymentConfigType
+			controllers[depcon.Name] = kubernetes.DeploymentConfigs
 		}
 	}
 	for _, rc := range repcon {
 		if _, exist := controllers[rc.Name]; !exist && len(rc.OwnerReferences) == 0 {
-			controllers[rc.Name] = kubernetes.ReplicationControllerType
+			controllers[rc.Name] = kubernetes.ReplicationControllers
 		}
 	}
 	if fulset != nil {
 		if _, exist := controllers[fulset.Name]; !exist {
-			controllers[fulset.Name] = kubernetes.StatefulSetType
+			controllers[fulset.Name] = kubernetes.StatefulSets
 		}
 	}
 	if ds != nil {
 		if _, exist := controllers[ds.Name]; !exist {
-			controllers[ds.Name] = kubernetes.DaemonSetType
+			controllers[ds.Name] = kubernetes.DaemonSets
 		}
 	}
 
 	// Build workload from controllers
 
-	if _, exist := controllers[workloadName]; exist {
+	if _, exist := controllers[criteria.WorkloadName]; exist {
 		w := models.Workload{
+			WorkloadListItem: models.WorkloadListItem{
+				Cluster:   criteria.Cluster,
+				Namespace: criteria.Namespace,
+			},
 			Pods:              models.Pods{},
 			Services:          []models.ServiceOverview{},
 			Runtimes:          []models.Runtime{},
 			AdditionalDetails: []models.AdditionalItem{},
+			Health:            *models.EmptyWorkloadHealth(),
 		}
-		ctype := controllers[workloadName]
-		// Cornercase -> a controller is found but API is forcing a different workload type
-		// https://github.com/kiali/kiali/issues/3830
-		controllerType := ctype
-		if workloadType != "" && ctype != workloadType {
-			controllerType = workloadType
+
+		// We have a controller with criteria.workloadName but if criteria.WorkloadType is specified and does
+		// not match then we may not yet have fetched the workload definition.
+		// For known types: respect criteria.WorkloadType and return NotFound if necessary.
+		// For custom types: fall through to the default handler and try to get the workload definition working
+		// up from the pods or replicas sets.
+		// see https://github.com/kiali/kiali/issues/3830
+		discoveredControllerGVK := controllers[criteria.WorkloadName]
+		controllerGVK := discoveredControllerGVK
+		if criteria.WorkloadGVK.Kind != "" && discoveredControllerGVK != criteria.WorkloadGVK {
+			controllerGVK = criteria.WorkloadGVK
 		}
-		// Flag to add a controller if it is found
+
+		// Handle the known types...
 		cnFound := true
-		switch controllerType {
-		case kubernetes.DeploymentType:
-			if dep != nil && dep.Name == workloadName {
+		switch controllerGVK {
+		case kubernetes.Deployments:
+			if dep != nil && dep.Name == criteria.WorkloadName {
 				selector := labels.Set(dep.Spec.Template.Labels).AsSelector()
-				w.SetPods(kubernetes.FilterPodsForSelector(selector, pods))
+				w.SetPods(kubernetes.FilterPodsBySelector(selector, pods))
 				w.ParseDeployment(dep)
 			} else {
-				log.Errorf("Workload %s is not found as Deployment", workloadName)
+				log.Errorf("Workload %s is not found as Deployment", criteria.WorkloadName)
 				cnFound = false
 			}
-		case kubernetes.ReplicaSetType:
+		case kubernetes.ReplicaSets:
 			found := false
 			iFound := -1
 			for i, rs := range repset {
-				if rs.Name == workloadName {
+				if rs.Name == criteria.WorkloadName {
 					found = true
 					iFound = i
 					break
@@ -1494,17 +1949,17 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 			}
 			if found {
 				selector := labels.Set(repset[iFound].Spec.Template.Labels).AsSelector()
-				w.SetPods(kubernetes.FilterPodsForSelector(selector, pods))
+				w.SetPods(kubernetes.FilterPodsBySelector(selector, pods))
 				w.ParseReplicaSet(&repset[iFound])
 			} else {
-				log.Errorf("Workload %s is not found as ReplicaSet", workloadName)
+				log.Errorf("Workload %s is not found as ReplicaSet", criteria.WorkloadName)
 				cnFound = false
 			}
-		case kubernetes.ReplicationControllerType:
+		case kubernetes.ReplicationControllers:
 			found := false
 			iFound := -1
 			for i, rc := range repcon {
-				if rc.Name == workloadName {
+				if rc.Name == criteria.WorkloadName {
 					found = true
 					iFound = i
 					break
@@ -1512,35 +1967,35 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 			}
 			if found {
 				selector := labels.Set(repcon[iFound].Spec.Template.Labels).AsSelector()
-				w.SetPods(kubernetes.FilterPodsForSelector(selector, pods))
+				w.SetPods(kubernetes.FilterPodsBySelector(selector, pods))
 				w.ParseReplicationController(&repcon[iFound])
 			} else {
-				log.Errorf("Workload %s is not found as ReplicationController", workloadName)
+				log.Errorf("Workload %s is not found as ReplicationController", criteria.WorkloadName)
 				cnFound = false
 			}
-		case kubernetes.DeploymentConfigType:
-			if depcon != nil && depcon.Name == workloadName {
+		case kubernetes.DeploymentConfigs:
+			if depcon != nil && depcon.Name == criteria.WorkloadName {
 				selector := labels.Set(depcon.Spec.Template.Labels).AsSelector()
-				w.SetPods(kubernetes.FilterPodsForSelector(selector, pods))
+				w.SetPods(kubernetes.FilterPodsBySelector(selector, pods))
 				w.ParseDeploymentConfig(depcon)
 			} else {
-				log.Errorf("Workload %s is not found as DeploymentConfig", workloadName)
+				log.Errorf("Workload %s is not found as DeploymentConfig", criteria.WorkloadName)
 				cnFound = false
 			}
-		case kubernetes.StatefulSetType:
-			if fulset != nil && fulset.Name == workloadName {
+		case kubernetes.StatefulSets:
+			if fulset != nil && fulset.Name == criteria.WorkloadName {
 				selector := labels.Set(fulset.Spec.Template.Labels).AsSelector()
-				w.SetPods(kubernetes.FilterPodsForSelector(selector, pods))
+				w.SetPods(kubernetes.FilterPodsBySelector(selector, pods))
 				w.ParseStatefulSet(fulset)
 			} else {
-				log.Errorf("Workload %s is not found as StatefulSet", workloadName)
+				log.Errorf("Workload %s is not found as StatefulSet", criteria.WorkloadName)
 				cnFound = false
 			}
-		case kubernetes.PodType:
+		case kubernetes.Pods:
 			found := false
 			iFound := -1
 			for i, pod := range pods {
-				if pod.Name == workloadName {
+				if pod.Name == criteria.WorkloadName {
 					found = true
 					iFound = i
 					break
@@ -1550,14 +2005,14 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 				w.SetPods([]core_v1.Pod{pods[iFound]})
 				w.ParsePod(&pods[iFound])
 			} else {
-				log.Errorf("Workload %s is not found as Pod", workloadName)
+				log.Errorf("Workload %s is not found as Pod", criteria.WorkloadName)
 				cnFound = false
 			}
-		case kubernetes.JobType:
+		case kubernetes.Jobs:
 			found := false
 			iFound := -1
 			for i, jb := range jbs {
-				if jb.Name == workloadName {
+				if jb.Name == criteria.WorkloadName {
 					found = true
 					iFound = i
 					break
@@ -1565,17 +2020,17 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 			}
 			if found {
 				selector := labels.Set(jbs[iFound].Spec.Template.Labels).AsSelector()
-				w.SetPods(kubernetes.FilterPodsForSelector(selector, pods))
+				w.SetPods(kubernetes.FilterPodsBySelector(selector, pods))
 				w.ParseJob(&jbs[iFound])
 			} else {
-				log.Errorf("Workload %s is not found as Job", workloadName)
+				log.Errorf("Workload %s is not found as Job", criteria.WorkloadName)
 				cnFound = false
 			}
-		case kubernetes.CronJobType:
+		case kubernetes.CronJobs:
 			found := false
 			iFound := -1
 			for i, cjb := range conjbs {
-				if cjb.Name == workloadName {
+				if cjb.Name == criteria.WorkloadName {
 					found = true
 					iFound = i
 					break
@@ -1583,117 +2038,425 @@ func fetchWorkload(layer *Layer, namespace string, workloadName string, workload
 			}
 			if found {
 				selector := labels.Set(conjbs[iFound].Spec.JobTemplate.Spec.Template.Labels).AsSelector()
-				w.SetPods(kubernetes.FilterPodsForSelector(selector, pods))
+				w.SetPods(kubernetes.FilterPodsBySelector(selector, pods))
 				w.ParseCronJob(&conjbs[iFound])
 			} else {
-				log.Warningf("Workload %s is not found as CronJob (CronJob could be deleted but children are still in the namespace)", workloadName)
+				log.Warningf("Workload %s is not found as CronJob (CronJob could be deleted but children are still in the namespace)", criteria.WorkloadName)
 				cnFound = false
 			}
-		case kubernetes.DaemonSetType:
-			if ds != nil && ds.Name == workloadName {
+		case kubernetes.DaemonSets:
+			if ds != nil && ds.Name == criteria.WorkloadName {
 				selector := labels.Set(ds.Spec.Template.Labels).AsSelector()
-				w.SetPods(kubernetes.FilterPodsForSelector(selector, pods))
+				w.SetPods(kubernetes.FilterPodsBySelector(selector, pods))
 				w.ParseDaemonSet(ds)
 			} else {
-				log.Errorf("Workload %s is not found as DaemonSet", workloadName)
+				log.Errorf("Workload %s is not found as DaemonSet", criteria.WorkloadName)
+				cnFound = false
+			}
+		case kubernetes.WorkloadGroups:
+			if wgroup != nil && wgroup.Name == criteria.WorkloadName {
+				if wgroup.Spec.Metadata != nil {
+					selector := labels.Set(wgroup.Spec.Metadata.Labels).AsSelector()
+					w.ParseWorkloadGroup(wgroup, kubernetes.FilterWorkloadEntriesBySelector(selector, wentries), kubernetes.FilterSidecarsBySelector(selector.String(), sidecars))
+				} else {
+					w.ParseWorkloadGroup(wgroup, []*networking_v1.WorkloadEntry{}, []*networking_v1.Sidecar{})
+				}
+			} else {
+				log.Errorf("Workload %s is not found as WorkloadGroup", criteria.WorkloadName)
 				cnFound = false
 			}
 		default:
-			// ReplicaSet should be used to link Pods with a custom controller type i.e. Argo Rollout
-			// Note, we will use the controller found in the Pod resolution, instead that the passed by parameter
-			// This will cover cornercase for https://github.com/kiali/kiali/issues/3830
-			cPods := kubernetes.FilterPodsForController(workloadName, kubernetes.ReplicaSetType, pods)
-			if len(cPods) == 0 {
-				// If no pods we're found for a ReplicaSet type, it's possible the controller
-				// is managing the pods itself i.e. the pod's have an owner ref directly to the controller type.
-				cPods = kubernetes.FilterPodsForController(workloadName, ctype, pods)
-			}
-			w.SetPods(cPods)
+			// Handle a custom type (criteria.WorkloadType is not a known type).
+			// 1. Custom controller with replicaset
+			// 2. Custom controller without replicaset controlling pods directly
 
-			rsParsed := false
+			// 1. use the controller type found in the Pod resolution and ignore the unknown criteria type
+			var cPods []core_v1.Pod
 			for _, rs := range repset {
-				if strings.HasPrefix(rs.Name, workloadName) {
-					w.ParseReplicaSetParent(&rs, workloadName, ctype)
-					rsParsed = true
-					break
+				if discoveredControllerGVK.Kind == kubernetes.ReplicaSetType && criteria.WorkloadName == rs.Name {
+					w.ParseReplicaSet(&rs)
+				} else {
+					rsOwnerRef := meta_v1.GetControllerOf(&rs.ObjectMeta)
+					if rsOwnerRef != nil && rsOwnerRef.Name == criteria.WorkloadName && rsOwnerRef.Kind == discoveredControllerGVK.Kind {
+						w.ParseReplicaSetParent(&rs, criteria.WorkloadName, discoveredControllerGVK)
+					} else {
+						continue
+					}
+				}
+				for _, pod := range pods {
+					if meta_v1.IsControlledBy(&pod, &rs) {
+						cPods = append(cPods, pod)
+					}
+				}
+				break
+			}
+
+			// 2. If no pods we're found for a ReplicaSet type, it's possible the controller
+			//    is managing the pods itself i.e. the pod's have an owner ref directly to the controller type.
+			if len(cPods) == 0 {
+				cPods = kubernetes.FilterPodsByController(criteria.WorkloadName, discoveredControllerGVK, pods)
+				if len(cPods) > 0 {
+					w.ParsePods(criteria.WorkloadName, discoveredControllerGVK, cPods)
+					log.Debugf("Workload %s of type %s has not a ReplicaSet as a child controller, it may need a revisit", criteria.WorkloadName, discoveredControllerGVK)
 				}
 			}
-			if !rsParsed {
-				log.Debugf("Workload %s of type %s has not a ReplicaSet as a child controller, it may need a revisit", workloadName, ctype)
-				w.ParsePods(workloadName, ctype, cPods)
-			}
+
+			w.SetPods(cPods)
 		}
+
+		w.WorkloadListItem.IsGateway = w.IsGateway()
 
 		// Add the Proxy Status to the workload
 		for _, pod := range w.Pods {
-			if pod.HasIstioSidecar() {
-				ps, err := layer.ProxyStatus.GetPodProxyStatus(namespace, pod.Name)
-				if err != nil {
-					log.Warningf("GetPodProxyStatus is failing for [namespace: %s] [pod: %s]: %s ", namespace, pod.Name, err.Error())
-				}
-				pod.ProxyStatus = castProxyStatus(ps)
+			if config.Get().ExternalServices.Istio.IstioAPIEnabled && (pod.HasIstioSidecar() || w.IsWaypoint()) {
+				pod.ProxyStatus = in.businessLayer.ProxyStatus.GetPodProxyStatus(criteria.Cluster, criteria.Namespace, pod.Name, !w.IsWaypoint())
 			}
+			// If Ambient is enabled for pod, check if has any Waypoint proxy
+			if pod.AmbientEnabled() && criteria.IncludeWaypoints {
+				w.WaypointWorkloads = in.GetWaypointsForWorkload(ctx, w)
+				// TODO: Maybe user doesn't have permissions
+				ztunnelPods := in.cache.GetZtunnelPods(criteria.Cluster)
+				for _, zPod := range ztunnelPods {
+					// There should be a ztunnel pod per node
+					// The information should be the same, but choosing the pod could help to verify the information is synchronized
+					zPodConfig := in.cache.GetZtunnelDump(criteria.Cluster, zPod.Namespace, zPod.Name)
+					if zPodConfig != nil {
+						w.AddPodsProtocol(*zPodConfig)
+					}
+				}
+
+			}
+		}
+
+		// If the pod is a waypoint proxy, check if it is attached to a namespace or to a service account, and get the affected workloads
+		if w.IsWaypoint() && criteria.IncludeWaypoints {
+			w.Ambient = config.Waypoint
+			includeServices := false
+			if w.WaypointFor() == config.WaypointForService || w.WaypointFor() == config.WaypointForAll {
+				includeServices = true
+			}
+			// Get waypoint workloads
+			in.cache.GetWaypointList()
+			waypointWorkloads, waypointServices := in.listWaypointWorkloads(ctx, w.Name, w.Namespace, criteria.Cluster, includeServices)
+			w.WaypointWorkloads = waypointWorkloads
+			if includeServices {
+				w.WaypointServices = waypointServices
+			}
+		}
+		if w.IsZtunnel() {
+			w.Ambient = config.Ztunnel
 		}
 
 		if cnFound {
 			return &w, nil
 		}
 	}
-	return wl, kubernetes.NewNotFound(workloadName, "Kiali", "Workload")
+	return wl, kubernetes.NewNotFound(criteria.WorkloadName, "Kiali", "Workload")
 }
 
-func updateWorkload(layer *Layer, namespace string, workloadName string, workloadType string, jsonPatch string) error {
+func (in *WorkloadService) GetZtunnelConfig(cluster, namespace, pod string) *kubernetes.ZtunnelConfigDump {
+
+	return in.cache.GetZtunnelDump(cluster, namespace, pod)
+
+}
+
+// GetWaypoints: Return the list of workloads when the waypoint proxy is applied per namespace
+func (in *WorkloadService) GetWaypoints(ctx context.Context) models.Workloads {
+	if !in.cache.IsWaypointListExpired() {
+		log.Tracef("GetWaypoints: Returning list from cache")
+		return in.cache.GetWaypointList()
+	}
+
+	labelSelector := fmt.Sprintf("%s=%s", config.WaypointLabel, config.WaypointLabelValue)
+	waypoints := []*models.Workload{}
+
+	for cluster := range in.userClients {
+		nslist, errNs := in.businessLayer.Namespace.GetClusterNamespaces(ctx, cluster)
+		if errNs != nil {
+			log.Errorf("GetWaypoints: Error fetching namespaces for cluster %s. %s", cluster, errNs.Error())
+		}
+
+		for _, ns := range nslist {
+			nsWaypoints, err := in.fetchWorkloadsFromCluster(ctx, cluster, ns.Name, labelSelector)
+			if err != nil {
+				log.Debugf("GetWaypoints: Error fetching workloads for namespace %s, labelSelector %s. %s", ns.Name, labelSelector, err.Error())
+				continue
+			}
+			waypoints = append(waypoints, nsWaypoints...)
+		}
+
+	}
+	in.cache.SetWaypointList(waypoints)
+	return waypoints
+}
+
+// isWorkloadCaptured Check if the pod is captured by a waypoint
+func (in *WorkloadService) isWorkloadCaptured(ctx context.Context, workload models.Workload) ([]models.Waypoint, bool) {
+	found := false
+	waypointNames := make([]models.Waypoint, 0)
+
+	if workload.Labels[config.WaypointUseLabel] == "none" {
+		return waypointNames, found
+	}
+
+	var services []models.ServiceOverview
+	servicesExcluded := false
+
+	// Is the service labeled?
+	if len(workload.Services) == 0 {
+		serviceCriteria := ServiceCriteria{
+			Cluster:                workload.Cluster,
+			Namespace:              workload.Namespace,
+			ServiceSelector:        labels.Set(workload.Labels).String(),
+			IncludeHealth:          false,
+			IncludeOnlyDefinitions: true,
+		}
+		svc, err := in.businessLayer.Svc.GetServiceList(ctx, serviceCriteria)
+		if err != nil {
+			log.Debugf("isWorkloadCaptured: Error fetching services %s", err.Error())
+		}
+		services = svc.Services
+	} else {
+		services = workload.Services
+	}
+	if len(services) > 0 {
+		for _, svc := range services {
+			waypointName, ok := svc.Labels[config.WaypointUseLabel]
+			if ok && waypointName == "none" {
+				servicesExcluded = true
+			} else {
+				waypointNamespace, okNs := svc.Labels[config.WaypointUseNamespaceLabel]
+				// If there is no specific waypoint Namespace label, it is supposed to be the same
+				if !okNs {
+					waypointNamespace = workload.Namespace
+				}
+				if ok {
+					found = true
+					waypointNames = append(waypointNames, models.Waypoint{Name: waypointName, Type: "service", Namespace: waypointNamespace, Cluster: workload.Cluster})
+				}
+			}
+		}
+	}
+
+	// Is the pod labeled?
+	for _, pod := range workload.Pods {
+		waypointName, ok := pod.Labels[config.WaypointUseLabel]
+		waypointNamespace, okNs := pod.Labels[config.WaypointUseNamespaceLabel]
+		if ok {
+			found = true
+			// If there is no specific waypoint Namespace label, it is supposed to be the same
+			if !okNs {
+				waypointNamespace = workload.Namespace
+			}
+			// Ambient doesn't support multicluster (For now), cluster is the same as the workload
+			waypointNames = append(waypointNames, models.Waypoint{Name: waypointName, Type: "pod", Namespace: waypointNamespace, Cluster: workload.Cluster})
+		}
+	}
+
+	// Is the namespace labeled?
+	ns, foundNS := in.cache.GetNamespace(workload.Cluster, in.userClients[workload.Cluster].GetToken(), workload.Namespace)
+
+	if foundNS && !servicesExcluded {
+		waypointName, ok := ns.Labels[config.WaypointUseLabel]
+		waypointNamespace, okNs := ns.Labels[config.WaypointUseNamespaceLabel]
+		// If there is no specific waypoint Namespace label, it is supposed to be the same
+		if !okNs {
+			waypointNamespace = workload.Namespace
+		}
+		if ok {
+			found = true
+			// Ambient doesn't support multicluster (For now), cluster is the same as the workload
+			waypointNames = append(waypointNames, models.Waypoint{Name: waypointName, Type: "namespace", Namespace: waypointNamespace, Cluster: workload.Cluster})
+		}
+	}
+
+	return waypointNames, found
+}
+
+// GetWaypointsForWorkload Returns a list of waypoint proxies that capture a workload
+// It should be related with just one waypoint, but this is up to the user, it can help to detect issues in the Ambient Mesh
+func (in *WorkloadService) GetWaypointsForWorkload(ctx context.Context, workload models.Workload) []models.WorkloadReferenceInfo {
+	var workloadslist []models.WorkloadReferenceInfo
+	workloadsMap := map[string]bool{} // Ensure unique
+
+	if workload.Labels[config.WaypointUseLabel] == "none" {
+		return workloadslist
+	}
+
+	// Get Waypoint list names for the workload
+	waypoints, found := in.isWorkloadCaptured(ctx, workload)
+	if !found {
+		return workloadslist
+	}
+
+	// Then, get workload waypoints
+	for _, waypoint := range waypoints {
+		wkd, err := in.fetchWorkload(ctx, WorkloadCriteria{Cluster: workload.Cluster, Namespace: waypoint.Namespace, WorkloadName: waypoint.Name, WorkloadGVK: schema.GroupVersionKind{}, IncludeWaypoints: false})
+		if err != nil {
+			log.Debugf("GetWaypointsForWorkload: Error fetching workloads %s", err.Error())
+			return nil
+		}
+		key := fmt.Sprintf("%s_%s_%s", workload.Cluster, waypoint.Namespace, waypoint.Name)
+		if wkd != nil && !workloadsMap[key] {
+			workloadslist = append(workloadslist, models.WorkloadReferenceInfo{Name: waypoint.Name, Namespace: waypoint.Namespace, Cluster: waypoint.Cluster, Type: wkd.WaypointFor()})
+			workloadsMap[key] = true
+		}
+	}
+
+	return workloadslist
+}
+
+// listWaypointWorkloads returns the list of workloads when the waypoint proxy is applied per namespace
+// Maybe use some cache?
+func (in *WorkloadService) listWaypointWorkloads(ctx context.Context, name, namespace, cluster string, includeServices bool) ([]models.WorkloadReferenceInfo, []models.ServiceReferenceInfo) {
+	// Get all the workloads for a namespaces labeled
+	labelSelector := fmt.Sprintf("%s=%s", config.WaypointUseLabel, name)
+	nslist, errNs := in.userClients[cluster].GetNamespaces(labelSelector)
+	if errNs != nil {
+		log.Errorf("listWaypointWorkloads: Error fetching namespaces by selector %s", labelSelector)
+	}
+
+	var workloadslist []models.WorkloadReferenceInfo
+	var servicesList []models.ServiceReferenceInfo
+	// This is to verify there is no duplicated services
+	servicesMap := make(map[string]bool)
+
+	// Excluded workloads
+	excludedWk := make(map[string]bool)
+	labelType := "namespace"
+	// Get all the workloads for the namespaces that has the waypoint label
+	for _, ns := range nslist {
+		// If it doesn't have a namespace label, it is the same namespace
+		if ns.Name == namespace || ns.Labels[config.WaypointUseNamespaceLabel] == namespace {
+			workloadList, err := in.fetchWorkloadsFromCluster(ctx, cluster, ns.Name, "")
+			if err != nil {
+				log.Debugf("listWaypointWorkloads: Error fetching workloads for namespace %s", ns.Name)
+			}
+			for _, wk := range workloadList {
+				// This annotation disables other labels (Like the ns one)
+				if wk.Labels[in.config.IstioLabels.AmbientNamespaceLabel] != "none" && wk.Labels[config.WaypointUseLabel] != "none" {
+					workloadslist = append(workloadslist, models.WorkloadReferenceInfo{Name: wk.Name, Namespace: wk.Namespace, Labels: wk.Labels, LabelType: labelType, Cluster: wk.Cluster})
+				} else {
+					excludedWk[wk.Name] = true
+				}
+			}
+		}
+	}
+
+	// Get annotated workloads
+	namespaces, found := in.cache.GetNamespaces(cluster, in.userClients[cluster].GetToken())
+	if found {
+		for _, ns := range namespaces {
+			wlist, err := in.fetchWorkloadsFromCluster(ctx, cluster, ns.Name, labelSelector)
+			if err != nil {
+				log.Debugf("listWaypointWorkloads: Error fetching workloads for namespace label selector %s", labelSelector)
+			}
+			if len(wlist) > 0 {
+				labelType = "workload"
+			}
+			for _, workload := range wlist {
+				// none disables the waypoint enrollment
+				if workload.Labels[config.WaypointUseLabel] != "none" {
+					workloadslist = append(workloadslist, models.WorkloadReferenceInfo{Name: workload.Name, Namespace: workload.Namespace, LabelType: labelType, Labels: workload.Labels, Cluster: workload.Cluster})
+				} else {
+					excludedWk[workload.Name] = true
+				}
+			}
+		}
+	}
+
+	// Should include service if the waypoint-for=service|all
+	if includeServices {
+		// Get the services for the workloads
+		var services *models.ServiceList
+		var err error
+
+		for _, wl := range workloadslist {
+			if !excludedWk[wl.Name] {
+				serviceCriteria := ServiceCriteria{
+					Cluster:                wl.Cluster,
+					Namespace:              wl.Namespace,
+					ServiceSelector:        labels.Set(wl.Labels).String(),
+					IncludeHealth:          false,
+					IncludeOnlyDefinitions: true,
+				}
+				services, err = in.businessLayer.Svc.GetServiceList(ctx, serviceCriteria)
+				if err != nil {
+					log.Infof("Error getting services %s", err.Error())
+				} else {
+					for _, service := range services.Services {
+						key := fmt.Sprintf("%s_%s_%s", service.Name, service.Namespace, service.Cluster)
+						if !servicesMap[key] && service.Labels[config.WaypointUseLabel] != "none" {
+							servicesList = append(servicesList, models.ServiceReferenceInfo{Name: service.Name, Namespace: service.Namespace, LabelType: labelType, Cluster: service.Cluster})
+							servicesMap[key] = true
+						}
+					}
+				}
+			}
+		}
+		// Get annotated services
+		servicesList = append(servicesList, in.businessLayer.Svc.ListWaypointServices(ctx, name, namespace, cluster)...)
+	}
+	return workloadslist, servicesList
+}
+
+func (in *WorkloadService) updateWorkload(ctx context.Context, cluster string, namespace string, workloadName string, workloadGVK schema.GroupVersionKind, jsonPatch string, patchType string) error {
 	// Check if user has access to the namespace (RBAC) in cache scenarios and/or
 	// if namespace is accessible from Kiali (Deployment.AccessibleNamespaces)
-	if _, err := layer.Namespace.GetNamespace(namespace); err != nil {
+	if _, err := in.businessLayer.Namespace.GetClusterNamespace(ctx, namespace, cluster); err != nil {
 		return err
 	}
 
-	workloadTypes := []string{
-		kubernetes.DeploymentType,
-		kubernetes.ReplicaSetType,
-		kubernetes.ReplicationControllerType,
-		kubernetes.DeploymentConfigType,
-		kubernetes.StatefulSetType,
-		kubernetes.JobType,
-		kubernetes.CronJobType,
-		kubernetes.PodType,
-		kubernetes.DaemonSetType,
+	userClient, ok := in.userClients[cluster]
+	if !ok {
+		return fmt.Errorf("user client for cluster [%s] not found", cluster)
 	}
 
-	// workloadType is an optional parameter used to optimize the workload type fetch
+	workloadGVKs := []schema.GroupVersionKind{
+		kubernetes.Deployments,
+		kubernetes.ReplicaSets,
+		kubernetes.ReplicationControllers,
+		kubernetes.DeploymentConfigs,
+		kubernetes.StatefulSets,
+		kubernetes.Jobs,
+		kubernetes.CronJobs,
+		kubernetes.Pods,
+		kubernetes.DaemonSets,
+	}
+
+	// workloadGVK is an optional parameter used to optimize the workload type fetch
 	// By default workloads use only the "name" but not the pair "name,type".
-	if workloadType != "" {
+	if workloadGVK.Kind != "" {
 		found := false
-		for _, wt := range workloadTypes {
-			if workloadType == wt {
+		for _, wt := range workloadGVKs {
+			if workloadGVK.Kind == wt.Kind {
 				found = true
 				break
 			}
 		}
 		if found {
-			workloadTypes = []string{workloadType}
+			workloadGVKs = []schema.GroupVersionKind{workloadGVK}
 		}
 	}
 
 	wg := sync.WaitGroup{}
-	wg.Add(len(workloadTypes))
-	errChan := make(chan error, len(workloadTypes))
+	wg.Add(len(workloadGVKs))
+	errChan := make(chan error, len(workloadGVKs))
 
-	for _, workloadType := range workloadTypes {
-		go func(wkType string) {
+	for _, workloadGVK := range workloadGVKs {
+		go func(wkGVK schema.GroupVersionKind) {
 			defer wg.Done()
 			var err error
-			if isWorkloadIncluded(wkType) {
-				err = layer.k8s.UpdateWorkload(namespace, workloadName, wkType, jsonPatch)
+			if in.isWorkloadIncluded(wkGVK.Kind) {
+				err = userClient.UpdateWorkload(namespace, workloadName, wkGVK, jsonPatch, patchType)
 			}
 			if err != nil {
 				if !errors.IsNotFound(err) {
-					log.Errorf("Error fetching %s per namespace %s and name %s: %s", wkType, namespace, workloadName, err)
+					log.Errorf("Error fetching %s per namespace %s and name %s: %s", wkGVK, namespace, workloadName, err)
 					errChan <- err
 				}
 			}
-		}(workloadType)
+		}(workloadGVK)
 	}
 
 	wg.Wait()
@@ -1738,14 +2501,281 @@ func controllerPriority(type1, type2 string) string {
 	}
 }
 
-// GetWorkloadAppName returns the "Application" name (app label) that relates to a workload
-func (in *WorkloadService) GetWorkloadAppName(namespace, workload string) (string, error) {
-	wkd, err := fetchWorkload(in.businessLayer, namespace, workload, "")
+// GetWorkloadTracingName returns a struct with all the information needed for tracing lookup
+// The "Application" name (app label) relates to a workload
+// If the workload has any Waypoint, the information is included, as it will be the search name in the tracing backend
+func (in *WorkloadService) GetWorkloadTracingName(ctx context.Context, cluster, namespace, workload string) (models.TracingName, error) {
+	var end observability.EndFunc
+	ctx, end = observability.StartSpan(ctx, "GetWorkloadTracingName",
+		observability.Attribute("package", "business"),
+		observability.Attribute("cluster", cluster),
+		observability.Attribute("namespace", namespace),
+		observability.Attribute("workload", workload),
+	)
+	defer end()
+
+	tracingName := models.TracingName{Workload: workload}
+	wkd, err := in.fetchWorkload(ctx, WorkloadCriteria{Cluster: cluster, Namespace: namespace, WorkloadName: workload, WorkloadGVK: schema.GroupVersionKind{Group: "", Version: "", Kind: ""}, IncludeWaypoints: true})
 	if err != nil {
-		return "", err
+		return tracingName, err
 	}
 
-	appLabelName := config.Get().IstioLabels.AppLabelName
+	tracingName.App = workload
+	if wkd.IsGateway() || wkd.IsWaypoint() {
+		// Waypoints and Gateways doesn't have an app label, but they have valid traces data
+		tracingName.Lookup = workload
+		return tracingName, nil
+	}
+	appLabelName := in.config.IstioLabels.AppLabelName
 	app := wkd.Labels[appLabelName]
-	return app, nil
+	tracingName.App = app
+	tracingName.Lookup = app
+
+	waypoints := wkd.WaypointWorkloads
+	if len(waypoints) > 0 {
+		tracingName.WaypointName = waypoints[0].Name
+		tracingName.Lookup = waypoints[0].Name
+		tracingName.WaypointNamespace = waypoints[0].Namespace
+	}
+
+	return tracingName, nil
+}
+
+// streamParsedLogs fetches logs from a container in a pod, parses and decorates each log line with some metadata (if possible) and
+// sends the processed lines to the client in JSON format. Results are sent as processing is performed, so in case of any error when
+// doing processing the JSON document will be truncated.
+func (in *WorkloadService) streamParsedLogs(cluster, namespace string, names []string, opts *LogOptions, w http.ResponseWriter) error {
+	var userClient kubernetes.ClientInterface
+	var ok bool
+	if opts.LogType == models.LogTypeZtunnel {
+		// Use the SA because the logs will be filtered by the specific workload logs
+		userClient, ok = in.kialiSAClients[cluster]
+	} else {
+		userClient, ok = in.userClients[cluster]
+	}
+	if !ok {
+		return fmt.Errorf("user client for cluster [%s] not found", cluster)
+	}
+
+	var engardeParser *parser.Parser
+	if opts.LogType == models.LogTypeProxy || opts.LogType == models.LogTypeWaypoint {
+		engardeParser = parser.New(parser.IstioProxyAccessLogsPattern)
+	}
+
+	k8sOpts := opts.PodLogOptions
+	// the k8s API does not support "endTime/beforeTime". So for bounded time ranges we need to
+	// discard the logs after sinceTime+duration
+	isBounded := opts.Duration != nil
+
+	firstEntry := true
+	firstWritter := true
+	for i, name := range names {
+		logsReader, err := userClient.StreamPodLogs(namespace, name, &k8sOpts)
+		if err != nil {
+			return err
+		}
+
+		defer func() {
+			e := logsReader.Close()
+			if e != nil {
+				log.Errorf("Error when closing the connection streaming logs of a pod: %s", e.Error())
+			}
+		}()
+
+		bufferedReader := bufio.NewReader(logsReader)
+
+		var startTime *time.Time
+		var endTime *time.Time
+		if k8sOpts.SinceTime != nil {
+			startTime = &k8sOpts.SinceTime.Time
+			if isBounded {
+				end := startTime.Add(*opts.Duration)
+				endTime = &end
+			}
+		}
+
+		var writeErr error
+
+		if firstWritter {
+			// To avoid high memory usage, the JSON will be written
+			// to the HTTP Response as it's received from the cluster API.
+			// That is, each log line is parsed, decorated with Kiali's metadata,
+			// marshalled to JSON and immediately written to the HTTP Response.
+			// This means that it is needed to push HTTP headers and start writing
+			// the response body right now and any errors at the middle of the log
+			// processing can no longer be informed to the client. So, starting
+			// these lines, the best we can do if some error happens is to simply
+			// log the error and stop/truncate the response, which will have the
+			// effect of sending an incomplete JSON document that the browser will fail
+			// to parse. Hopefully, the client/UI can catch the parsing error and
+			// properly show an error message about the failure retrieving logs.
+			w.Header().Set("Content-Type", "application/json")
+			_, writeErr = w.Write([]byte("{\"entries\":[")) // This starts the JSON document
+			if writeErr != nil {
+				return writeErr
+			}
+			firstWritter = false
+		}
+
+		line, readErr := bufferedReader.ReadString('\n')
+		linesWritten := 0
+		for ; readErr == nil || (readErr == io.EOF && len(line) > 0); line, readErr = bufferedReader.ReadString('\n') {
+			// Abort if we already reached the requested max-lines limit
+			if opts.MaxLines != nil && linesWritten >= *opts.MaxLines {
+				break
+			}
+
+			var entry *LogEntry
+			if opts.LogType == models.LogTypeZtunnel {
+				entry = parseZtunnelLine(line, name)
+			} else {
+				entry = parseLogLine(line, opts.LogType == models.LogTypeProxy || opts.LogType == models.LogTypeWaypoint, engardeParser)
+			}
+
+			if entry == nil {
+				continue
+			}
+
+			if opts.LogType == models.LogTypeZtunnel && !filterMatches(entry.Message, opts.filter) {
+				continue
+			}
+
+			if opts.LogType == models.LogTypeWaypoint && !opts.filter.app.MatchString(entry.Message) {
+				continue
+			}
+
+			// If we are past the requested time window then stop processing
+			if startTime == nil {
+				startTime = &entry.OriginalTime
+			}
+
+			if isBounded {
+				if endTime == nil {
+					end := entry.OriginalTime.Add(*opts.Duration)
+					endTime = &end
+				}
+
+				if entry.OriginalTime.After(*endTime) {
+					break
+				}
+			}
+
+			// Send to client the processed log line
+
+			response, err := json.Marshal(entry)
+			if err != nil {
+				// Remember that since the HTTP Response body is already being sent,
+				// it is not possible to change the response code. So, log the error
+				// and terminate early the response.
+				log.Errorf("Error when marshalling JSON while streaming pod logs: %s", err.Error())
+				return nil
+			}
+
+			if firstEntry {
+				firstEntry = false
+			} else {
+				_, writeErr = w.Write([]byte{','})
+				if writeErr != nil {
+					// Remember that since the HTTP Response body is already being sent,
+					// it is not possible to change the response code. So, log the error
+					// and terminate early the response.
+					log.Errorf("Error when writing log entries separator: %s", writeErr.Error())
+					return nil
+				}
+			}
+
+			_, writeErr = w.Write(response)
+			if writeErr != nil {
+				log.Errorf("Error when writing a processed log entry while streaming pod logs: %s", writeErr.Error())
+				return nil
+			}
+
+			linesWritten++
+		}
+		if readErr == nil && opts.MaxLines != nil && linesWritten >= *opts.MaxLines {
+			// End the JSON document, setting the max-lines truncated flag
+			_, writeErr = w.Write([]byte("], \"linesTruncated\": true}"))
+			if writeErr != nil {
+				log.Errorf("Error when writing the outro of the JSON document while streaming pod logs: %s", err.Error())
+			}
+			break
+		} else {
+			if i == len(names)-1 {
+				// End the JSON document
+				_, writeErr = w.Write([]byte("]}"))
+				if writeErr != nil {
+					log.Errorf("Error when writing the outro of the JSON document while streaming pod logs: %s", err.Error())
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// StreamPodLogs streams pod logs to an HTTP Response given the provided options
+// The workload name is used to get the waypoint workloads when opts.LogType is "waypoint"
+func (in *WorkloadService) StreamPodLogs(ctx context.Context, cluster, namespace, workload, app, name string, opts *LogOptions, w http.ResponseWriter) error {
+	names := []string{}
+	if opts.LogType == models.LogTypeZtunnel {
+		// First, get ztunnel namespace and containers
+		pods := in.cache.GetZtunnelPods(cluster)
+		// This is needed for the K8S client
+		opts.PodLogOptions.Container = models.IstioProxy
+		wkDstPattern := fmt.Sprintf(`dst\.workload=("?%s"?)`, name)
+		nsDstPattern := fmt.Sprintf(`dst\.namespace=("?%s"?)`, namespace)
+		wkSrcPattern := fmt.Sprintf(`src\.workload=("?%s"?)`, name)
+		nsSrcPattern := fmt.Sprintf(`src\.namespace=("?%s"?)`, namespace)
+
+		// The ztunnel line should include the pod and the namespace
+		fs := filterOpts{
+			destWk: *regexp.MustCompile(wkDstPattern),
+			destNs: *regexp.MustCompile(nsDstPattern),
+			srcWk:  *regexp.MustCompile(wkSrcPattern),
+			srcNs:  *regexp.MustCompile(nsSrcPattern),
+		}
+		opts.filter = fs
+		for _, pod := range pods {
+			names = append(names, pod.Name)
+		}
+		// They should be all in the same ns
+		return in.streamParsedLogs(cluster, pods[0].Namespace, names, opts, w)
+	}
+	if opts.LogType == models.LogTypeWaypoint {
+		wk, err := in.GetWorkload(ctx, WorkloadCriteria{Cluster: cluster, Namespace: namespace, WorkloadName: workload, IncludeServices: false})
+		if err != nil {
+			log.Errorf("Error when getting workload info: %s", err.Error())
+		} else {
+			if len(wk.WaypointWorkloads) > 0 {
+				// Waypoint filter by the app name
+				fs := filterOpts{
+					app: *regexp.MustCompile(app),
+				}
+				opts.filter = fs
+				// TODO: Get efective one
+				waypoint := wk.WaypointWorkloads[0]
+				waypointWk, errWaypoint := in.GetWorkload(ctx, WorkloadCriteria{Cluster: waypoint.Cluster, Namespace: waypoint.Namespace, WorkloadName: waypoint.Name, IncludeServices: false})
+				if errWaypoint != nil {
+					log.Errorf("Error when getting workload info: %s", err.Error())
+				} else {
+					for _, pod := range waypointWk.Pods {
+						names = append(names, pod.Name)
+					}
+					// This is needed for the K8S client
+					opts.PodLogOptions.Container = models.IstioProxy
+					return in.streamParsedLogs(cluster, waypoint.Namespace, names, opts, w)
+				}
+			}
+		}
+	}
+	names = append(names, name)
+	return in.streamParsedLogs(cluster, namespace, names, opts, w)
+}
+
+// AND filter
+func filterMatches(line string, filter filterOpts) bool {
+	if (filter.destNs.MatchString(line) && filter.destWk.MatchString(line)) || (filter.srcNs.MatchString(line) && filter.srcWk.MatchString(line)) {
+		return true
+	}
+	return false
 }

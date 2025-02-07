@@ -1,74 +1,46 @@
 package business
 
 import (
-	"k8s.io/client-go/tools/clientcmd/api"
+	"context"
+	"fmt"
 
 	"github.com/kiali/kiali/kubernetes"
+	"github.com/kiali/kiali/kubernetes/cache"
 	"github.com/kiali/kiali/models"
 )
 
 type ProxyStatusService struct {
-	k8s           kubernetes.ClientInterface
-	businessLayer *Layer
+	kialiCache     cache.KialiCache
+	kialiSAClients map[string]kubernetes.ClientInterface
+	businessLayer  *Layer
 }
 
-func (in *ProxyStatusService) GetPodProxyStatus(ns, pod string) (*kubernetes.ProxyStatus, error) {
-	if kialiCache == nil {
-		return nil, nil
-	}
-
-	if kialiCache.CheckProxyStatus() {
-		return kialiCache.GetPodProxyStatus(ns, pod), nil
-	}
-
-	var proxyStatus []*kubernetes.ProxyStatus
-	var err error
-
-	if proxyStatus, err = in.k8s.GetProxyStatus(); err != nil {
-		if proxyStatus, err = in.getProxyStatusUsingKialiSA(); err != nil {
-			return nil, err
-		}
-	}
-
-	kialiCache.SetProxyStatus(proxyStatus)
-	return kialiCache.GetPodProxyStatus(ns, pod), nil
+// GetPodProxyStatus isSubscribed is used to return IGNORED if sent is empty, instead of NOT_SENT
+func (in *ProxyStatusService) GetPodProxyStatus(cluster, ns, pod string, isSubscribed bool) *models.ProxyStatus {
+	return castProxyStatus(kialiCache.GetPodProxyStatus(cluster, ns, pod), isSubscribed)
 }
 
-func (in *ProxyStatusService) getProxyStatusUsingKialiSA() ([]*kubernetes.ProxyStatus, error) {
-	clientFactory, err := kubernetes.GetClientFactory()
-	if err != nil {
-		return nil, err
-	}
-
-	kialiToken, err := kubernetes.GetKialiToken()
-	if err != nil {
-		return nil, err
-	}
-
-	k8s, err := clientFactory.GetClient(&api.AuthInfo{Token: kialiToken})
-	if err != nil {
-		return nil, err
-	}
-
-	return k8s.GetProxyStatus()
-}
-
-func castProxyStatus(ps *kubernetes.ProxyStatus) *models.ProxyStatus {
+// castProxyStatus returns a status string depending on the proxyStatus and whether the proxy is subscribed
+// See https://github.com/istio/istio/pull/51638/files#diff-fded610aca2639111f0d6b42e18dfc1ce047126340a2d36bb976cfa4c575b984R8
+func castProxyStatus(ps *kubernetes.ProxyStatus, isSubscribed bool) *models.ProxyStatus {
 	if ps == nil {
 		return nil
 	}
 
 	return &models.ProxyStatus{
-		CDS: xdsStatus(ps.ClusterSent, ps.ClusterAcked),
-		EDS: xdsStatus(ps.EndpointSent, ps.EndpointAcked),
-		LDS: xdsStatus(ps.ListenerSent, ps.ListenerAcked),
-		RDS: xdsStatus(ps.RouteSent, ps.RouteAcked),
+		CDS: xdsStatus(ps.ClusterSent, ps.ClusterAcked, isSubscribed),
+		EDS: xdsStatus(ps.EndpointSent, ps.EndpointAcked, isSubscribed),
+		LDS: xdsStatus(ps.ListenerSent, ps.ListenerAcked, isSubscribed),
+		RDS: xdsStatus(ps.RouteSent, ps.RouteAcked, isSubscribed),
 	}
 }
 
-func xdsStatus(sent, acked string) string {
+func xdsStatus(sent, acked string, isSubscribed bool) string {
 	if sent == "" {
-		return "NOT_SENT"
+		if isSubscribed {
+			return "NOT_SENT"
+		}
+		return "IGNORED"
 	}
 	if sent == acked {
 		return "Synced"
@@ -81,18 +53,28 @@ func xdsStatus(sent, acked string) string {
 	return "Stale"
 }
 
-func (in *ProxyStatusService) GetConfigDump(namespace, pod string) (models.EnvoyProxyDump, error) {
-	dump, err := in.k8s.GetConfigDump(namespace, pod)
+func (in *ProxyStatusService) GetConfigDump(cluster, namespace, pod string) (models.EnvoyProxyDump, error) {
+	kialiSAClient, ok := in.kialiSAClients[cluster]
+	if !ok {
+		return models.EnvoyProxyDump{}, fmt.Errorf("cluster [%s] not found", cluster)
+	}
+
+	dump, err := kialiSAClient.GetConfigDump(namespace, pod)
 	return models.EnvoyProxyDump{ConfigDump: dump}, err
 }
 
-func (in *ProxyStatusService) GetConfigDumpResourceEntries(namespace, pod, resource string) (*models.EnvoyProxyDump, error) {
-	dump, err := in.k8s.GetConfigDump(namespace, pod)
+func (in *ProxyStatusService) GetConfigDumpResourceEntries(cluster, namespace, pod, resource string) (*models.EnvoyProxyDump, error) {
+	kialiSAClient, ok := in.kialiSAClients[cluster]
+	if !ok {
+		return nil, fmt.Errorf("cluster [%s] not found", cluster)
+	}
+
+	dump, err := kialiSAClient.GetConfigDump(namespace, pod)
 	if err != nil {
 		return nil, err
 	}
 
-	namespaces, err := in.businessLayer.Namespace.GetNamespaces()
+	namespaces, err := in.businessLayer.Namespace.GetClusterNamespaces(context.TODO(), cluster)
 	if err != nil {
 		return nil, err
 	}

@@ -7,6 +7,7 @@ import (
 	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
+	"github.com/kiali/kiali/tests/data"
 	"github.com/kiali/kiali/tests/testutils/validations"
 )
 
@@ -241,9 +242,8 @@ func mtlsCheckerTestPrep(scenario string, autoMtls bool, t *testing.T) models.Is
 	}
 
 	validations := MtlsEnabledChecker{
-		Namespace:             "bookinfo",
 		AuthorizationPolicies: loader.GetResources().AuthorizationPolicies,
-		ServiceList:           fakeServices([]string{"ratings"}),
+		RegistryServices:      data.CreateFakeRegistryServicesLabels("ratings", "bookinfo"),
 		MtlsDetails: kubernetes.MTLSDetails{
 			DestinationRules:        loader.GetResources().DestinationRules,
 			MeshPeerAuthentications: loader.FindPeerAuthenticationIn("istio-system"),
@@ -266,10 +266,10 @@ func testMtlsCheckerPresent(scenario string, t *testing.T, autoMtls bool) {
 	ta := validations.ValidationsTestAsserter{T: t, Validations: vals}
 	ta.AssertValidationsPresent(1)
 	ta.AssertValidationAt(models.IstioValidationKey{
-		ObjectType: "authorizationpolicy",
-		Name:       "policy",
-		Namespace:  "bookinfo",
-	}, models.ErrorSeverity, "spec/rules[0]/source/principals", "authorizationpolicy.mtls.needstobeenabled")
+		ObjectGVK: kubernetes.AuthorizationPolicies,
+		Name:      "policy",
+		Namespace: "bookinfo",
+	}, models.ErrorSeverity, "spec/rules[0]/from[0]/source/principals", "authorizationpolicy.mtls.needstobeenabled")
 }
 
 func yamlFixtureLoaderFor(file string) *validations.YamlFixtureLoader {

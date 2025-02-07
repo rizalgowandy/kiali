@@ -14,7 +14,15 @@ import (
 // Setup mocks
 
 func setupMocked() (*prometheus.Client, *prometheustest.PromAPIMock, error) {
-	config.Set(config.NewConfig())
+	return setupMockedWithQueryScope("")
+}
+
+func setupMockedWithQueryScope(meshId string) (*prometheus.Client, *prometheustest.PromAPIMock, error) {
+	testConfig := config.NewConfig()
+	if meshId != "" {
+		testConfig.ExternalServices.Prometheus.QueryScope = map[string]string{"mesh_id": meshId}
+	}
+	config.Set(testConfig)
 	api := new(prometheustest.PromAPIMock)
 	client, err := prometheus.NewClient()
 	if err != nil {
@@ -27,13 +35,13 @@ func setupMocked() (*prometheus.Client, *prometheustest.PromAPIMock, error) {
 func mockQuery(api *prometheustest.PromAPIMock, query string, ret *model.Vector) {
 	api.On(
 		"Query",
-		mock.AnythingOfType("*context.emptyCtx"),
+		mock.Anything,
 		query,
 		mock.AnythingOfType("time.Time"),
 	).Return(*ret, nil)
 	api.On(
 		"Query",
-		mock.AnythingOfType("*context.cancelCtx"),
+		mock.Anything,
 		query,
 		mock.AnythingOfType("time.Time"),
 	).Return(*ret, nil)

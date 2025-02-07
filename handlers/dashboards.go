@@ -9,46 +9,60 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 
 	"github.com/kiali/kiali/business"
+	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/grafana"
 	"github.com/kiali/kiali/models"
 )
 
 // CustomDashboard is the API handler to fetch runtime metrics to be displayed, related to a single app
-func CustomDashboard(w http.ResponseWriter, r *http.Request) {
-	queryParams := r.URL.Query()
-	pathParams := mux.Vars(r)
-	namespace := pathParams["namespace"]
-	dashboardName := pathParams["dashboard"]
+func CustomDashboard(conf *config.Config, grafana *grafana.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		queryParams := r.URL.Query()
+		pathParams := mux.Vars(r)
+		cluster := clusterNameFromQuery(queryParams)
+		namespace := pathParams["namespace"]
+		dashboardName := pathParams["dashboard"]
 
-	authInfo, err := getAuthInfo(r)
-	if err != nil {
+		layer, err := getBusiness(r)
 		if err != nil {
 			RespondWithError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-	}
 
-	// Check namespace
-	layer, err := getBusiness(r)
-	if err != nil {
-		RespondWithError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	info, err := checkNamespaceAccess(layer.Namespace, namespace)
-	if err != nil {
-		RespondWithError(w, http.StatusForbidden, "Cannot access namespace data: "+err.Error())
-		return
-	}
+		// Check namespace access
+		info, err := layer.Namespace.GetClusterNamespace(r.Context(), namespace, cluster)
+		if err != nil {
+			RespondWithError(w, http.StatusForbidden, "Cannot access namespace data: "+err.Error())
+			return
+		}
 
-	params := models.DashboardQuery{Namespace: namespace}
-	err = extractDashboardQueryParams(queryParams, &params, info)
-	if err != nil {
-		RespondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
+		params := models.DashboardQuery{Namespace: namespace}
+		err = extractDashboardQueryParams(queryParams, &params, info)
+		if err != nil {
+			RespondWithError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 
-	var wkd *models.Workload
-	if params.Workload != "" {
-		wkd, err = layer.Workload.GetWorkload(namespace, params.Workload, params.WorkloadType, false)
+		var wkd *models.Workload
+		if params.Workload != "" {
+			wkd, err = layer.Workload.GetWorkload(r.Context(), business.WorkloadCriteria{Cluster: cluster, Namespace: namespace, WorkloadName: params.Workload, WorkloadGVK: params.WorkloadGVK, IncludeServices: false})
+			if err != nil {
+				if errors.IsNotFound(err) {
+					RespondWithError(w, http.StatusNotFound, err.Error())
+				} else {
+					RespondWithError(w, http.StatusInternalServerError, err.Error())
+				}
+				return
+			}
+		}
+
+		svc := business.NewDashboardsService(conf, grafana, info, wkd)
+		if !svc.CustomEnabled {
+			RespondWithError(w, http.StatusServiceUnavailable, "Custom dashboards are disabled in config")
+			return
+		}
+
+		dashboard, err := svc.GetDashboard(r.Context(), params, dashboardName)
 		if err != nil {
 			if errors.IsNotFound(err) {
 				RespondWithError(w, http.StatusNotFound, err.Error())
@@ -57,24 +71,8 @@ func CustomDashboard(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+		RespondWithJSON(w, http.StatusOK, dashboard)
 	}
-
-	svc := business.NewDashboardsService(info, wkd)
-	if !svc.CustomEnabled {
-		RespondWithError(w, http.StatusServiceUnavailable, "Custom dashboards are disabled in config")
-		return
-	}
-
-	dashboard, err := svc.GetDashboard(authInfo, params, dashboardName)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			RespondWithError(w, http.StatusNotFound, err.Error())
-		} else {
-			RespondWithError(w, http.StatusInternalServerError, err.Error())
-		}
-		return
-	}
-	RespondWithJSON(w, http.StatusOK, dashboard)
 }
 
 func extractDashboardQueryParams(queryParams url.Values, q *models.DashboardQuery, namespaceInfo *models.Namespace) error {
@@ -113,85 +111,115 @@ func extractLabelsFilters(rawString string) map[string]string {
 }
 
 // AppDashboard is the API handler to fetch Istio dashboard, related to a single app
-func AppDashboard(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	namespace := vars["namespace"]
-	app := vars["app"]
+func AppDashboard(conf *config.Config, grafana *grafana.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		vars := mux.Vars(r)
+		namespace := vars["namespace"]
+		app := vars["app"]
+		cluster := clusterNameFromQuery(r.URL.Query())
 
-	metricsService, namespaceInfo := createMetricsServiceForNamespace(w, r, defaultPromClientSupplier, namespace)
-	if metricsService == nil {
-		// any returned value nil means error & response already written
-		return
-	}
+		metricsService, namespaceInfo := createMetricsServiceForNamespace(w, r, DefaultPromClientSupplier, models.Namespace{Name: namespace, Cluster: cluster})
+		if metricsService == nil {
+			// any returned value nil means error & response already written
+			return
+		}
 
-	params := models.IstioMetricsQuery{Namespace: namespace, App: app}
-	err := extractIstioMetricsQueryParams(r, &params, namespaceInfo)
-	if err != nil {
-		RespondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
+		params := models.IstioMetricsQuery{Cluster: cluster, Namespace: namespace, App: app}
+		err := extractIstioMetricsQueryParams(r, &params, namespaceInfo)
+		if err != nil {
+			RespondWithError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 
-	metrics, err := metricsService.GetMetrics(params, business.GetIstioScaler())
-	if err != nil {
-		RespondWithError(w, http.StatusServiceUnavailable, err.Error())
-		return
+		metrics, err := metricsService.GetMetrics(params, business.GetIstioScaler())
+		if err != nil {
+			RespondWithError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		dashboard := business.NewDashboardsService(conf, grafana, namespaceInfo, nil).BuildIstioDashboard(metrics, params.Direction)
+		RespondWithJSON(w, http.StatusOK, dashboard)
 	}
-	dashboard := business.NewDashboardsService(namespaceInfo, nil).BuildIstioDashboard(metrics, params.Direction)
-	RespondWithJSON(w, http.StatusOK, dashboard)
 }
 
 // ServiceDashboard is the API handler to fetch Istio dashboard, related to a single service
-func ServiceDashboard(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	namespace := vars["namespace"]
-	service := vars["service"]
+func ServiceDashboard(conf *config.Config, grafana *grafana.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		vars := mux.Vars(r)
+		namespace := vars["namespace"]
+		service := vars["service"]
 
-	metricsService, namespaceInfo := createMetricsServiceForNamespace(w, r, defaultPromClientSupplier, namespace)
-	if metricsService == nil {
-		// any returned value nil means error & response already written
-		return
-	}
+		queryParams := r.URL.Query()
+		cluster := clusterNameFromQuery(queryParams)
 
-	params := models.IstioMetricsQuery{Namespace: namespace, Service: service}
-	err := extractIstioMetricsQueryParams(r, &params, namespaceInfo)
-	if err != nil {
-		RespondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
+		metricsService, namespaceInfo := createMetricsServiceForNamespace(w, r, DefaultPromClientSupplier, models.Namespace{Name: namespace, Cluster: cluster})
+		if metricsService == nil {
+			// any returned value nil means error & response already written
+			return
+		}
 
-	metrics, err := metricsService.GetMetrics(params, business.GetIstioScaler())
-	if err != nil {
-		RespondWithError(w, http.StatusServiceUnavailable, err.Error())
-		return
+		params := models.IstioMetricsQuery{Cluster: cluster, Namespace: namespace, Service: service}
+		err := extractIstioMetricsQueryParams(r, &params, namespaceInfo)
+		if err != nil {
+			RespondWithError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		// ACcess to the service details to check
+		b, err := getBusiness(r)
+		if err != nil {
+			RespondWithError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+
+		svc, err := b.Svc.GetService(r.Context(), cluster, namespace, service)
+		if err != nil {
+			RespondWithError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+
+		// "External"/"ServiceEntry" services don't use namespace in telemetry, they need to use the "unknown" parameter
+		// to collect the relevant telemetry for those services
+		if svc.Type == "External" {
+			params.Namespace = "unknown"
+		}
+
+		metrics, err := metricsService.GetMetrics(params, business.GetIstioScaler())
+		if err != nil {
+			RespondWithError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		dashboard := business.NewDashboardsService(conf, grafana, namespaceInfo, nil).BuildIstioDashboard(metrics, params.Direction)
+		RespondWithJSON(w, http.StatusOK, dashboard)
 	}
-	dashboard := business.NewDashboardsService(namespaceInfo, nil).BuildIstioDashboard(metrics, params.Direction)
-	RespondWithJSON(w, http.StatusOK, dashboard)
 }
 
 // WorkloadDashboard is the API handler to fetch Istio dashboard, related to a single workload
-func WorkloadDashboard(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	namespace := vars["namespace"]
-	workload := vars["workload"]
+func WorkloadDashboard(conf *config.Config, grafana *grafana.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		vars := mux.Vars(r)
+		namespace := vars["namespace"]
+		workload := vars["workload"]
+		cluster := clusterNameFromQuery(r.URL.Query())
 
-	metricsService, namespaceInfo := createMetricsServiceForNamespace(w, r, defaultPromClientSupplier, namespace)
-	if metricsService == nil {
-		// any returned value nil means error & response already written
-		return
-	}
+		metricsService, namespaceInfo := createMetricsServiceForNamespace(w, r, DefaultPromClientSupplier, models.Namespace{Name: namespace, Cluster: cluster})
+		if metricsService == nil {
+			// any returned value nil means error & response already written
+			return
+		}
 
-	params := models.IstioMetricsQuery{Namespace: namespace, Workload: workload}
-	err := extractIstioMetricsQueryParams(r, &params, namespaceInfo)
-	if err != nil {
-		RespondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
+		params := models.IstioMetricsQuery{Cluster: cluster, Namespace: namespace, Workload: workload}
+		err := extractIstioMetricsQueryParams(r, &params, namespaceInfo)
+		if err != nil {
+			RespondWithError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 
-	metrics, err := metricsService.GetMetrics(params, business.GetIstioScaler())
-	if err != nil {
-		RespondWithError(w, http.StatusServiceUnavailable, err.Error())
-		return
+		metrics, err := metricsService.GetMetrics(params, business.GetIstioScaler())
+		if err != nil {
+			RespondWithError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		dashboard := business.NewDashboardsService(conf, grafana, namespaceInfo, nil).BuildIstioDashboard(metrics, params.Direction)
+		RespondWithJSON(w, http.StatusOK, dashboard)
 	}
-	dashboard := business.NewDashboardsService(namespaceInfo, nil).BuildIstioDashboard(metrics, params.Direction)
-	RespondWithJSON(w, http.StatusOK, dashboard)
 }

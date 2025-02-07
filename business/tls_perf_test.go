@@ -1,20 +1,23 @@
 package business
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
-	networking_v1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
-	security_v1beta1 "istio.io/client-go/pkg/apis/security/v1beta1"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
+	security_v1 "istio.io/client-go/pkg/apis/security/v1"
 	core_v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
 	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/istio/istiotest"
+	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/kubernetes/kubetest"
+	"github.com/kiali/kiali/models"
 	"github.com/kiali/kiali/tests/data"
 )
 
@@ -36,13 +39,13 @@ func TestTlsPerfNsDr(t *testing.T) {
 
 	testPerfScenario(MTLSPartiallyEnabled, nss, drs, pss, false, t)
 	testPerfScenario(MTLSEnabled, nss, drs, pss, true, t)
-	testPerfScenario(MTLSEnabled, nss, []networking_v1alpha3.DestinationRule{}, pss, true, t)
+	testPerfScenario(MTLSEnabled, nss, []*networking_v1.DestinationRule{}, pss, true, t)
 }
 
-func preparePerfScenario(numNs, numDr int) ([]core_v1.Namespace, []security_v1beta1.PeerAuthentication, []networking_v1alpha3.DestinationRule) {
+func preparePerfScenario(numNs, numDr int) ([]core_v1.Namespace, []*security_v1.PeerAuthentication, []*networking_v1.DestinationRule) {
 	nss := []core_v1.Namespace{}
-	pss := []security_v1beta1.PeerAuthentication{}
-	drs := []networking_v1alpha3.DestinationRule{}
+	pss := []*security_v1.PeerAuthentication{}
+	drs := []*networking_v1.DestinationRule{}
 
 	fmt.Printf("TLS perf test. Num NS: %d DR per NS: %d\n", numNs, numDr)
 	i := 0
@@ -51,11 +54,11 @@ func preparePerfScenario(numNs, numDr int) ([]core_v1.Namespace, []security_v1be
 		ns.Name = fmt.Sprintf("bookinfo-%d", i)
 		nss = append(nss, ns)
 		ps := *data.CreateEmptyPeerAuthentication(fmt.Sprintf("pa-%d", i), ns.Name, data.CreateMTLS("STRICT"))
-		pss = append(pss, ps)
+		pss = append(pss, &ps)
 		j := 0
 		for j < numDr {
 			dr := *data.CreateEmptyDestinationRule(ns.Name, fmt.Sprintf("dr-%d-%d", i, j), fmt.Sprintf("*.%s.svc.cluster.local", ns.Name))
-			drs = append(drs, dr)
+			drs = append(drs, &dr)
 			j++
 		}
 		i++
@@ -63,33 +66,48 @@ func preparePerfScenario(numNs, numDr int) ([]core_v1.Namespace, []security_v1be
 	return nss, pss, drs
 }
 
-func testPerfScenario(exStatus string, nss []core_v1.Namespace, drs []networking_v1alpha3.DestinationRule, ps []security_v1beta1.PeerAuthentication, autoMtls bool, t *testing.T) {
+func testPerfScenario(exStatus string, namespaces []core_v1.Namespace, drs []*networking_v1.DestinationRule, ps []*security_v1.PeerAuthentication, autoMtls bool, t *testing.T) {
 	assert := assert.New(t)
+
 	conf := config.NewConfig()
-	config.Set(conf)
+	conf.Deployment.ClusterWideAccess = true
+	kubernetes.SetConfig(t, *conf)
 
-	k8s := new(kubetest.K8SClientMock)
-	fakeIstioObjects := []runtime.Object{}
-	for _, d := range drs {
-		fakeIstioObjects = append(fakeIstioObjects, d.DeepCopyObject())
+	var objs []runtime.Object
+	for _, obj := range namespaces {
+		o := obj
+		objs = append(objs, &o)
 	}
-	for _, p := range ps {
-		fakeIstioObjects = append(fakeIstioObjects, p.DeepCopyObject())
-	}
-	k8s.MockIstio(fakeIstioObjects...)
-	k8s.On("IsOpenShift").Return(false)
-	k8s.On("IsMaistraApi").Return(false)
-	k8s.On("GetNamespaces", mock.AnythingOfType("string")).Return(nss, nil)
-	for _, ns := range nss {
-		k8s.On("GetNamespace", ns.Name).Return(&ns, nil)
-	}
-	config.Set(config.NewConfig())
+	objs = append(objs, kubernetes.ToRuntimeObjects(ps)...)
+	objs = append(objs, kubernetes.ToRuntimeObjects(drs)...)
 
-	tlsService := TLSService{k8s: k8s, enabledAutoMtls: &autoMtls, businessLayer: NewWithBackends(k8s, nil, nil)}
-	tlsService.businessLayer.Namespace.isAccessibleNamespaces["**"] = true
-	for _, ns := range nss {
-		status, err := (tlsService).NamespaceWidemTLSStatus(ns.Name)
-		assert.NoError(err)
+	k8s := kubetest.NewFakeK8sClient(objs...)
+	SetupBusinessLayer(t, k8s, *conf)
+	discovery := &istiotest.FakeDiscovery{
+		MeshReturn: models.Mesh{
+			ControlPlanes: []models.ControlPlane{{
+				IstiodNamespace: conf.IstioNamespace,
+				Revision:        "default",
+				Cluster:         &models.KubeCluster{Name: conf.KubernetesConfig.ClusterName},
+				Config: models.ControlPlaneConfiguration{
+					IstioMeshConfig: models.IstioMeshConfig{
+						EnableAutoMtls: &autoMtls,
+					},
+				},
+			}},
+		},
+	}
+	WithDiscovery(discovery)
+
+	k8sclients := make(map[string]kubernetes.ClientInterface)
+	k8sclients[conf.KubernetesConfig.ClusterName] = k8s
+
+	tlsService := NewWithBackends(k8sclients, k8sclients, nil, nil).TLS
+
+	statuses, err := tlsService.ClusterWideNSmTLSStatus(context.TODO(), models.CastNamespaceCollection(namespaces, conf.KubernetesConfig.ClusterName), conf.KubernetesConfig.ClusterName)
+	assert.NoError(err)
+	assert.NotEmpty(statuses)
+	for _, status := range statuses {
 		assert.Equal(exStatus, status.Status)
 	}
 }

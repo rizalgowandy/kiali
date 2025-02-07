@@ -1,13 +1,16 @@
 package business
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/config/dashboards"
+	"github.com/kiali/kiali/grafana"
+	"github.com/kiali/kiali/kubernetes"
+	"github.com/kiali/kiali/kubernetes/kubetest"
 	"github.com/kiali/kiali/models"
 	pmock "github.com/kiali/kiali/prometheus/prometheustest"
 )
@@ -17,10 +20,10 @@ func setupService(namespace string, dashboards []dashboards.MonitoringDashboard)
 	for _, d := range dashboards {
 		cfg.CustomDashboards = append(cfg.CustomDashboards, d)
 	}
-	config.Set(cfg)
 	prom := new(pmock.PromClientMock)
 	ns := models.Namespace{Name: namespace}
-	service := NewDashboardsService(&ns, nil)
+	grafana := grafana.NewService(cfg, kubetest.NewFakeK8sClient())
+	service := NewDashboardsService(cfg, grafana, &ns, nil)
 	service.promClient = prom
 	return service, prom
 }
@@ -30,8 +33,9 @@ func TestGetDashboard(t *testing.T) {
 
 	// Setup mocks
 	service, prom := setupService("my-namespace", []dashboards.MonitoringDashboard{*fakeDashboard("1")})
+	service.promConfig.QueryScope = map[string]string{"mesh_id": "mesh1"}
 
-	expectedLabels := "{kubernetes_namespace=\"my-namespace\",APP=\"my-app\"}"
+	expectedLabels := `{namespace="my-namespace",APP="my-app",mesh_id="mesh1"}`
 	namespace := models.Namespace{
 		Name: "my-namespace",
 	}
@@ -51,7 +55,11 @@ func TestGetDashboard(t *testing.T) {
 	prom.MockMetric("my_metric_1_1", expectedLabels, &query.RangeQuery, 10)
 	prom.MockHistogram("my_metric_1_2", expectedLabels, &query.RangeQuery, 11, 12)
 
-	dashboard, err := service.GetDashboard(&api.AuthInfo{Token: ""}, query, "dashboard1")
+	k8s := kubetest.NewFakeK8sClient()
+	mockClientFactory := kubetest.NewK8SClientFactoryMock(k8s)
+	SetWithBackends(mockClientFactory, nil)
+
+	dashboard, err := service.GetDashboard(context.Background(), query, "dashboard1")
 
 	assert.Nil(err)
 	assert.Equal("Dashboard 1", dashboard.Title)
@@ -70,10 +78,13 @@ func TestGetDashboard(t *testing.T) {
 func TestGetDashboardFromKialiNamespace(t *testing.T) {
 	assert := assert.New(t)
 
+	// allows GetDashboard to get the SA client under the covers
+	kubernetes.NewTestingClientFactory(t)
+
 	// Setup mocks
 	service, prom := setupService("my-namespace", []dashboards.MonitoringDashboard{*fakeDashboard("1")})
 
-	expectedLabels := "{kubernetes_namespace=\"my-namespace\",APP=\"my-app\"}"
+	expectedLabels := "{namespace=\"my-namespace\",APP=\"my-app\"}"
 	namespace := models.Namespace{
 		Name: "my-namespace",
 	}
@@ -87,7 +98,7 @@ func TestGetDashboardFromKialiNamespace(t *testing.T) {
 	prom.MockMetric("my_metric_1_1", expectedLabels, &query.RangeQuery, 10)
 	prom.MockHistogram("my_metric_1_2", expectedLabels, &query.RangeQuery, 11, 12)
 
-	dashboard, err := service.GetDashboard(&api.AuthInfo{Token: ""}, query, "dashboard1")
+	dashboard, err := service.GetDashboard(context.Background(), query, "dashboard1")
 
 	assert.Nil(err)
 	assert.Equal("Dashboard 1", dashboard.Title)
@@ -260,14 +271,14 @@ func TestBuildIstioDashboard(t *testing.T) {
 
 	// Setup mocks
 	conf := config.NewConfig()
-	config.Set(conf)
 	ns := models.Namespace{Name: "my-namespace"}
-	service := NewDashboardsService(&ns, nil)
+	grafana := grafana.NewService(conf, kubetest.NewFakeK8sClient())
+	service := NewDashboardsService(conf, grafana, &ns, nil)
 
 	dashboard := service.BuildIstioDashboard(fakeMetrics(), "inbound")
 
 	assert.Equal("Inbound Metrics", dashboard.Title)
-	assert.Len(dashboard.Aggregations, 7)
+	assert.Len(dashboard.Aggregations, 8)
 	assert.Equal("Local version", dashboard.Aggregations[0].DisplayName)
 	assert.Equal("destination_canonical_revision", dashboard.Aggregations[0].Label)
 	assert.Equal("Remote namespace", dashboard.Aggregations[1].DisplayName)
@@ -288,6 +299,7 @@ func TestBuildIstioDashboard(t *testing.T) {
 	assert.Equal("Response throughput", dashboard.Charts[5].Name)
 	assert.NotNil(dashboard.Charts[5].Metrics)
 	assert.Len(dashboard.Charts[5].Metrics, 0)
+	assert.Equal("Connection Security Policy", dashboard.Aggregations[7].DisplayName)
 }
 
 func fakeCounter(value float64) []models.Metric {

@@ -1,9 +1,7 @@
 package handlers
 
 import (
-	"context"
-	"errors"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -22,6 +20,7 @@ import (
 
 	"github.com/kiali/kiali/business"
 	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/handlers/authentication"
 	"github.com/kiali/kiali/kubernetes/kubetest"
 	"github.com/kiali/kiali/models"
 	"github.com/kiali/kiali/prometheus"
@@ -149,8 +148,7 @@ func buildNamespace(name string, creationTime time.Time) *models.Namespace {
 }
 
 func TestAggregateMetricsDefault(t *testing.T) {
-	ts, api, _ := setupAggregateMetricsEndpoint(t)
-	defer ts.Close()
+	ts, api := setupAggregateMetricsEndpoint(t)
 
 	url := ts.URL + "/api/namespaces/ns/aggregates/my_aggregate/my_aggregate_value/metrics"
 	now := time.Now()
@@ -179,14 +177,13 @@ func TestAggregateMetricsDefault(t *testing.T) {
 	}
 
 	// default has direction=outbound
-	actual, _ := ioutil.ReadAll(resp.Body)
+	actual, _ := io.ReadAll(resp.Body)
 	assert.Equal(t, 400, resp.StatusCode)
 	assert.Contains(t, string(actual), "'direction' must be 'inbound'")
 }
 
 func TestAggregateMetricsWithParams(t *testing.T) {
-	ts, api, _ := setupAggregateMetricsEndpoint(t)
-	defer ts.Close()
+	ts, api := setupAggregateMetricsEndpoint(t)
 
 	req, err := http.NewRequest("GET", ts.URL+"/api/namespaces/ns/aggregates/my_aggregate/my_aggregate_value/metrics", nil)
 	if err != nil {
@@ -236,7 +233,7 @@ func TestAggregateMetricsWithParams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actual, _ := ioutil.ReadAll(resp.Body)
+	actual, _ := io.ReadAll(resp.Body)
 
 	assert.NotEmpty(t, actual)
 	assert.Equal(t, 200, resp.StatusCode, string(actual))
@@ -246,26 +243,23 @@ func TestAggregateMetricsWithParams(t *testing.T) {
 }
 
 func TestAggregateMetricsInaccessibleNamespace(t *testing.T) {
-	ts, _, k8s := setupAggregateMetricsEndpoint(t)
-	defer ts.Close()
+	ts, _ := setupAggregateMetricsEndpoint(t)
+
+	k := kubetest.NewFakeK8sClient(&osproject_v1.Project{ObjectMeta: meta_v1.ObjectMeta{Name: "ns"}})
+
+	business.SetupBusinessLayer(t, &noPrivClient{k}, *config.Get())
 
 	url := ts.URL + "/api/namespaces/my_namespace/aggregates/my_aggregate/my_aggregate_value/metrics"
-
-	var nsNil *osproject_v1.Project
-	k8s.On("GetProject", "my_namespace").Return(nsNil, errors.New("no privileges"))
-
 	resp, err := http.Get(url)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
-	k8s.AssertCalled(t, "GetProject", "my_namespace")
 }
 
 func TestAggregateMetricsBadDirection(t *testing.T) {
-	ts, _, _ := setupAggregateMetricsEndpoint(t)
-	defer ts.Close()
+	ts, _ := setupAggregateMetricsEndpoint(t)
 
 	req, err := http.NewRequest("GET", ts.URL+"/api/namespaces/ns/aggregates/my_aggregate/my_aggregate_value/metrics", nil)
 	if err != nil {
@@ -281,15 +275,14 @@ func TestAggregateMetricsBadDirection(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	actual, _ := ioutil.ReadAll(resp.Body)
+	actual, _ := io.ReadAll(resp.Body)
 
 	assert.Equal(t, 400, resp.StatusCode)
 	assert.Contains(t, string(actual), "'direction' must be 'inbound'")
 }
 
 func TestAggregateMetricsBadReporter(t *testing.T) {
-	ts, _, _ := setupAggregateMetricsEndpoint(t)
-	defer ts.Close()
+	ts, _ := setupAggregateMetricsEndpoint(t)
 
 	req, err := http.NewRequest("GET", ts.URL+"/api/namespaces/ns/aggregates/my_aggregate/my_aggregate_value/metrics", nil)
 	if err != nil {
@@ -306,46 +299,49 @@ func TestAggregateMetricsBadReporter(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	actual, _ := ioutil.ReadAll(resp.Body)
+	actual, _ := io.ReadAll(resp.Body)
 
 	assert.Equal(t, 400, resp.StatusCode)
 	assert.Contains(t, string(actual), "'reporter' must be 'destination'")
 }
 
-func setupAggregateMetricsEndpoint(t *testing.T) (*httptest.Server, *prometheustest.PromAPIMock, *kubetest.K8SClientMock) {
-	config.Set(config.NewConfig())
+func setupAggregateMetricsEndpoint(t *testing.T) (*httptest.Server, *prometheustest.PromAPIMock) {
+	conf := config.NewConfig()
+	config.Set(conf)
 	xapi := new(prometheustest.PromAPIMock)
-	k8s := kubetest.NewK8SClientMock()
+	k := kubetest.NewFakeK8sClient(&osproject_v1.Project{ObjectMeta: meta_v1.ObjectMeta{Name: "ns"}})
+	k.OpenShift = true
 	prom, err := prometheus.NewClient()
 	if err != nil {
 		t.Fatal(err)
 	}
 	prom.Inject(xapi)
-	k8s.On("GetProject", "ns").Return(&osproject_v1.Project{}, nil)
 
+	authInfo := map[string]*api.AuthInfo{conf.KubernetesConfig.ClusterName: {Token: "test"}}
 	mr := mux.NewRouter()
 	mr.HandleFunc("/api/namespaces/{namespace}/aggregates/{aggregate}/{aggregateValue}/metrics", http.HandlerFunc(
-		func(w http.ResponseWriter, r *http.Request) {
-			context := context.WithValue(r.Context(), "authInfo", &api.AuthInfo{Token: "test"})
-			getAggregateMetrics(w, r.WithContext(context), func() (*prometheus.Client, error) {
+		WithAuthInfo(authInfo, func(w http.ResponseWriter, r *http.Request) {
+			getAggregateMetrics(w, r, func() (*prometheus.Client, error) {
 				return prom, nil
 			})
-		}))
+		})),
+	)
 
 	ts := httptest.NewServer(mr)
+	t.Cleanup(ts.Close)
 
-	mockClientFactory := kubetest.NewK8SClientFactoryMock(k8s)
-	business.SetWithBackends(mockClientFactory, prom)
+	business.SetupBusinessLayer(t, k, *conf)
 
-	return ts, xapi, k8s
+	return ts, xapi
 }
 
 func TestPrepareStatsQueriesPartialError(t *testing.T) {
 	assert := assert.New(t)
-	prom, _, _ := utilSetupMocks(t)
+	prom := utilSetupMocks(t)
 
 	req := httptest.NewRequest("GET", "/foo", nil)
-	req = req.WithContext(context.WithValue(req.Context(), "authInfo", &api.AuthInfo{Token: "test"}))
+	authInfo := map[string]*api.AuthInfo{config.Get().KubernetesConfig.ClusterName: {Token: "test"}}
+	req = req.WithContext(authentication.SetAuthInfoContext(req.Context(), authInfo))
 	w := httptest.NewRecorder()
 	queryTime := time.Date(2020, 10, 22, 0, 0, 0, 0, time.UTC).Unix()
 
@@ -405,7 +401,7 @@ func TestPrepareStatsQueriesPartialError(t *testing.T) {
 	assert.NotNil(errs)
 	errsStr := errs.Strings()
 	assert.Len(errsStr, 1)
-	assert.Equal("Namespace 'nsNil': no privileges", errsStr[0])
+	assert.Equal("namespace 'nsNil': no privileges", errsStr[0])
 	assert.NotNil(srv)
 	assert.Len(queries, 3)
 	assert.Equal("ns1", queries[0].Target.Namespace)
@@ -419,13 +415,12 @@ func TestPrepareStatsQueriesPartialError(t *testing.T) {
 
 func TestPrepareStatsQueriesNoErrorIntervalAdjusted(t *testing.T) {
 	assert := assert.New(t)
-	prom, _, k8s := utilSetupMocks(t)
 	queryTime := time.Date(2020, 10, 22, 0, 0, 0, 0, time.UTC)
-	creation := meta_v1.NewTime(queryTime.Add(-1 * time.Hour))
-	k8s.On("GetNamespace", "ns3").Return(&core_v1.Namespace{ObjectMeta: meta_v1.ObjectMeta{Name: "ns3", CreationTimestamp: creation}}, nil)
+	prom := utilSetupMocks(t, &core_v1.Namespace{ObjectMeta: meta_v1.ObjectMeta{Name: "ns3", CreationTimestamp: meta_v1.NewTime(queryTime.Add(-1 * time.Hour))}})
 
 	req := httptest.NewRequest("GET", "/foo", nil)
-	req = req.WithContext(context.WithValue(req.Context(), "authInfo", &api.AuthInfo{Token: "test"}))
+	authInfo := map[string]*api.AuthInfo{config.Get().KubernetesConfig.ClusterName: {Token: "test"}}
+	req = req.WithContext(authentication.SetAuthInfoContext(req.Context(), authInfo))
 	w := httptest.NewRecorder()
 
 	rawQ := []models.MetricsStatsQuery{{
@@ -453,11 +448,11 @@ func TestPrepareStatsQueriesNoErrorIntervalAdjusted(t *testing.T) {
 
 func TestValidateBadRequest(t *testing.T) {
 	assert := assert.New(t)
-	prom, _, _ := utilSetupMocks(t)
+	prom := utilSetupMocks(t)
 	queryTime := time.Date(2020, 10, 22, 0, 0, 0, 0, time.UTC)
 
 	req := httptest.NewRequest("GET", "/foo", nil)
-	req = req.WithContext(context.WithValue(req.Context(), "authInfo", &api.AuthInfo{Token: "test"}))
+	req = req.WithContext(authentication.SetAuthInfoContext(req.Context(), &api.AuthInfo{Token: "test"}))
 	w := httptest.NewRecorder()
 
 	rawQ := []models.MetricsStatsQuery{{

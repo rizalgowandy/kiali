@@ -1,10 +1,11 @@
 package routing
 
 import (
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	rpprof "runtime/pprof"
 	"testing"
 
 	"github.com/gorilla/mux"
@@ -12,24 +13,25 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/kubernetes/kubetest"
 	"github.com/kiali/kiali/prometheus/internalmetrics"
 )
 
 func TestDrawPathProperly(t *testing.T) {
 	conf := new(config.Config)
-	config.Set(conf)
-	router := NewRouter()
+	mockClientFactory := kubetest.NewK8SClientFactoryMock(kubetest.NewFakeK8sClient())
+	router, _ := NewRouter(conf, nil, mockClientFactory, nil, nil, nil, nil, nil)
 	testRoute(router, "Root", "GET", t)
 }
 
 func testRoute(router *mux.Router, name string, method string, t *testing.T) {
-	var path = router.Get(name)
+	path := router.Get(name)
 
 	if path == nil {
 		t.Error("path is not registered into router")
 	}
 
-	var methods, err = path.GetMethods()
+	methods, err := path.GetMethods()
 	if err != nil {
 		t.Error(err)
 	}
@@ -40,14 +42,11 @@ func testRoute(router *mux.Router, name string, method string, t *testing.T) {
 }
 
 func TestWebRootRedirect(t *testing.T) {
-	oldConfig := config.Get()
-	defer config.Set(oldConfig)
-
 	conf := new(config.Config)
 	conf.Server.WebRoot = "/test"
-	config.Set(conf)
 
-	router := NewRouter()
+	mockClientFactory := kubetest.NewK8SClientFactoryMock(kubetest.NewFakeK8sClient())
+	router, _ := NewRouter(conf, nil, mockClientFactory, nil, nil, nil, nil, nil)
 	ts := httptest.NewServer(router)
 	defer ts.Close()
 
@@ -68,9 +67,9 @@ func TestWebRootRedirect(t *testing.T) {
 
 func TestSimpleRoute(t *testing.T) {
 	conf := new(config.Config)
-	config.Set(conf)
 
-	router := NewRouter()
+	mockClientFactory := kubetest.NewK8SClientFactoryMock(kubetest.NewFakeK8sClient())
+	router, _ := NewRouter(conf, nil, mockClientFactory, nil, nil, nil, nil, nil)
 	ts := httptest.NewServer(router)
 	defer ts.Close()
 
@@ -80,25 +79,85 @@ func TestSimpleRoute(t *testing.T) {
 	}
 	assert.Equal(t, 200, resp.StatusCode, "Response should be ok")
 
-	body, _ := ioutil.ReadAll(resp.Body)
+	body, _ := io.ReadAll(resp.Body)
 	assert.Equal(t, "", string(body), "Response should be empty")
 }
 
-func TestRedirectWithSetWebRootKeepsParams(t *testing.T) {
-	oldConfig := config.Get()
-	defer config.Set(oldConfig)
+func TestProfilerRoute(t *testing.T) {
+	conf := new(config.Config)
+	conf.Server.Profiler.Enabled = true
 
+	mockClientFactory := kubetest.NewK8SClientFactoryMock(kubetest.NewFakeK8sClient())
+	router, _ := NewRouter(conf, nil, mockClientFactory, nil, nil, nil, nil, nil)
+	ts := httptest.NewServer(router)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/debug/pprof/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assert.Equal(t, 400, resp.StatusCode, "pprof index should exist but needed credentials")
+
+	for _, p := range rpprof.Profiles() {
+		resp, err = http.Get(ts.URL + "/debug/pprof/" + p.Name())
+		if err != nil {
+			t.Fatalf("Failed to get profile [%v]: %v", p, err)
+		}
+		assert.Equal(t, 400, resp.StatusCode, "pprof profile [%v] should exist but needed credentials", p.Name())
+	}
+	// note we do not test "profile" endpoint - it takes too long and besides that the test framework eventually times out
+	for _, p := range []string{"symbol", "trace"} {
+		resp, err = http.Get(ts.URL + "/debug/pprof/" + p)
+		if err != nil {
+			t.Fatalf("Failed to get profile [%v]: %v", p, err)
+		}
+		assert.Equal(t, 400, resp.StatusCode, "pprof endpoint [%v] should exist but needed credentials", p)
+	}
+}
+
+func TestDisabledProfilerRoute(t *testing.T) {
+	conf := new(config.Config)
+	conf.Server.Profiler.Enabled = false
+
+	mockClientFactory := kubetest.NewK8SClientFactoryMock(kubetest.NewFakeK8sClient())
+	router, _ := NewRouter(conf, nil, mockClientFactory, nil, nil, nil, nil, nil)
+	ts := httptest.NewServer(router)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/debug/pprof/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assert.Equal(t, 404, resp.StatusCode, "pprof should have been disabled")
+
+	for _, p := range rpprof.Profiles() {
+		resp, err = http.Get(ts.URL + "/debug/pprof/" + p.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		assert.Equal(t, 404, resp.StatusCode, "pprof should have been disabled [%v]", p.Name())
+	}
+	for _, p := range []string{"symbol", "trace", "profile"} {
+		resp, err = http.Get(ts.URL + "/debug/pprof/" + p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assert.Equal(t, 404, resp.StatusCode, "pprof should have been disabled [%v]", p)
+	}
+}
+
+func TestRedirectWithSetWebRootKeepsParams(t *testing.T) {
 	oldWd, _ := os.Getwd()
 	defer func() { _ = os.Chdir(oldWd) }()
 	_ = os.Chdir(os.TempDir())
-	_ = os.MkdirAll("./console", 0777)
+	_ = os.MkdirAll("./console", 0o777)
 	_, _ = os.Create("./console/index.html")
 
 	conf := new(config.Config)
 	conf.Server.WebRoot = "/test"
-	config.Set(conf)
 
-	router := NewRouter()
+	mockClientFactory := kubetest.NewK8SClientFactoryMock(kubetest.NewFakeK8sClient())
+	router, _ := NewRouter(conf, nil, mockClientFactory, nil, nil, nil, nil, nil)
 	ts := httptest.NewServer(router)
 	defer ts.Close()
 
@@ -112,21 +171,21 @@ func TestRedirectWithSetWebRootKeepsParams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, _ := ioutil.ReadAll(resp.Body)
+	body, _ := io.ReadAll(resp.Body)
 	assert.Equal(t, 200, resp.StatusCode, "Response should not redirect")
 
 	resp, err = client.Get(ts.URL + "/test/")
 	if err != nil {
 		t.Fatal(err)
 	}
-	body2, _ := ioutil.ReadAll(resp.Body)
+	body2, _ := io.ReadAll(resp.Body)
 	assert.Equal(t, 200, resp.StatusCode, string(body2))
 
 	assert.Equal(t, string(body), string(body2), "Response with and without the trailing slash on the webroot are not the same")
 }
 
 func TestMetricHandlerAPIFailures(t *testing.T) {
-	var errcodes = []struct {
+	errcodes := []struct {
 		Name string
 		Code int
 	}{

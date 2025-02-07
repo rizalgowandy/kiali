@@ -1,15 +1,15 @@
 package models
 
 import (
-	api_networking_v1alpha3 "istio.io/api/networking/v1alpha3"
-	networking_v1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
+	api_networking_v1 "istio.io/api/networking/v1"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
 
 	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/kubernetes"
 )
 
-func HasDRCircuitBreaker(dr *networking_v1alpha3.DestinationRule, namespace, serviceName, version string) bool {
-	if kubernetes.FilterByHost(dr.Spec.Host, serviceName, namespace) {
+func HasDRCircuitBreaker(dr *networking_v1.DestinationRule, namespace, serviceName, version string) bool {
+	if kubernetes.FilterByHost(dr.Spec.Host, dr.Namespace, serviceName, namespace) {
 		if isCB(dr.Spec.TrafficPolicy) {
 			return true
 		}
@@ -31,7 +31,7 @@ func HasDRCircuitBreaker(dr *networking_v1alpha3.DestinationRule, namespace, ser
 	return false
 }
 
-func isCB(trafficPolicy *api_networking_v1alpha3.TrafficPolicy) bool {
+func isCB(trafficPolicy *api_networking_v1.TrafficPolicy) bool {
 	if trafficPolicy == nil {
 		return false
 	}

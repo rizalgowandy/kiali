@@ -1,10 +1,7 @@
 package handlers
 
 import (
-	"context"
-	"errors"
-	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,7 +14,6 @@ import (
 	prom_v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
-	core_v1 "k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/clientcmd/api"
 
@@ -30,8 +26,7 @@ import (
 
 // TestNamespaceMetricsDefault is unit test (testing request handling, not the prometheus client behaviour)
 func TestNamespaceMetricsDefault(t *testing.T) {
-	ts, api, _ := setupNamespaceMetricsEndpoint(t)
-	defer ts.Close()
+	ts, api := setupNamespaceMetricsEndpoint(t)
 
 	url := ts.URL + "/api/namespaces/ns/metrics"
 	now := time.Now()
@@ -55,7 +50,7 @@ func TestNamespaceMetricsDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actual, _ := ioutil.ReadAll(resp.Body)
+	actual, _ := io.ReadAll(resp.Body)
 
 	assert.NotEmpty(t, actual)
 	assert.Equal(t, 200, resp.StatusCode, string(actual))
@@ -64,8 +59,7 @@ func TestNamespaceMetricsDefault(t *testing.T) {
 }
 
 func TestNamespaceMetricsWithParams(t *testing.T) {
-	ts, api, _ := setupNamespaceMetricsEndpoint(t)
-	defer ts.Close()
+	ts, api := setupNamespaceMetricsEndpoint(t)
 
 	req, err := http.NewRequest("GET", ts.URL+"/api/namespaces/ns/metrics", nil)
 	if err != nil {
@@ -113,7 +107,7 @@ func TestNamespaceMetricsWithParams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actual, _ := ioutil.ReadAll(resp.Body)
+	actual, _ := io.ReadAll(resp.Body)
 
 	assert.NotEmpty(t, actual)
 	assert.Equal(t, 200, resp.StatusCode, string(actual))
@@ -123,13 +117,11 @@ func TestNamespaceMetricsWithParams(t *testing.T) {
 }
 
 func TestNamespaceMetricsInaccessibleNamespace(t *testing.T) {
-	ts, _, k8s := setupNamespaceMetricsEndpoint(t)
-	defer ts.Close()
+	ts, _ := setupNamespaceMetricsEndpoint(t)
+	k8s := kubetest.NewFakeK8sClient(kubetest.FakeNamespace("my_namespace"))
+	business.SetupBusinessLayer(t, &noPrivClient{k8s}, *config.NewConfig())
 
 	url := ts.URL + "/api/namespaces/my_namespace/metrics"
-
-	var nsNil *osproject_v1.Project
-	k8s.On("GetProject", "my_namespace").Return(nsNil, errors.New("no privileges"))
 
 	resp, err := http.Get(url)
 	if err != nil {
@@ -137,79 +129,78 @@ func TestNamespaceMetricsInaccessibleNamespace(t *testing.T) {
 	}
 
 	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
-	k8s.AssertCalled(t, "GetProject", "my_namespace")
 }
 
-func setupNamespaceMetricsEndpoint(t *testing.T) (*httptest.Server, *prometheustest.PromAPIMock, *kubetest.K8SClientMock) {
-	client, xapi, k8s, err := setupMocked()
+func TestNamespaceInfo(t *testing.T) {
+	setupMocked(t)
+
+	authInfo := map[string]*api.AuthInfo{config.Get().KubernetesConfig.ClusterName: {Token: "test"}}
+	mr := mux.NewRouter()
+	mr.HandleFunc("/api/namespaces/{namespace}/info", WithAuthInfo(authInfo, NamespaceInfo))
+
+	ts := httptest.NewServer(mr)
+	t.Cleanup(ts.Close)
+
+	req, err := http.NewRequest("GET", ts.URL+"/api/namespaces/ns/info", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	k8s.On("GetProject", "ns").Return(&osproject_v1.Project{}, nil)
 
+	httpclient := &http.Client{}
+	resp, err := httpclient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, _ := io.ReadAll(resp.Body)
+
+	assert.NotEmpty(t, actual)
+	assert.Equal(t, 200, resp.StatusCode, string(actual))
+}
+
+func setupNamespaceMetricsEndpoint(t *testing.T) (*httptest.Server, *prometheustest.PromAPIMock) {
+	client, xapi := setupMocked(t)
+
+	authInfo := map[string]*api.AuthInfo{config.Get().KubernetesConfig.ClusterName: {Token: "test"}}
 	mr := mux.NewRouter()
 	mr.HandleFunc("/api/namespaces/{namespace}/metrics", http.HandlerFunc(
-		func(w http.ResponseWriter, r *http.Request) {
-			context := context.WithValue(r.Context(), "authInfo", &api.AuthInfo{Token: "test"})
-			getNamespaceMetrics(w, r.WithContext(context), func() (*prometheus.Client, error) {
-				return client, nil
-			})
-		}))
+		WithAuthInfo(
+			authInfo,
+			NamespaceMetrics(func() (*prometheus.Client, error) { return client, nil }),
+		),
+	))
 
 	ts := httptest.NewServer(mr)
-	return ts, xapi, k8s
+	t.Cleanup(ts.Close)
+	return ts, xapi
 }
 
 // Setup mock
 
-func setupMocked() (*prometheus.Client, *prometheustest.PromAPIMock, *kubetest.K8SClientMock, error) {
+func setupMocked(t *testing.T) (*prometheus.Client, *prometheustest.PromAPIMock) {
+	t.Helper()
+
 	conf := config.NewConfig()
-	conf.KubernetesConfig.CacheEnabled = false
 	config.Set(conf)
-	k8s := new(kubetest.K8SClientMock)
 
-	k8s.On("GetNamespaces").Return(
-		&core_v1.NamespaceList{
-			Items: []core_v1.Namespace{
-				{
-					ObjectMeta: meta_v1.ObjectMeta{
-						Name: "bookinfo",
-					},
-				},
-				{
-					ObjectMeta: meta_v1.ObjectMeta{
-						Name: "tutorial",
-					},
-				},
-			},
-		}, nil)
-
-	fmt.Println("!!! Set up standard mock")
-	k8s.On("GetProjects").Return(
-		[]osproject_v1.Project{
-			{
-				ObjectMeta: meta_v1.ObjectMeta{
-					Name: "bookinfo",
-				},
-			},
-			{
-				ObjectMeta: meta_v1.ObjectMeta{
-					Name: "tutorial",
-				},
-			},
-		}, nil)
-
-	k8s.On("IsOpenShift").Return(true)
+	k := kubetest.NewFakeK8sClient(
+		kubetest.FakeNamespace("bookinfo"),
+		kubetest.FakeNamespace("tutorial"),
+		kubetest.FakeNamespace("ns"),
+		&osproject_v1.Project{ObjectMeta: meta_v1.ObjectMeta{Name: "bookinfo"}},
+		&osproject_v1.Project{ObjectMeta: meta_v1.ObjectMeta{Name: "tutorial"}},
+		&osproject_v1.Project{ObjectMeta: meta_v1.ObjectMeta{Name: "ns"}},
+	)
+	k.OpenShift = true
 
 	api := new(prometheustest.PromAPIMock)
 	client, err := prometheus.NewClient()
 	if err != nil {
-		return nil, nil, nil, err
+		t.Fatal(err)
+		return nil, nil
 	}
 	client.Inject(api)
 
-	mockClientFactory := kubetest.NewK8SClientFactoryMock(k8s)
-	business.SetWithBackends(mockClientFactory, nil)
+	business.SetupBusinessLayer(t, k, *conf)
 
-	return client, api, k8s, nil
+	return client, api
 }

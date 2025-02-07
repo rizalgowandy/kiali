@@ -10,7 +10,9 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
+	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/kubernetes"
+	"github.com/kiali/kiali/log"
 	"github.com/kiali/kiali/models"
 )
 
@@ -26,8 +28,13 @@ func (p PortMappingChecker) Check() ([]*models.IstioCheck, bool) {
 	// Check Port naming for services in the service mesh
 	if p.hasMatchingPodsWithSidecar(p.Service) {
 		for portIndex, sp := range p.Service.Spec.Ports {
-			if strings.ToLower(string(sp.Protocol)) == "udp" {
+			if _, ok := p.Service.Labels["kiali_wizard"]; ok || strings.ToLower(string(sp.Protocol)) == "udp" {
 				continue
+			} else if sp.AppProtocol != nil {
+				if !kubernetes.MatchPortAppProtocolWithValidProtocols(sp.AppProtocol) {
+					validation := models.Build("port.appprotocol.mismatch", fmt.Sprintf("spec/ports[%d]", portIndex))
+					validations = append(validations, &validation)
+				}
 			} else if !kubernetes.MatchPortNameWithValidProtocols(sp.Name) {
 				validation := models.Build("port.name.mismatch", fmt.Sprintf("spec/ports[%d]", portIndex))
 				validations = append(validations, &validation)
@@ -35,6 +42,16 @@ func (p PortMappingChecker) Check() ([]*models.IstioCheck, bool) {
 		}
 	}
 
+	// Ignoring istio-system Services as some ports are used for debug purposes and not exposed in deployments
+	if config.IsIstioNamespace(p.Service.Namespace) {
+		log.Tracef("Skipping Port matching check for Service %s from Istio Namespace %s", p.Service.Name, p.Service.Namespace)
+		return validations, len(validations) == 0
+	}
+	// Ignoring waypoint Services as auto-generated
+	if config.IsWaypoint(p.Service.Labels) {
+		log.Tracef("Skipping Port matching check for waypoint Service %s from Namespace %s", p.Service.Name, p.Service.Namespace)
+		return validations, len(validations) == 0
+	}
 	if deployment := p.findMatchingDeployment(p.Service.Spec.Selector); deployment != nil {
 		p.matchPorts(&p.Service, deployment, &validations)
 	}
@@ -44,7 +61,7 @@ func (p PortMappingChecker) Check() ([]*models.IstioCheck, bool) {
 
 func (p PortMappingChecker) hasMatchingPodsWithSidecar(service v1.Service) bool {
 	sPods := models.Pods{}
-	sPods.Parse(kubernetes.FilterPodsForService(&service, p.Pods))
+	sPods.Parse(kubernetes.FilterPodsByService(&service, p.Pods))
 	return sPods.HasIstioSidecar()
 }
 

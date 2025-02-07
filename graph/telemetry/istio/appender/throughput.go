@@ -37,8 +37,13 @@ func (a ThroughputAppender) Name() string {
 	return ThroughputAppenderName
 }
 
+// IsFinalizer implements Appender
+func (a ThroughputAppender) IsFinalizer() bool {
+	return false
+}
+
 // AppendGraph implements Appender
-func (a ThroughputAppender) AppendGraph(trafficMap graph.TrafficMap, globalInfo *graph.AppenderGlobalInfo, namespaceInfo *graph.AppenderNamespaceInfo) {
+func (a ThroughputAppender) AppendGraph(trafficMap graph.TrafficMap, globalInfo *graph.GlobalInfo, namespaceInfo *graph.AppenderNamespaceInfo) {
 	if len(trafficMap) == 0 {
 		return
 	}
@@ -67,14 +72,14 @@ func (a ThroughputAppender) appendGraph(trafficMap graph.TrafficMap, namespace s
 	// query prometheus for throughput info in two queries:
 	groupBy := "source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision"
 	metric := fmt.Sprintf("istio_%s_bytes_sum", a.ThroughputType)
-	reporter := "destination"
+	reporter := util.GetReporter("destination", a.Rates)
 	if a.ThroughputType == "request" {
-		reporter = "source"
+		reporter = util.GetReporter("source", a.Rates)
 	}
 
 	// query prometheus for throughput rates in two queries:
 	// 1) query for requests originating from a workload outside the namespace.
-	query := fmt.Sprintf(`sum(rate(%s{reporter="%s",source_workload_namespace!="%s",destination_service_namespace="%s"}[%vs])) by (%s) > 0`,
+	query := fmt.Sprintf(`sum(rate(%s{%s,source_workload_namespace!="%s",destination_service_namespace="%s"}[%vs])) by (%s) > 0`,
 		metric,
 		reporter,
 		namespace,
@@ -85,7 +90,7 @@ func (a ThroughputAppender) appendGraph(trafficMap graph.TrafficMap, namespace s
 	a.populateThroughputMap(throughputMap, &vector)
 
 	// 2) query for requests originating from a workload inside of the namespace
-	query = fmt.Sprintf(`sum(rate(%s{reporter="%s",source_workload_namespace="%s"}[%vs])) by (%s) > 0`,
+	query = fmt.Sprintf(`sum(rate(%s{%s,source_workload_namespace="%s"}[%vs])) by (%s) > 0`,
 		metric,
 		reporter,
 		namespace,
@@ -157,10 +162,19 @@ func (a ThroughputAppender) populateThroughputMap(throughputMap map[string]float
 			continue
 		}
 
-		// don't inject a service node if destSvcName is not set or the dest node is already a service node.
+		// don't inject a service node if any of:
+		// - destSvcName is not set
+		// - destSvcName is PassthroughCluster (see https://github.com/kiali/kiali/issues/4488)
+		// - dest node is already a service node
+		// - note: we ignore the waypoint injection problem here because ztunnel does not generate throughput
+		//         telemetry for waypoint source or destination traffic (see istio.go for where we do handle it)
 		inject := false
-		if a.InjectServiceNodes && graph.IsOK(destSvcName) {
-			_, destNodeType := graph.Id(destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, a.GraphType)
+		if a.InjectServiceNodes && graph.IsOK(destSvcName) && destSvcName != graph.PassthroughCluster {
+			_, destNodeType, err := graph.Id(destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, a.GraphType)
+			if err != nil {
+				log.Warningf("Skipping (t) %s, %s", m.String(), err)
+				continue
+			}
 			inject = (graph.NodeTypeService != destNodeType)
 		}
 
@@ -175,8 +189,16 @@ func (a ThroughputAppender) populateThroughputMap(throughputMap map[string]float
 }
 
 func (a ThroughputAppender) addThroughput(throughputMap map[string]float64, val float64, sourceCluster, sourceNs, sourceSvc, sourceWl, sourceApp, sourceVer, destCluster, destSvcNs, destSvc, destWlNs, destWl, destApp, destVer string) {
-	sourceID, _ := graph.Id(sourceCluster, sourceNs, sourceSvc, sourceNs, sourceWl, sourceApp, sourceVer, a.GraphType)
-	destID, _ := graph.Id(destCluster, destSvcNs, destSvc, destWlNs, destWl, destApp, destVer, a.GraphType)
+	sourceID, _, err := graph.Id(sourceCluster, sourceNs, sourceSvc, sourceNs, sourceWl, sourceApp, sourceVer, a.GraphType)
+	if err != nil {
+		log.Warningf("Skipping addThroughput (source), %s", err)
+		return
+	}
+	destID, _, err := graph.Id(destCluster, destSvcNs, destSvc, destWlNs, destWl, destApp, destVer, a.GraphType)
+	if err != nil {
+		log.Warningf("Skipping addThroughput (dest), %s", err)
+		return
+	}
 	key := fmt.Sprintf("%s %s http", sourceID, destID)
 
 	throughputMap[key] += val

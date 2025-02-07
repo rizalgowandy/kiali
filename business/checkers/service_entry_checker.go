@@ -1,35 +1,41 @@
 package checkers
 
 import (
-	networking_v1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
 
 	"github.com/kiali/kiali/business/checkers/common"
+	"github.com/kiali/kiali/business/checkers/serviceentries"
+	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
 )
 
-const ServiceEntryCheckerType = "serviceentry"
-
 type ServiceEntryChecker struct {
-	ServiceEntries         []networking_v1alpha3.ServiceEntry
-	ExportedServiceEntries []networking_v1alpha3.ServiceEntry
-	Namespaces             models.Namespaces
+	ServiceEntries  []*networking_v1.ServiceEntry
+	Namespaces      models.Namespaces
+	WorkloadEntries []*networking_v1.WorkloadEntry
+	Cluster         string
 }
 
 func (s ServiceEntryChecker) Check() models.IstioValidations {
 	validations := models.IstioValidations{}
 
+	weMap := serviceentries.GroupWorkloadEntriesByLabels(s.WorkloadEntries)
+
 	for _, se := range s.ServiceEntries {
-		validations.MergeValidations(s.runSingleChecks(se))
+		validations.MergeValidations(s.runSingleChecks(se, weMap))
 	}
 
 	return validations
 }
 
-func (s ServiceEntryChecker) runSingleChecks(se networking_v1alpha3.ServiceEntry) models.IstioValidations {
-	key, validations := EmptyValidValidation(se.Name, se.Namespace, ServiceEntryCheckerType)
+func (s ServiceEntryChecker) runSingleChecks(se *networking_v1.ServiceEntry, workloadEntriesMap map[string][]string) models.IstioValidations {
+	key, validations := EmptyValidValidation(se.Name, se.Namespace, kubernetes.ServiceEntries, s.Cluster)
 
 	enabledCheckers := []Checker{
-		common.ExportToNamespaceChecker{ExportTo: se.Spec.ExportTo, Namespaces: s.Namespaces},
+		serviceentries.HasMatchingWorkloadEntryAddress{ServiceEntry: se, WorkloadEntries: workloadEntriesMap},
+	}
+	if !s.Namespaces.IsNamespaceAmbient(se.Namespace, s.Cluster) {
+		enabledCheckers = append(enabledCheckers, common.ExportToNamespaceChecker{ExportTo: se.Spec.ExportTo, Namespaces: s.Namespaces})
 	}
 
 	for _, checker := range enabledCheckers {

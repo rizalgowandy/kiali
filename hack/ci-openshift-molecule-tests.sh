@@ -123,6 +123,13 @@ Options:
     than to install its own operator.
     Default: helm
 
+-rr|--reduce-resources <true|false>
+    When true, and if Istio will be installed (see --install-istio), some Istio components
+    (such as sidecar proxies) will be given a smaller amount of resources (CPU and memory)
+    which will allow you to run the tests on a cluster that does not have a large amount
+    of resources.
+    Default: false
+
 -sd|--src-dir <directory>
     Where the git source repositories will be cloned.
     Default: /tmp/KIALI-GIT
@@ -144,12 +151,13 @@ Options:
     If false, the cluster will simply pull the 'latest' images published on quay.io.
     Default: false
 
--udsi|--use-default-server-image <true|false>
+-udefi|--use-default-images <true|false>
     If true (and --use-dev-images is 'false') no specific image name or version will be specified in
-    the Kiali CRs that are created by the molecule tests. In other words, spec.deployment.image_name and
-    spec.deployment.image_version will be empty strings. This means the Kial server image that will be deployed
-    in the tests will be determined by the operator defaults. This is useful when testing with a specific
-    spec.version (--spec-version) and you want the operator to install the default server image for that version.
+    the CRs that are created by the molecule tests. In other words, spec.deployment.image_name and
+    spec.deployment.image_version will be empty strings. This means the Kial server image and the OSSMC image
+    that will be deployed in the tests will be determined by the operator defaults.
+    This is useful when testing with a specific spec.version (--spec-version) and you want the operator
+    to install the default server image for that version.
     Default: false
 
 -ul|--upload-logs <true|false>
@@ -188,11 +196,12 @@ while [[ $# -gt 0 ]]; do
     -oapi|--openshift-api)        OPENSHIFT_API="$2";         shift;shift; ;;
     -oc)                          OC="$2";                    shift;shift; ;;
     -oi|--operator-installer)     OPERATOR_INSTALLER="$2";    shift;shift; ;;
+    -rr|--reduce-resources)       REDUCE_RESOURCES="$2";      shift;shift; ;;
     -sd|--src-dir)                SRC="$2";                   shift;shift; ;;
     -st|--skip-tests)             SKIP_TESTS="$2";            shift;shift; ;;
     -sv|--spec-version)           SPEC_VERSION="$2";          shift;shift; ;;
     -udi|--use-dev-images)        USE_DEV_IMAGES="$2";        shift;shift; ;;
-    -udsi|--use-default-server-image) USE_DEFAULT_SERVER_IMAGE="$2"; shift;shift; ;;
+    -udefi|--use-default-images)  USE_DEFAULT_IMAGES="$2";    shift;shift; ;;
     -ul|--upload-logs)            UPLOAD_LOGS="$2";           shift;shift; ;;
     *) echo "Unknown argument: [$key]. Aborting."; helpmsg; exit 1 ;;
   esac
@@ -251,7 +260,9 @@ IRC_ROOM="${IRC_ROOM-kiali-molecule-tests}"
 UPLOAD_LOGS="${UPLOAD_LOGS:-false}"
 
 # Only if this is set to "true" will Istio be installed if it is missing
+# The reduce resources flag is not used unless Istio will be installed.
 INSTALL_ISTIO="${INSTALL_ISTIO:-true}"
+REDUCE_RESOURCES="${REDUCE_RESOURCES:-false}"
 
 # Determines if we should build and push dev images
 USE_DEV_IMAGES="${USE_DEV_IMAGES:-false}"
@@ -259,8 +270,8 @@ USE_DEV_IMAGES="${USE_DEV_IMAGES:-false}"
 # Determines what Kiali CR spec.version the tests should use
 SPEC_VERSION="${SPEC_VERSION:-default}"
 
-# Determines if image_name/image_version should be omitted from test Kiali CRs
-USE_DEFAULT_SERVER_IMAGE="${USE_DEFAULT_SERVER_IMAGE:-false}"
+# Determines if image_name/image_version should be omitted from test Kiali CRs and OSSMConsole CRs
+USE_DEFAULT_IMAGES="${USE_DEFAULT_IMAGES:-false}"
 
 # print out our settings for debug purposes
 cat <<EOM
@@ -287,12 +298,13 @@ LOGS_LOCAL_SUBDIR=$LOGS_LOCAL_SUBDIR
 LOGS_LOCAL_SUBDIR_ABS=$LOGS_LOCAL_SUBDIR_ABS
 OC=$OC
 OPERATOR_INSTALLER=$OPERATOR_INSTALLER
+REDUCE_RESOURCES=$REDUCE_RESOURCES
 SKIP_TESTS=$SKIP_TESTS
 SPEC_VERSION=$SPEC_VERSION
 SRC=$SRC
 UPLOAD_LOGS=$UPLOAD_LOGS
 USE_DEV_IMAGES=$USE_DEV_IMAGES
-USE_DEFAULT_SERVER_IMAGE=$USE_DEFAULT_SERVER_IMAGE
+USE_DEFAULT_IMAGES=$USE_DEFAULT_IMAGES
 === SETTINGS ===
 EOM
 
@@ -364,16 +376,17 @@ infomsg "Log into the cluster [${OPENSHIFT_API}] as kubeadmin user named [${KUBE
 $OC login -u ${KUBEADMIN_USER} -p ${KUBEADMIN_PW} ${OPENSHIFT_API}
 
 if [ "${USE_DEV_IMAGES}" == "true" ]; then
-  infomsg "Dev images are to be tested. Will prepare them now."
+  GOPATH="${GOPATH:-/tmp}"
+  infomsg "Dev images are to be tested. Will prepare them now using GOPATH=${GOPATH}"
 
-  infomsg "Building dev image..."
-  make -e OC="${OC}" -e DORP="${DORP}" clean build test
+  infomsg "Building backend server and frontend UI..."
+  make -e OC="${OC}" -e DORP="${DORP}" -e GOPATH="${GOPATH}" clean build test build-ui
 
   infomsg "Logging into the image registry..."
   eval $(make -e OC="${OC}" -e DORP="${DORP}" cluster-status | grep "Image Registry login:" | sed 's/Image Registry login: \(.*\)$/\1/')
 
   infomsg "Pushing the images into the cluster..."
-  make -e OC="${OC}" -e DORP="${DORP}" cluster-push
+  make -e OC="${OC}" -e DORP="${DORP}" -e GOPATH="${GOPATH}" cluster-push
 else
   infomsg "Will test the latest published images"
 fi
@@ -391,7 +404,7 @@ if ! $OC get namespace istio-system > /dev/null; then
       DOWNLOAD_ISTIO_VERSION_ARG="--istio-version ${ISTIO_VERSION}"
     fi
     hack/istio/download-istio.sh ${DOWNLOAD_ISTIO_VERSION_ARG}
-    hack/istio/install-istio-via-istioctl.sh --client-exe-path "$OC"
+    hack/istio/install-istio-via-istioctl.sh --client-exe-path "$OC" --reduce-resources "${REDUCE_RESOURCES}"
   else
     infomsg "There is no 'istio-system' namespace, and this script was told not to install Istio. Aborting."
     exit 1
@@ -405,7 +418,7 @@ make -e FORCE_MOLECULE_BUILD="true" -e DORP="${DORP}" molecule-build
 
 mkdir -p "${LOGS_LOCAL_SUBDIR_ABS}"
 infomsg "Running the tests - logs are going here: ${LOGS_LOCAL_SUBDIR_ABS}"
-eval hack/run-molecule-tests.sh $(test ! -z "$ALL_TESTS" && echo "--all-tests \"$ALL_TESTS\"") $(test ! -z "$SKIP_TESTS" && echo "--skip-tests \"$SKIP_TESTS\"") --use-dev-images "${USE_DEV_IMAGES}" --use-default-server-image "${USE_DEFAULT_SERVER_IMAGE}" --spec-version "${SPEC_VERSION}" --helm-charts-repo "${SRC}/helm-charts" --client-exe "$OC" --color false --test-logs-dir "${LOGS_LOCAL_SUBDIR_ABS}" -dorp "${DORP}" --operator-installer "${OPERATOR_INSTALLER:-helm}" > "${LOGS_LOCAL_RESULTS}"
+eval hack/run-molecule-tests.sh $(test ! -z "$ALL_TESTS" && echo "--all-tests \"$ALL_TESTS\"") $(test ! -z "$SKIP_TESTS" && echo "--skip-tests \"$SKIP_TESTS\"") --use-dev-images "${USE_DEV_IMAGES}" --use-default-images "${USE_DEFAULT_IMAGES}" --spec-version "${SPEC_VERSION}" --helm-charts-repo "${SRC}/helm-charts" --client-exe "$OC" --color false --test-logs-dir "${LOGS_LOCAL_SUBDIR_ABS}" -dorp "${DORP}" --operator-installer "${OPERATOR_INSTALLER:-helm}" > "${LOGS_LOCAL_RESULTS}"
 
 cd ${LOGS_LOCAL_SUBDIR_ABS}
 

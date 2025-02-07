@@ -1,15 +1,15 @@
 package handlers
 
 import (
-	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gorilla/mux"
 	"github.com/stretchr/testify/assert"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kiali/kiali/business"
@@ -18,15 +18,11 @@ import (
 )
 
 func setupTestLoggingServer(t *testing.T, namespace, pod string) *httptest.Server {
-	conf := config.NewConfig()
-	conf.KubernetesConfig.CacheEnabled = false
-	config.Set(conf)
-
 	mr := mux.NewRouter()
 	path := "/api/namespaces/{namespace}/pods/{pod}/logging"
+	authInfo := map[string]*api.AuthInfo{config.Get().KubernetesConfig.ClusterName: {Token: "test"}}
 	mr.HandleFunc(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx := context.WithValue(r.Context(), "authInfo", &api.AuthInfo{Token: "test"})
-		LoggingUpdate(w, r.Clone(ctx))
+		WithAuthInfo(authInfo, LoggingUpdate)(w, r)
 	}))
 
 	ts := httptest.NewServer(mr)
@@ -34,7 +30,10 @@ func setupTestLoggingServer(t *testing.T, namespace, pod string) *httptest.Serve
 
 	k8s := new(kubetest.K8SClientMock)
 	k8s.On("IsOpenShift").Return(false)
+	k8s.On("IsGatewayAPI").Return(false)
 	k8s.On("SetProxyLogLevel").Return(nil)
+	var fakePod *corev1.Pod
+	k8s.On("GetPod", namespace, pod).Return(fakePod, nil)
 
 	mockClientFactory := kubetest.NewK8SClientFactoryMock(k8s)
 	business.SetWithBackends(mockClientFactory, nil)
@@ -57,7 +56,7 @@ func TestProxyLoggingSucceeds(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := ioutil.ReadAll(resp.Body)
+	body, _ := io.ReadAll(resp.Body)
 	assert.Equalf(200, resp.StatusCode, "response text: %s", string(body))
 }
 
@@ -76,7 +75,7 @@ func TestMissingQueryParamFails(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := ioutil.ReadAll(resp.Body)
+	body, _ := io.ReadAll(resp.Body)
 	assert.Equalf(400, resp.StatusCode, "response text: %s", string(body))
 }
 
@@ -95,6 +94,6 @@ func TestIncorrectQueryParamFails(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := ioutil.ReadAll(resp.Body)
+	body, _ := io.ReadAll(resp.Body)
 	assert.Equalf(400, resp.StatusCode, "response text: %s", string(body))
 }

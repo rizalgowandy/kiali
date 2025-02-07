@@ -101,7 +101,7 @@ func listenerMatches(listener kubernetes.EnvoyListener) []map[string]interface{}
 
 		port := ""
 		if match.DestinationPort != nil {
-			port = fmt.Sprintf(":%d", match.DestinationPort)
+			port = fmt.Sprintf(":%d", *match.DestinationPort)
 		}
 
 		if len(match.PrefixRanges) > 0 {
@@ -273,7 +273,7 @@ func (cs *Cluster) Parse(cluster kubernetes.EnvoyCluster) {
 
 	parts := strings.Split(cluster.Name, "|")
 	if len(parts) > 3 {
-		cs.ServiceFQDN = kubernetes.ParseHost(parts[3], "", "")
+		cs.ServiceFQDN = kubernetes.ParseHost(parts[3], "")
 		cs.Port, _ = strconv.Atoi(strings.TrimSuffix(parts[1], "_"))
 		cs.Subset = parts[2]
 		cs.Direction = strings.TrimSuffix(parts[0], "_")
@@ -345,7 +345,7 @@ func bestDomainMatch(domains []string, namespaces []string) kubernetes.Host {
 	}
 
 	if len(domains) == 1 {
-		return kubernetes.GetHost(domains[0], "", "", namespaces)
+		return kubernetes.GetHost(domains[0], "", namespaces)
 	}
 
 	bestMatch := domains[0]
@@ -363,7 +363,7 @@ func bestDomainMatch(domains []string, namespaces []string) kubernetes.Host {
 			bestMatch = domain
 		}
 	}
-	return kubernetes.GetHost(bestMatch, "", "", namespaces)
+	return kubernetes.GetHost(bestMatch, "", namespaces)
 }
 
 func istioMetadata(metadata *kubernetes.EnvoyMetadata) string {
@@ -375,7 +375,7 @@ func istioMetadata(metadata *kubernetes.EnvoyMetadata) string {
 }
 
 func renderConfig(configPath string) string {
-	if strings.HasPrefix(configPath, "/apis/networking.istio.io/v1alpha3/namespaces/") {
+	if strings.HasPrefix(configPath, "/apis/networking.istio.io/v1/namespaces/") {
 		parts := strings.Split(configPath, "/")
 		if len(parts) != 8 {
 			return ""

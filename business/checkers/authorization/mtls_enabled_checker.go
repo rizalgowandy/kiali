@@ -3,9 +3,9 @@ package authorization
 import (
 	"fmt"
 
-	api_security_v1beta "istio.io/api/security/v1beta1"
-	networking_v1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
-	security_v1beta "istio.io/client-go/pkg/apis/security/v1beta1"
+	api_security_v1 "istio.io/api/security/v1"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
+	security_v1 "istio.io/client-go/pkg/apis/security/v1"
 
 	"k8s.io/apimachinery/pkg/labels"
 
@@ -14,14 +14,12 @@ import (
 	"github.com/kiali/kiali/util/mtls"
 )
 
-const objectType = "authorizationpolicy"
-
 type MtlsEnabledChecker struct {
-	Namespace             string
-	AuthorizationPolicies []security_v1beta.AuthorizationPolicy
+	AuthorizationPolicies []*security_v1.AuthorizationPolicy
+	Cluster               string
 	MtlsDetails           kubernetes.MTLSDetails
-	ServiceList           models.ServiceList
-	ServiceEntries        []networking_v1alpha3.ServiceEntry
+	ServiceEntries        []networking_v1.ServiceEntry
+	RegistryServices      []*kubernetes.RegistryService
 }
 
 // Checks if mTLS is enabled, mark all Authz Policies with error
@@ -33,11 +31,11 @@ func (c MtlsEnabledChecker) Check() models.IstioValidations {
 		if ap.Spec.Selector != nil {
 			matchLabels = ap.Spec.Selector.MatchLabels
 		}
-		receiveMtlsTraffic := c.IsMtlsEnabledFor(matchLabels)
+		receiveMtlsTraffic := c.IsMtlsEnabledFor(matchLabels, ap.Namespace)
 		if !receiveMtlsTraffic {
-			if need, paths := needsMtls(&ap); need {
+			if need, paths := needsMtls(ap); need {
 				checks := make([]*models.IstioCheck, 0)
-				key := models.BuildKey(objectType, ap.Name, ap.Namespace)
+				key := models.BuildKey(kubernetes.AuthorizationPolicies, ap.Name, ap.Namespace, c.Cluster)
 
 				for _, path := range paths {
 					check := models.Build("authorizationpolicy.mtls.needstobeenabled", path)
@@ -45,10 +43,11 @@ func (c MtlsEnabledChecker) Check() models.IstioValidations {
 				}
 
 				validations.MergeValidations(models.IstioValidations{key: &models.IstioValidation{
-					Name:       ap.Namespace,
-					ObjectType: objectType,
-					Valid:      false,
-					Checks:     checks,
+					Cluster:   c.Cluster,
+					Name:      ap.Namespace,
+					ObjectGVK: kubernetes.AuthorizationPolicies,
+					Valid:     false,
+					Checks:    checks,
 				}})
 			}
 		}
@@ -57,7 +56,7 @@ func (c MtlsEnabledChecker) Check() models.IstioValidations {
 	return validations
 }
 
-func needsMtls(ap *security_v1beta.AuthorizationPolicy) (bool, []string) {
+func needsMtls(ap *security_v1.AuthorizationPolicy) (bool, []string) {
 	paths := make([]string, 0)
 	if len(ap.Spec.Rules) == 0 {
 		return false, nil
@@ -77,10 +76,10 @@ func needsMtls(ap *security_v1beta.AuthorizationPolicy) (bool, []string) {
 	return len(paths) > 0, paths
 }
 
-func fromNeedsMtls(froms []*api_security_v1beta.Rule_From, ruleNum int) (bool, []string) {
+func fromNeedsMtls(froms []*api_security_v1.Rule_From, ruleNum int) (bool, []string) {
 	paths := make([]string, 0)
 
-	for _, from := range froms {
+	for fromNum, from := range froms {
 		if from == nil {
 			continue
 		}
@@ -90,22 +89,22 @@ func fromNeedsMtls(froms []*api_security_v1beta.Rule_From, ruleNum int) (bool, [
 		}
 
 		if len(from.Source.Principals) > 0 {
-			paths = append(paths, fmt.Sprintf("spec/rules[%d]/source/principals", ruleNum))
+			paths = append(paths, fmt.Sprintf("spec/rules[%d]/from[%d]/source/principals", ruleNum, fromNum))
 		}
 		if len(from.Source.NotPrincipals) > 0 {
-			paths = append(paths, fmt.Sprintf("spec/rules[%d]/source/notPrincipals", ruleNum))
+			paths = append(paths, fmt.Sprintf("spec/rules[%d]/from[%d]/source/notPrincipals", ruleNum, fromNum))
 		}
 		if len(from.Source.Namespaces) > 0 {
-			paths = append(paths, fmt.Sprintf("spec/rules[%d]/source/namespaces", ruleNum))
+			paths = append(paths, fmt.Sprintf("spec/rules[%d]/from[%d]/source/namespaces", ruleNum, fromNum))
 		}
 		if len(from.Source.NotNamespaces) > 0 {
-			paths = append(paths, fmt.Sprintf("spec/rules[%d]/source/notNamespaces", ruleNum))
+			paths = append(paths, fmt.Sprintf("spec/rules[%d]/from[%d]/source/notNamespaces", ruleNum, fromNum))
 		}
 	}
 	return len(paths) > 0, paths
 }
 
-func conditionNeedsMtls(conditions []*api_security_v1beta.Condition, ruleNum int) (bool, []string) {
+func conditionNeedsMtls(conditions []*api_security_v1.Condition, ruleNum int) (bool, []string) {
 	var keysWithMtls = [3]string{"source.namespace", "source.principal", "connection.sni"}
 	paths := make([]string, 0)
 
@@ -122,8 +121,8 @@ func conditionNeedsMtls(conditions []*api_security_v1beta.Condition, ruleNum int
 	return len(paths) > 0, paths
 }
 
-func (c MtlsEnabledChecker) IsMtlsEnabledFor(labels labels.Set) bool {
-	mtlsEnabledNamespaceLevel := c.hasMtlsEnabledForNamespace() == mtls.MTLSEnabled
+func (c MtlsEnabledChecker) IsMtlsEnabledFor(labels labels.Set, namespace string) bool {
+	mtlsEnabledNamespaceLevel := c.hasMtlsEnabledForNamespace(namespace) == mtls.MTLSEnabled
 	if labels == nil {
 		return mtlsEnabledNamespaceLevel
 	}
@@ -132,10 +131,9 @@ func (c MtlsEnabledChecker) IsMtlsEnabledFor(labels labels.Set) bool {
 		AutoMtlsEnabled:     c.MtlsDetails.EnabledAutoMtls,
 		DestinationRules:    c.MtlsDetails.DestinationRules,
 		MatchingLabels:      labels,
-		Namespace:           c.Namespace,
 		PeerAuthentications: c.MtlsDetails.PeerAuthentications,
-		ServiceList:         c.ServiceList,
-	}.WorkloadMtlsStatus()
+		RegistryServices:    c.RegistryServices,
+	}.WorkloadMtlsStatus(namespace)
 
 	if workloadmTlsStatus == mtls.MTLSEnabled {
 		return true
@@ -149,10 +147,10 @@ func (c MtlsEnabledChecker) IsMtlsEnabledFor(labels labels.Set) bool {
 	return false
 }
 
-func (c MtlsEnabledChecker) hasMtlsEnabledForNamespace() string {
+func (c MtlsEnabledChecker) hasMtlsEnabledForNamespace(namespace string) string {
 	mtlsStatus := mtls.MtlsStatus{
 		AutoMtlsEnabled: c.MtlsDetails.EnabledAutoMtls,
-	}.OverallMtlsStatus(c.namespaceMtlsStatus(), c.meshWideMtlsStatus())
+	}.OverallMtlsStatus(c.namespaceMtlsStatus(namespace), c.meshWideMtlsStatus())
 
 	// If there isn't any PeerAuthn or DestinationRule and AutoMtls is enabled,
 	// then we can consider that the rule will be using mtls
@@ -166,7 +164,6 @@ func (c MtlsEnabledChecker) hasMtlsEnabledForNamespace() string {
 
 func (c MtlsEnabledChecker) meshWideMtlsStatus() mtls.TlsStatus {
 	mtlsStatus := mtls.MtlsStatus{
-		Namespace:           c.Namespace,
 		PeerAuthentications: c.MtlsDetails.MeshPeerAuthentications,
 		DestinationRules:    c.MtlsDetails.DestinationRules,
 		AutoMtlsEnabled:     c.MtlsDetails.EnabledAutoMtls,
@@ -176,14 +173,13 @@ func (c MtlsEnabledChecker) meshWideMtlsStatus() mtls.TlsStatus {
 	return mtlsStatus.MeshMtlsStatus()
 }
 
-func (c MtlsEnabledChecker) namespaceMtlsStatus() mtls.TlsStatus {
+func (c MtlsEnabledChecker) namespaceMtlsStatus(namespace string) mtls.TlsStatus {
 	mtlsStatus := mtls.MtlsStatus{
-		Namespace:           c.Namespace,
 		PeerAuthentications: c.MtlsDetails.PeerAuthentications,
 		DestinationRules:    c.MtlsDetails.DestinationRules,
 		AutoMtlsEnabled:     c.MtlsDetails.EnabledAutoMtls,
 		AllowPermissive:     true,
 	}
 
-	return mtlsStatus.NamespaceMtlsStatus()
+	return mtlsStatus.NamespaceMtlsStatus(namespace)
 }

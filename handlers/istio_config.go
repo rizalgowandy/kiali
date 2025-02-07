@@ -1,17 +1,20 @@
 package handlers
 
 import (
-	"io/ioutil"
+	"context"
+	"io"
 	"net/http"
 	"strings"
-	"sync"
 
 	"github.com/gorilla/mux"
+
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/kiali/kiali/business"
 	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/log"
 	"github.com/kiali/kiali/models"
+	"github.com/kiali/kiali/util"
 )
 
 func IstioConfigList(w http.ResponseWriter, r *http.Request) {
@@ -21,9 +24,9 @@ func IstioConfigList(w http.ResponseWriter, r *http.Request) {
 	objects := ""
 	parsedTypes := make([]string, 0)
 	if _, ok := query["objects"]; ok {
-		objects = strings.ToLower(query.Get("objects"))
+		objects = query.Get("objects")
 		if len(objects) > 0 {
-			parsedTypes = strings.Split(objects, ",")
+			parsedTypes = strings.Split(objects, ";")
 		}
 	}
 
@@ -42,7 +45,12 @@ func IstioConfigList(w http.ResponseWriter, r *http.Request) {
 		workloadSelector = query.Get("workloadSelector")
 	}
 
-	criteria := business.ParseIstioConfigCriteria(namespace, objects, labelSelector, workloadSelector)
+	cluster := clusterNameFromQuery(query)
+	if !config.Get().ExternalServices.Istio.IstioAPIEnabled {
+		includeValidations = false
+	}
+
+	criteria := business.ParseIstioConfigCriteria(objects, labelSelector, workloadSelector)
 
 	// Get business layer
 	business, err := getBusiness(r)
@@ -51,45 +59,43 @@ func IstioConfigList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var istioConfigValidations models.IstioValidations
+	var istioConfig *models.IstioConfigList
+	if namespace != "" {
+		istioConfig, err = business.IstioConfig.GetIstioConfigListForNamespace(r.Context(), cluster, namespace, criteria)
+		if err != nil {
+			handleErrorResponse(w, err)
+			return
+		}
+	} else {
+		istioConfig, err = business.IstioConfig.GetIstioConfigList(r.Context(), cluster, criteria)
+		if err != nil {
+			handleErrorResponse(w, err)
+			return
+		}
+	}
 
-	wg := sync.WaitGroup{}
 	if includeValidations {
-		wg.Add(1)
-		go func(namespace string, istioConfigValidations *models.IstioValidations, err *error) {
-			defer wg.Done()
-			// We don't filter by objects when calling validations, because certain validations require fetching all types to get the correct errors
-			istioConfigValidationResults, errValidations := business.Validations.GetValidations(namespace, "")
-			if errValidations != nil && *err == nil {
-				*err = errValidations
-			} else {
-				if len(parsedTypes) > 0 {
-					istioConfigValidationResults = istioConfigValidationResults.FilterByTypes(parsedTypes)
-				}
-				*istioConfigValidations = istioConfigValidationResults
-			}
-		}(namespace, &istioConfigValidations, &err)
+		istioConfig.IstioValidations, err = business.Validations.GetValidations(r.Context(), cluster)
+		if err != nil {
+			RespondWithError(w, http.StatusInternalServerError, "Error while getting validations: "+err.Error())
+			return
+		}
+
+		// We don't filter by objects when calling validations, because certain validations require fetching all types to get the correct errors
+		if len(parsedTypes) > 0 {
+			istioConfig.IstioValidations = istioConfig.IstioValidations.FilterByTypes(parsedTypes)
+		}
 	}
 
-	istioConfig, err := business.IstioConfig.GetIstioConfigList(criteria)
-	if includeValidations {
-		// Add validation results to the IstioConfigList once they're available (previously done in the UI layer)
-		wg.Wait()
-		istioConfig.IstioValidations = istioConfigValidations
-	}
-
-	if err != nil {
-		handleErrorResponse(w, err)
-		return
-	}
-
-	RespondWithJSON(w, http.StatusOK, istioConfig)
+	RespondWithAPIResponse(w, http.StatusOK, istioConfig)
 }
 
 func IstioConfigDetails(w http.ResponseWriter, r *http.Request) {
 	params := mux.Vars(r)
 	namespace := params["namespace"]
-	objectType := params["object_type"]
+	objectGroup := params["group"]
+	objectVersion := params["version"]
+	objectKind := params["kind"]
 	object := params["object"]
 
 	includeValidations := false
@@ -98,8 +104,24 @@ func IstioConfigDetails(w http.ResponseWriter, r *http.Request) {
 		includeValidations = true
 	}
 
-	if !checkObjectType(objectType) {
-		RespondWithError(w, http.StatusBadRequest, "Object type not managed: "+objectType)
+	includeHelp := false
+	if _, found := query["help"]; found {
+		includeHelp = true
+	}
+
+	cluster := clusterNameFromQuery(query)
+	if !config.Get().ExternalServices.Istio.IstioAPIEnabled {
+		includeValidations = false
+	}
+
+	gvk := schema.GroupVersionKind{
+		Group:   objectGroup,
+		Version: objectVersion,
+		Kind:    objectKind,
+	}
+
+	if !checkObjectType(gvk) {
+		RespondWithError(w, http.StatusBadRequest, "Object type not managed: "+gvk.String())
 		return
 	}
 
@@ -110,35 +132,64 @@ func IstioConfigDetails(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var istioConfigValidations models.IstioValidations
-
-	wg := sync.WaitGroup{}
-	if includeValidations {
-		wg.Add(1)
-		go func(istioConfigValidations *models.IstioValidations, err *error) {
-			defer wg.Done()
-			istioConfigValidationResults, errValidations := business.Validations.GetIstioObjectValidations(namespace, objectType, object)
-			if errValidations != nil && *err == nil {
-				*err = errValidations
-			} else {
-				*istioConfigValidations = istioConfigValidationResults
-			}
-		}(&istioConfigValidations, &err)
-	}
-
-	istioConfigDetails, err := business.IstioConfig.GetIstioConfigDetails(namespace, objectType, object)
-
-	if includeValidations && err == nil {
-		wg.Wait()
-
-		if validation, found := istioConfigValidations[models.IstioValidationKey{ObjectType: models.ObjectTypeSingular[objectType], Namespace: namespace, Name: object}]; found {
-			istioConfigDetails.IstioValidation = validation
-		}
-	}
-
+	istioConfigDetails, err := business.IstioConfig.GetIstioConfigDetails(context.TODO(), cluster, namespace, gvk, object)
 	if err != nil {
 		handleErrorResponse(w, err)
 		return
+	}
+
+	istioConfigValidations := models.IstioValidations{}
+	istioConfigReferences := models.IstioReferencesMap{}
+
+	validationsResult := make(chan error)
+	if includeValidations {
+		go func(istioConfigValidations *models.IstioValidations, istioConfigReferences *models.IstioReferencesMap) {
+			defer func() {
+				close(validationsResult)
+			}()
+			exportTo := istioConfigDetails.GetExportTo()
+			if len(exportTo) != 0 {
+				// validations should be done per exported namespaces to apply exportTo configs
+				loadedNamespaces, _ := business.Namespace.GetClusterNamespaces(r.Context(), cluster)
+				for _, ns := range loadedNamespaces {
+					if util.InSlice(exportTo, ns.Name) && ns.Name != namespace {
+						istioConfigValidationResults, istioConfigReferencesResults, err := business.Validations.GetIstioObjectValidations(r.Context(), cluster, ns.Name, gvk, object)
+						if err != nil {
+							validationsResult <- err
+						}
+						*istioConfigValidations = istioConfigValidations.MergeValidations(istioConfigValidationResults)
+						*istioConfigReferences = istioConfigReferences.MergeReferencesMap(istioConfigReferencesResults)
+					}
+				}
+			}
+			// also validate own namespace
+			istioConfigValidationResults, istioConfigReferencesResults, err := business.Validations.GetIstioObjectValidations(r.Context(), cluster, namespace, gvk, object)
+			if err != nil {
+				validationsResult <- err
+			}
+			*istioConfigValidations = istioConfigValidations.MergeValidations(istioConfigValidationResults)
+			*istioConfigReferences = istioConfigReferences.MergeReferencesMap(istioConfigReferencesResults)
+
+		}(&istioConfigValidations, &istioConfigReferences)
+	}
+
+	if includeHelp {
+		istioConfigDetails.IstioConfigHelpFields = models.IstioConfigHelpMessages[gvk.String()]
+	}
+
+	if includeValidations {
+		err := <-validationsResult
+		if err != nil {
+			handleErrorResponse(w, err)
+			return
+		}
+
+		if validation, found := istioConfigValidations[models.IstioValidationKey{ObjectGVK: gvk, Namespace: namespace, Name: object, Cluster: cluster}]; found {
+			istioConfigDetails.IstioValidation = validation
+		}
+		if references, found := istioConfigReferences[models.IstioReferenceKey{ObjectGVK: gvk, Namespace: namespace, Name: object}]; found {
+			istioConfigDetails.IstioReferences = references
+		}
 	}
 
 	RespondWithJSON(w, http.StatusOK, istioConfigDetails)
@@ -147,11 +198,22 @@ func IstioConfigDetails(w http.ResponseWriter, r *http.Request) {
 func IstioConfigDelete(w http.ResponseWriter, r *http.Request) {
 	params := mux.Vars(r)
 	namespace := params["namespace"]
-	objectType := params["object_type"]
+	objectGroup := params["group"]
+	objectVersion := params["version"]
+	objectKind := params["kind"]
 	object := params["object"]
 
-	if !business.GetIstioAPI(objectType) {
-		RespondWithError(w, http.StatusBadRequest, "Object type not managed: "+objectType)
+	query := r.URL.Query()
+	cluster := clusterNameFromQuery(query)
+
+	gvk := schema.GroupVersionKind{
+		Group:   objectGroup,
+		Version: objectVersion,
+		Kind:    objectKind,
+	}
+
+	if !business.GetIstioAPI(gvk) {
+		RespondWithError(w, http.StatusBadRequest, "Object type not managed: "+gvk.String())
 		return
 	}
 
@@ -161,12 +223,12 @@ func IstioConfigDelete(w http.ResponseWriter, r *http.Request) {
 		RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
 		return
 	}
-	err = business.IstioConfig.DeleteIstioConfigDetail(namespace, objectType, object)
+	err = business.IstioConfig.DeleteIstioConfigDetail(r.Context(), cluster, namespace, gvk, object)
 	if err != nil {
 		handleErrorResponse(w, err)
 		return
 	} else {
-		audit(r, "DELETE on Namespace: "+namespace+" Type: "+objectType+" Name: "+object)
+		audit(r, "DELETE on Namespace: "+namespace+" Type: "+gvk.String()+" Name: "+object)
 		RespondWithCode(w, http.StatusOK)
 	}
 }
@@ -174,11 +236,22 @@ func IstioConfigDelete(w http.ResponseWriter, r *http.Request) {
 func IstioConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	params := mux.Vars(r)
 	namespace := params["namespace"]
-	objectType := params["object_type"]
+	objectGroup := params["group"]
+	objectVersion := params["version"]
+	objectKind := params["kind"]
 	object := params["object"]
 
-	if !business.GetIstioAPI(objectType) {
-		RespondWithError(w, http.StatusBadRequest, "Object type not managed: "+objectType)
+	query := r.URL.Query()
+	cluster := clusterNameFromQuery(query)
+
+	gvk := schema.GroupVersionKind{
+		Group:   objectGroup,
+		Version: objectVersion,
+		Kind:    objectKind,
+	}
+
+	if !business.GetIstioAPI(gvk) {
+		RespondWithError(w, http.StatusBadRequest, "Object type not managed: "+gvk.String())
 		return
 	}
 
@@ -189,19 +262,18 @@ func IstioConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		RespondWithError(w, http.StatusBadRequest, "Update request with bad update patch: "+err.Error())
 	}
 	jsonPatch := string(body)
-	updatedConfigDetails, err := business.IstioConfig.UpdateIstioConfigDetail(namespace, objectType, object, jsonPatch)
-
+	updatedConfigDetails, err := business.IstioConfig.UpdateIstioConfigDetail(r.Context(), cluster, namespace, gvk, object, jsonPatch)
 	if err != nil {
 		handleErrorResponse(w, err)
 		return
 	}
 
-	audit(r, "UPDATE on Namespace: "+namespace+" Type: "+objectType+" Name: "+object+" Patch: "+jsonPatch)
+	audit(r, "UPDATE on Namespace: "+namespace+" Type: "+gvk.String()+" Name: "+object+" Patch: "+jsonPatch)
 	RespondWithJSON(w, http.StatusOK, updatedConfigDetails)
 }
 
@@ -209,10 +281,21 @@ func IstioConfigCreate(w http.ResponseWriter, r *http.Request) {
 	// Feels kinda replicated for multiple functions..
 	params := mux.Vars(r)
 	namespace := params["namespace"]
-	objectType := params["object_type"]
+	objectGroup := params["group"]
+	objectVersion := params["version"]
+	objectKind := params["kind"]
 
-	if !business.GetIstioAPI(objectType) {
-		RespondWithError(w, http.StatusBadRequest, "Object type not managed: "+objectType)
+	query := r.URL.Query()
+	cluster := clusterNameFromQuery(query)
+
+	gvk := schema.GroupVersionKind{
+		Group:   objectGroup,
+		Version: objectVersion,
+		Kind:    objectKind,
+	}
+
+	if !business.GetIstioAPI(gvk) {
+		RespondWithError(w, http.StatusBadRequest, "Object type not managed: "+gvk.String())
 		return
 	}
 
@@ -223,23 +306,23 @@ func IstioConfigCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		RespondWithError(w, http.StatusBadRequest, "Create request could not be read: "+err.Error())
 	}
 
-	createdConfigDetails, err := business.IstioConfig.CreateIstioConfigDetail(namespace, objectType, body)
+	createdConfigDetails, err := business.IstioConfig.CreateIstioConfigDetail(r.Context(), cluster, namespace, gvk, body)
 	if err != nil {
 		handleErrorResponse(w, err)
 		return
 	}
 
-	audit(r, "CREATE on Namespace: "+namespace+" Type: "+objectType+" Object: "+string(body))
+	audit(r, "CREATE on Namespace: "+namespace+" Type: "+gvk.String()+" Object: "+string(body))
 	RespondWithJSON(w, http.StatusOK, createdConfigDetails)
 }
 
-func checkObjectType(objectType string) bool {
-	return business.GetIstioAPI(objectType)
+func checkObjectType(gvk schema.GroupVersionKind) bool {
+	return business.GetIstioAPI(gvk)
 }
 
 func audit(r *http.Request, message string) {
@@ -253,16 +336,23 @@ func IstioConfigPermissions(w http.ResponseWriter, r *http.Request) {
 	// query params
 	params := r.URL.Query()
 	namespaces := params.Get("namespaces") // csl of namespaces
+	cluster := clusterNameFromQuery(params)
 
 	business, err := getBusiness(r)
 	if err != nil {
 		RespondWithError(w, http.StatusInternalServerError, "Services initialization error: "+err.Error())
 		return
 	}
+
+	if !business.Mesh.IsValidCluster(cluster) {
+		RespondWithError(w, http.StatusBadRequest, "Cluster %s does not exist "+cluster)
+		return
+	}
+
 	istioConfigPermissions := models.IstioConfigPermissions{}
 	if len(namespaces) > 0 {
 		ns := strings.Split(namespaces, ",")
-		istioConfigPermissions = business.IstioConfig.GetIstioConfigPermissions(ns)
+		istioConfigPermissions = business.IstioConfig.GetIstioConfigPermissions(r.Context(), ns, cluster)
 	}
 	RespondWithJSON(w, http.StatusOK, istioConfigPermissions)
 }

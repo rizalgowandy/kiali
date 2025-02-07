@@ -1,7 +1,6 @@
 package appender
 
 import (
-	"github.com/kiali/kiali/business"
 	"github.com/kiali/kiali/graph"
 	"github.com/kiali/kiali/log"
 )
@@ -9,33 +8,31 @@ import (
 const DeadNodeAppenderName = "deadNode"
 
 // DeadNodeAppender is responsible for removing from the graph unwanted nodes:
-// - nodes for which there is no traffic reported and a backing workload that can't be found
-//   (presumably removed from K8S). (kiali-621)
+//   - nodes for which there is no traffic reported and a backing workload that can't be found
+//     (presumably removed from K8S). (kiali-621)
 //   - this includes "unknown"
-// - service nodes that are not service entries (kiali-1526), egress handlers and for which there is no
-//   incoming traffic or outgoing edges
-//   error traffic and no outgoing edges (kiali-1326).
+//   - service nodes that are not service entries (kiali-1526) or egress handlers, and for which
+//     there is no incoming traffic or outgoing edge
+//
 // Name: deadNode
-type DeadNodeAppender struct{}
+type DeadNodeAppender struct {
+	AccessibleNamespaces graph.AccessibleNamespaces
+}
 
 // Name implements Appender
 func (a DeadNodeAppender) Name() string {
 	return DeadNodeAppenderName
 }
 
+// IsFinalizer implements Appender
+func (a DeadNodeAppender) IsFinalizer() bool {
+	return false
+}
+
 // AppendGraph implements Appender
-func (a DeadNodeAppender) AppendGraph(trafficMap graph.TrafficMap, globalInfo *graph.AppenderGlobalInfo, namespaceInfo *graph.AppenderNamespaceInfo) {
+func (a DeadNodeAppender) AppendGraph(trafficMap graph.TrafficMap, globalInfo *graph.GlobalInfo, namespaceInfo *graph.AppenderNamespaceInfo) {
 	if len(trafficMap) == 0 {
 		return
-	}
-
-	if globalInfo.HomeCluster == "" {
-		globalInfo.HomeCluster = business.DefaultClusterID
-		c, err := globalInfo.Business.Mesh.ResolveKialiControlPlaneCluster(nil)
-		graph.CheckError(err)
-		if c != nil {
-			globalInfo.HomeCluster = c.Name
-		}
 	}
 
 	// Apply dead node removal iteratively until no dead nodes are found.  Removal of dead nodes may
@@ -54,7 +51,7 @@ func (a DeadNodeAppender) AppendGraph(trafficMap graph.TrafficMap, globalInfo *g
 	}
 }
 
-func (a DeadNodeAppender) applyDeadNodes(trafficMap graph.TrafficMap, globalInfo *graph.AppenderGlobalInfo, namespaceInfo *graph.AppenderNamespaceInfo) (numRemoved int) {
+func (a DeadNodeAppender) applyDeadNodes(trafficMap graph.TrafficMap, globalInfo *graph.GlobalInfo, namespaceInfo *graph.AppenderNamespaceInfo) (numRemoved int) {
 	for id, n := range trafficMap {
 		isDead := true
 
@@ -74,17 +71,12 @@ func (a DeadNodeAppender) applyDeadNodes(trafficMap graph.TrafficMap, globalInfo
 			continue
 		}
 
-		// a node from a remote cluster is not considered dead, assume the best for it
-		if n.Cluster != globalInfo.HomeCluster {
-			continue
-		}
-
 		switch n.NodeType {
 		case graph.NodeTypeAggregate:
-			// am aggregate node is never dead
+			// an aggregate node is never dead
 			continue
 		case graph.NodeTypeService:
-			// a service node with outgoing edges is never considered dead (or egress)
+			// a service node with outgoing edges is never considered dead
 			if len(n.Edges) > 0 {
 				continue
 			}
@@ -111,8 +103,14 @@ func (a DeadNodeAppender) applyDeadNodes(trafficMap graph.TrafficMap, globalInfo
 				continue
 			}
 
-			// Remove if backing workload is not defined (always true for "unknown"), flag if there are no pods
-			if workload, found := getWorkload(namespaceInfo.Namespace, n.Workload, globalInfo); !found {
+			// If the potential workload is not unknown, but is inaccessible, we can't actually check for its existence, so we
+			// need to assume it is valid
+			if n.NodeType != graph.NodeTypeUnknown && !a.nodeOK(n) {
+				continue
+			}
+
+			// Remove if backing workload is not defined (always for "unknown"), flag if there are no pods
+			if workload, found := getWorkload(n.Cluster, namespaceInfo.Namespace, n.Workload, globalInfo); !found {
 				delete(trafficMap, id)
 				numRemoved++
 			} else {
@@ -137,4 +135,11 @@ func (a DeadNodeAppender) applyDeadNodes(trafficMap graph.TrafficMap, globalInfo
 	}
 
 	return numRemoved
+}
+
+// nodeOK returns true if we have access to its workload info
+func (a *DeadNodeAppender) nodeOK(node *graph.Node) bool {
+	key := graph.GetClusterSensitiveKey(node.Cluster, node.Namespace)
+	_, ok := a.AccessibleNamespaces[key]
+	return ok
 }

@@ -6,13 +6,20 @@ import (
 	"github.com/kiali/kiali/log"
 )
 
-// NamespaceAppHealth is an alias of map of app name x health
+// ClustersNamespaceHealth is a map NamespaceHealth for namespaces of given clusters
+type ClustersNamespaceHealth struct {
+	AppHealth      map[string]*NamespaceAppHealth      `json:"namespaceAppHealth,omitempty"`
+	ServiceHealth  map[string]*NamespaceServiceHealth  `json:"namespaceServiceHealth,omitempty"`
+	WorkloadHealth map[string]*NamespaceWorkloadHealth `json:"namespaceWorkloadHealth,omitempty"`
+}
+
+// NamespaceAppsHealth is a list of app name x health for a given namespace
 type NamespaceAppHealth map[string]*AppHealth
 
-// NamespaceServiceHealth is an alias of map of service name x health
+// NamespaceServicesHealth is a list of service name x health for a given namespace
 type NamespaceServiceHealth map[string]*ServiceHealth
 
-// NamespaceWorkloadHealth is an alias of map of workload name x health
+// NamespaceWorkloadsHealth is a list of workload name x health for a given namespace
 type NamespaceWorkloadHealth map[string]*WorkloadHealth
 
 // ServiceHealth contains aggregated health from various sources, for a given service
@@ -54,7 +61,8 @@ func EmptyServiceHealth() ServiceHealth {
 // EmptyWorkloadHealth create an empty WorkloadHealth
 func EmptyWorkloadHealth() *WorkloadHealth {
 	return &WorkloadHealth{
-		Requests: NewEmptyRequestHealth(),
+		Requests:       NewEmptyRequestHealth(),
+		WorkloadStatus: nil,
 	}
 }
 
@@ -71,8 +79,8 @@ type WorkloadHealth struct {
 // In healthy scenarios all variables should point same value.
 // When something wrong happens the different values can indicate an unhealthy situation.
 // i.e.
-// 	desired = 1, current = 10, available = 0 would means that a user scaled down a workload from 10 to 1
-//  but in the operaton 10 pods showed problems, so no pod is available/ready but user will see 10 pods under a workload
+// - desired = 1, current = 10, available = 0 would means that a user scaled down a workload from 10 to 1
+// - but in the operaton 10 pods showed problems, so no pod is available/ready but user will see 10 pods under a workload
 type WorkloadStatus struct {
 	Name              string `json:"name"`
 	DesiredReplicas   int32  `json:"desiredReplicas"`
@@ -93,7 +101,7 @@ type ProxyStatus struct {
 
 // RequestHealth holds several stats about recent request errors
 // - Inbound//Outbound are the rates of requests by protocol and status_code.
-//   Example:   Inbound: { "http": {"200": 1.5, "400": 2.3}, "grpc": {"1": 1.2} }
+// Example:   Inbound: { "http": {"200": 1.5, "400": 2.3}, "grpc": {"1": 1.2} }
 type RequestHealth struct {
 	Inbound            map[string]map[string]float64 `json:"inbound"`
 	Outbound           map[string]map[string]float64 `json:"outbound"`
@@ -172,20 +180,18 @@ func aggregate(sample *model.Sample, requests map[string]map[string]float64) {
 			code = string(grpcStatus)
 		}
 	}
+
 	if _, ok := requests[protocol]; !ok {
 		requests[protocol] = make(map[string]float64)
 	}
-	if _, ok := requests[protocol][code]; ok {
-		requests[protocol][code] += float64(sample.Value)
-	} else {
-		requests[protocol][code] = float64(sample.Value)
-	}
+
+	requests[protocol][code] += float64(sample.Value)
 }
 
 // CastWorkloadStatus returns a WorkloadStatus out of a given Workload
 func (w Workload) CastWorkloadStatus() *WorkloadStatus {
 	syncedProxies := int32(-1)
-	if w.HasIstioSidecar() {
+	if w.HasIstioSidecar() && !w.IsGateway() {
 		syncedProxies = w.Pods.SyncedPodProxiesCount()
 	}
 

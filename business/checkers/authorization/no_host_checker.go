@@ -3,22 +3,21 @@ package authorization
 import (
 	"fmt"
 
-	api_security_v1beta "istio.io/api/security/v1beta1"
-	networking_v1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
-	security_v1beta "istio.io/client-go/pkg/apis/security/v1beta1"
+	api_security_v1 "istio.io/api/security/v1"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
+	security_v1 "istio.io/client-go/pkg/apis/security/v1"
 
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
 )
 
 type NoHostChecker struct {
-	AuthorizationPolicy security_v1beta.AuthorizationPolicy
-	Namespace           string
+	AuthorizationPolicy *security_v1.AuthorizationPolicy
 	Namespaces          models.Namespaces
 	ServiceEntries      map[string][]string
-	ServiceList         models.ServiceList
-	VirtualServices     []networking_v1alpha3.VirtualService
-	RegistryStatus      []*kubernetes.RegistryStatus
+	VirtualServices     []*networking_v1.VirtualService
+	RegistryServices    []*kubernetes.RegistryService
+	PolicyAllowAny      bool
 }
 
 func (n NoHostChecker) Check() ([]*models.IstioCheck, bool) {
@@ -45,11 +44,11 @@ func (n NoHostChecker) Check() ([]*models.IstioCheck, bool) {
 	return checks, valid
 }
 
-func (n NoHostChecker) validateHost(ruleIdx int, to []*api_security_v1beta.Rule_To) ([]*models.IstioCheck, bool) {
+func (n NoHostChecker) validateHost(ruleIdx int, to []*api_security_v1.Rule_To) ([]*models.IstioCheck, bool) {
 	if len(to) == 0 {
 		return nil, true
 	}
-
+	namespace := n.AuthorizationPolicy.Namespace
 	checks, valid := make([]*models.IstioCheck, 0, len(to)), true
 	for toIdx, t := range to {
 		if t == nil {
@@ -65,10 +64,13 @@ func (n NoHostChecker) validateHost(ruleIdx int, to []*api_security_v1beta.Rule_
 		}
 
 		for hostIdx, h := range t.Operation.Hosts {
-			fqdn := kubernetes.GetHost(h, n.AuthorizationPolicy.Namespace, n.AuthorizationPolicy.ClusterName, n.Namespaces.GetNames())
-			if !n.hasMatchingService(fqdn, n.AuthorizationPolicy.Namespace) {
+			fqdn := kubernetes.GetHost(h, namespace, n.Namespaces.GetNames())
+			if !n.hasMatchingService(fqdn, namespace) {
 				path := fmt.Sprintf("spec/rules[%d]/to[%d]/operation/hosts[%d]", ruleIdx, toIdx, hostIdx)
 				validation := models.Build("authorizationpolicy.nodest.matchingregistry", path)
+				if n.PolicyAllowAny {
+					validation.Severity = models.WarningSeverity
+				}
 				valid = false
 				checks = append(checks, &validation)
 			}
@@ -80,19 +82,11 @@ func (n NoHostChecker) validateHost(ruleIdx int, to []*api_security_v1beta.Rule_
 
 func (n NoHostChecker) hasMatchingService(host kubernetes.Host, itemNamespace string) bool {
 	// Covering 'servicename.namespace' host format scenario
-	localSvc, localNs := kubernetes.ParseTwoPartHost(host)
+	_, localNs := kubernetes.ParseTwoPartHost(host)
 
 	// Check wildcard hosts - needs to match "*" and "*.suffix" also..
 	if host.IsWildcard() && localNs == itemNamespace {
 		return true
-	}
-
-	// Only find matches for workloads and services in the same namespace
-	if localNs == itemNamespace {
-		// Check ServiceNames
-		if matches := n.ServiceList.HasMatchingServices(localSvc); matches {
-			return matches
-		}
 	}
 
 	// Check ServiceEntries
@@ -105,9 +99,9 @@ func (n NoHostChecker) hasMatchingService(host kubernetes.Host, itemNamespace st
 		return true
 	}
 
-	// Use RegistryStatus to check destinations that may not be covered with previous check
+	// Use RegistryService to check destinations that may not be covered with previous check
 	// i.e. Multi-cluster or Federation validations
-	if kubernetes.HasMatchingRegistryStatus(host.String(), n.RegistryStatus) {
+	if kubernetes.HasMatchingRegistryService(itemNamespace, host.String(), n.RegistryServices) {
 		return true
 	}
 

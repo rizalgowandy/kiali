@@ -3,14 +3,16 @@ package virtualservices
 import (
 	"fmt"
 
-	api_networking_v1alpha3 "istio.io/api/networking/v1alpha3"
-	networking_v1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
+	api_networking_v1 "istio.io/api/networking/v1"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
 
+	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
 )
 
 type RouteChecker struct {
-	VirtualService networking_v1alpha3.VirtualService
+	Namespaces     []string
+	VirtualService *networking_v1.VirtualService
 }
 
 // Check returns both an array of IstioCheck and a boolean indicating if the current route rule is valid.
@@ -63,7 +65,7 @@ func (route RouteChecker) checkHttpRoutes() ([]*models.IstioCheck, bool) {
 			}
 		}
 
-		trackHttpSubset(routeIdx, "http", destinationWeights, &validations)
+		route.trackHttpSubset(routeIdx, "http", destinationWeights, &validations)
 	}
 
 	return validations, valid
@@ -86,7 +88,8 @@ func (route RouteChecker) checkTcpRoutes() ([]*models.IstioCheck, bool) {
 				continue
 			}
 			weight := destinationWeights[0].Weight
-			if weight < 100 {
+			// We can't rely on nil value as Weight is an integer that will be always present
+			if weight > 0 && weight < 100 {
 				valid = true
 				path := fmt.Sprintf("spec/tcp[%d]/route[%d]/weight", routeIdx, 0)
 				validation := models.Build("virtualservices.route.singleweight", path)
@@ -94,7 +97,7 @@ func (route RouteChecker) checkTcpRoutes() ([]*models.IstioCheck, bool) {
 			}
 		}
 
-		trackTcpTlsSubset(routeIdx, "http", destinationWeights, &validations)
+		route.trackTcpTlsSubset(routeIdx, "tcp", destinationWeights, &validations)
 	}
 
 	return validations, valid
@@ -117,7 +120,8 @@ func (route RouteChecker) checkTlsRoutes() ([]*models.IstioCheck, bool) {
 				continue
 			}
 			weight := destinationWeights[0].Weight
-			if weight < 100 {
+			// We can't rely on nil value as Weight is an integer that will be always present
+			if weight > 0 && weight < 100 {
 				valid = true
 				path := fmt.Sprintf("spec/tls[%d]/route[%d]/weight", routeIdx, 0)
 				validation := models.Build("virtualservices.route.singleweight", path)
@@ -125,13 +129,13 @@ func (route RouteChecker) checkTlsRoutes() ([]*models.IstioCheck, bool) {
 			}
 		}
 
-		trackTcpTlsSubset(routeIdx, "http", destinationWeights, &validations)
+		route.trackTcpTlsSubset(routeIdx, "tls", destinationWeights, &validations)
 	}
 
 	return validations, valid
 }
 
-func trackHttpSubset(routeIdx int, kind string, destinationWeights []*api_networking_v1alpha3.HTTPRouteDestination, checks *[]*models.IstioCheck) {
+func (route RouteChecker) trackHttpSubset(routeIdx int, kind string, destinationWeights []*api_networking_v1.HTTPRouteDestination, checks *[]*models.IstioCheck) {
 	subsetCollitions := map[string][]int{}
 
 	for destWeightIdx, destinationWeight := range destinationWeights {
@@ -141,18 +145,20 @@ func trackHttpSubset(routeIdx int, kind string, destinationWeights []*api_networ
 		if destinationWeight.Destination == nil {
 			return
 		}
+		fqdn := kubernetes.GetHost(destinationWeight.Destination.Host, route.VirtualService.Namespace, route.Namespaces)
 		subset := destinationWeight.Destination.Subset
-		collisions := subsetCollitions[subset]
+		key := fmt.Sprintf("%s%s", fqdn.String(), subset)
+		collisions := subsetCollitions[key]
 		if collisions == nil {
 			collisions = make([]int, 0, len(destinationWeights))
 		}
-		subsetCollitions[subset] = append(collisions, destWeightIdx)
+		subsetCollitions[key] = append(collisions, destWeightIdx)
 
 	}
 	appendSubsetDuplicity(routeIdx, kind, subsetCollitions, checks)
 }
 
-func trackTcpTlsSubset(routeIdx int, kind string, destinationWeights []*api_networking_v1alpha3.RouteDestination, checks *[]*models.IstioCheck) {
+func (route RouteChecker) trackTcpTlsSubset(routeIdx int, kind string, destinationWeights []*api_networking_v1.RouteDestination, checks *[]*models.IstioCheck) {
 	subsetCollitions := map[string][]int{}
 
 	for destWeightIdx, destinationWeight := range destinationWeights {
@@ -162,12 +168,14 @@ func trackTcpTlsSubset(routeIdx int, kind string, destinationWeights []*api_netw
 		if destinationWeight.Destination == nil {
 			return
 		}
+		fqdn := kubernetes.GetHost(destinationWeight.Destination.Host, route.VirtualService.Namespace, route.Namespaces)
 		subset := destinationWeight.Destination.Subset
-		collisions := subsetCollitions[subset]
+		key := fmt.Sprintf("%s%s", fqdn.String(), subset)
+		collisions := subsetCollitions[key]
 		if collisions == nil {
 			collisions = make([]int, 0, len(destinationWeights))
 		}
-		subsetCollitions[subset] = append(collisions, destWeightIdx)
+		subsetCollitions[key] = append(collisions, destWeightIdx)
 
 	}
 	appendSubsetDuplicity(routeIdx, kind, subsetCollitions, checks)
@@ -177,7 +185,7 @@ func appendSubsetDuplicity(routeIdx int, kind string, collistionsMap map[string]
 	for _, dups := range collistionsMap {
 		if len(dups) > 1 {
 			for _, dup := range dups {
-				path := fmt.Sprintf("spec/%s[%d]/route[%d]/subset", kind, routeIdx, dup)
+				path := fmt.Sprintf("spec/%s[%d]/route[%d]/host", kind, routeIdx, dup)
 				validation := models.Build("virtualservices.route.repeatedsubset", path)
 				*checks = append(*checks, &validation)
 			}

@@ -18,7 +18,7 @@ const (
 
 // AggregateNodeAppender is responsible for injecting aggregate nodes into the graph to gain
 // visibility into traffic aggregations for a user-specfied metric attribute.
-// Note: Aggregate Nodes are supported only on Requests traffic (not TCP or gRPC-message traffic)
+// Note: Aggregate Nodes are supported only on Request traffic (not TCP or gRPC-message traffic)
 type AggregateNodeAppender struct {
 	Aggregate          string
 	AggregateValue     string
@@ -35,9 +35,19 @@ func (a AggregateNodeAppender) Name() string {
 	return AggregateNodeAppenderName
 }
 
+// IsFinalizer implements Appender
+func (a AggregateNodeAppender) IsFinalizer() bool {
+	return false
+}
+
 // AppendGraph implements Appender
-func (a AggregateNodeAppender) AppendGraph(trafficMap graph.TrafficMap, globalInfo *graph.AppenderGlobalInfo, namespaceInfo *graph.AppenderNamespaceInfo) {
+func (a AggregateNodeAppender) AppendGraph(trafficMap graph.TrafficMap, globalInfo *graph.GlobalInfo, namespaceInfo *graph.AppenderNamespaceInfo) {
 	if len(trafficMap) == 0 {
+		return
+	}
+
+	// Aggregate Nodes are not applicable to Service Graphs
+	if a.GraphType == graph.GraphTypeService {
 		return
 	}
 
@@ -69,9 +79,14 @@ func (a AggregateNodeAppender) appendGraph(trafficMap graph.TrafficMap, namespac
 	//   note2: for now we will filter out aggregates with no traffic on the assumption that users probably don't want to
 	//      see them and it will just increase the graph density.  To change that behavior remove the "> 0" conditions.
 	// 1) query for requests originating from a workload outside the namespace.
+	//
+	// TODO: This *may* require an additional query to pick up incoming gateway traffic (source reported) for ambient namespaces (no dest
+	// proxy reporting) but because it's unclear whether this is a used feature, or whether we really need to handle that use case, I'm
+	// deferring. If necessary, see the incoming traffic handling in buildNamespacesTrafficMap.
 	groupBy := fmt.Sprintf("source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags,%s", a.Aggregate)
-	httpQuery := fmt.Sprintf(`sum(rate(%s{reporter="destination",source_workload_namespace!="%s",destination_service_namespace="%v",%s!="unknown"}[%vs])) by (%s) > 0`,
+	httpQuery := fmt.Sprintf(`sum(rate(%s{%s,source_workload_namespace!="%s",destination_service_namespace="%v",%s!="unknown"}[%vs])) by (%s) > 0`,
 		"istio_requests_total",
+		util.GetReporter("destination", a.Rates),
 		namespace,
 		namespace,
 		a.Aggregate,
@@ -82,8 +97,9 @@ func (a AggregateNodeAppender) appendGraph(trafficMap graph.TrafficMap, namespac
 	a.injectAggregates(trafficMap, &vector)
 
 	// 2) query for requests originating from a workload inside of the namespace
-	httpQuery = fmt.Sprintf(`sum(rate(%s{reporter="destination",source_workload_namespace="%s",%s!="unknown"}[%vs])) by (%s) > 0`,
+	httpQuery = fmt.Sprintf(`sum(rate(%s{%s,source_workload_namespace="%s",%s!="unknown"}[%vs])) by (%s) > 0`,
 		"istio_requests_total",
+		util.GetReporter("destination", a.Rates),
 		namespace,
 		a.Aggregate,
 		int(duration.Seconds()), // range duration for the query
@@ -105,8 +121,9 @@ func (a AggregateNodeAppender) appendNodeGraph(trafficMap graph.TrafficMap, name
 		serviceFragment = fmt.Sprintf(`,destination_service_name="%s"`, a.Service)
 	}
 	groupBy := fmt.Sprintf("source_cluster,source_workload_namespace,source_workload,source_canonical_service,source_canonical_revision,destination_cluster,destination_service_namespace,destination_service,destination_service_name,destination_workload_namespace,destination_workload,destination_canonical_service,destination_canonical_revision,request_protocol,response_code,grpc_response_status,response_flags,%s", a.Aggregate)
-	httpQuery := fmt.Sprintf(`sum(rate(%s{reporter="destination",destination_service_namespace="%s",%s="%s"%s}[%vs])) by (%s) > 0`,
+	httpQuery := fmt.Sprintf(`sum(rate(%s{%s,destination_service_namespace="%s",%s="%s"%s}[%vs])) by (%s) > 0`,
 		"istio_requests_total",
+		util.GetReporter("destination", a.Rates),
 		namespace,
 		a.Aggregate,
 		a.AggregateValue,
@@ -196,7 +213,7 @@ func (a AggregateNodeAppender) injectAggregates(trafficMap graph.TrafficMap, vec
 		val := float64(s.Value)
 
 		// inject aggregate node between source and destination
-		sourceID, _ := graph.Id(sourceCluster, sourceWlNs, "", sourceWlNs, sourceWl, sourceApp, sourceVer, a.GraphType)
+		sourceID, _, _ := graph.Id(sourceCluster, sourceWlNs, "", sourceWlNs, sourceWl, sourceApp, sourceVer, a.GraphType)
 		sourceNode, sourceFound := trafficMap[sourceID]
 		if !sourceFound {
 			log.Debugf("Expected source [%s] node not found in traffic map. Skipping aggregate injection [%s]", sourceID, aggregate)
@@ -209,9 +226,9 @@ func (a AggregateNodeAppender) injectAggregates(trafficMap graph.TrafficMap, vec
 		// else show the independent aggregation by using the workload/app node as the dest
 		destID := ""
 		if a.InjectServiceNodes {
-			destID, _ = graph.Id(destCluster, destSvcNs, destSvcName, "", "", "", "", a.GraphType) // service
+			destID, _, _ = graph.Id(destCluster, destSvcNs, destSvcName, "", "", "", "", a.GraphType) // service
 		} else {
-			destID, _ = graph.Id(destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, a.GraphType) // wl/app
+			destID, _, _ = graph.Id(destCluster, destSvcNs, destSvcName, destWlNs, destWl, destApp, destVer, a.GraphType) // wl/app
 		}
 		destNode, destFound := trafficMap[destID]
 		if !destFound {

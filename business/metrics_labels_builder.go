@@ -3,6 +3,9 @@ package business
 import (
 	"fmt"
 	"strings"
+
+	"github.com/kiali/kiali/config"
+	"github.com/kiali/kiali/prometheus"
 )
 
 const (
@@ -37,12 +40,20 @@ func (lb *MetricsLabelsBuilder) Add(key, value string) *MetricsLabelsBuilder {
 	return lb
 }
 
+func (lb *MetricsLabelsBuilder) AddOp(key, value, op string) *MetricsLabelsBuilder {
+	lb.labelsKV = append(lb.labelsKV, fmt.Sprintf(`%s%s"%s"`, key, op, value))
+	return lb
+}
+
 func (lb *MetricsLabelsBuilder) addSided(partialKey, value, side string) *MetricsLabelsBuilder {
 	lb.labelsKV = append(lb.labelsKV, fmt.Sprintf(`%s_%s="%s"`, side, partialKey, value))
 	return lb
 }
 
-func (lb *MetricsLabelsBuilder) Reporter(name string) *MetricsLabelsBuilder {
+func (lb *MetricsLabelsBuilder) Reporter(name string, includeAmbient bool) *MetricsLabelsBuilder {
+	if includeAmbient {
+		return lb.AddOp("reporter", fmt.Sprintf("%s|%s", name, "waypoint"), "=~")
+	}
 	return lb.Add("reporter", name)
 }
 
@@ -69,6 +80,10 @@ func (lb *MetricsLabelsBuilder) Workload(name, namespace string) *MetricsLabelsB
 		lb.addSided("workload_namespace", namespace, lb.side)
 	}
 	return lb.addSided("workload", name, lb.side)
+}
+
+func (lb *MetricsLabelsBuilder) Cluster(cluster string) *MetricsLabelsBuilder {
+	return lb.addSided("cluster", cluster, lb.side)
 }
 
 func (lb *MetricsLabelsBuilder) App(name, namespace string) *MetricsLabelsBuilder {
@@ -115,6 +130,16 @@ func (lb *MetricsLabelsBuilder) Protocol(name string) *MetricsLabelsBuilder {
 
 func (lb *MetricsLabelsBuilder) Aggregate(key, value string) *MetricsLabelsBuilder {
 	return lb.Add(key, value)
+}
+
+// QueryScope adds scope labels, if configured
+func (lb *MetricsLabelsBuilder) QueryScope() *MetricsLabelsBuilder {
+	scope := config.Get().ExternalServices.Prometheus.QueryScope
+
+	for labelName, labelValue := range scope {
+		lb.Add(prometheus.SanitizeLabelName(labelName), labelValue)
+	}
+	return lb
 }
 
 func (lb *MetricsLabelsBuilder) Build() string {

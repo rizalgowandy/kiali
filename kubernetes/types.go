@@ -1,15 +1,43 @@
 package kubernetes
 
 import (
-	"time"
-
-	networking_v1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
-	security_v1beta "istio.io/client-go/pkg/apis/security/v1beta1"
-
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
+	security_v1 "istio.io/client-go/pkg/apis/security/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 const (
+	// Networking
+	DestinationRuleType = "DestinationRule"
+	GatewayType         = "Gateway"
+	EnvoyFilterType     = "EnvoyFilter"
+	SidecarType         = "Sidecar"
+	ServiceEntryType    = "ServiceEntry"
+	VirtualServiceType  = "VirtualService"
+	WorkloadEntryType   = "WorkloadEntry"
+	WorkloadGroupType   = "WorkloadGroup"
+	WasmPluginType      = "WasmPlugin"
+	TelemetryType       = "Telemetry"
+
+	// K8s Networking
+	K8sGatewayType        = "Gateway"
+	K8sGatewayClassType   = "GatewayClass"
+	K8sGRPCRouteType      = "GRPCRoute"
+	K8sHTTPRouteType      = "HTTPRoute"
+	K8sReferenceGrantType = "ReferenceGrant"
+	K8sTCPRouteType       = "TCPRoute"
+	K8sTLSRouteType       = "TLSRoute"
+
+	// Authorization PeerAuthentications
+	AuthorizationPoliciesType = "AuthorizationPolicy"
+
+	// Peer Authentications
+	PeerAuthenticationsType = "PeerAuthentication"
+
+	// Request Authentications
+	RequestAuthenticationsType = "RequestAuthentication"
+
 	// Kubernetes Controllers
 	ConfigMapType             = "ConfigMap"
 	CronJobType               = "CronJob"
@@ -23,169 +51,161 @@ const (
 	ReplicaSetType            = "ReplicaSet"
 	ServiceType               = "Service"
 	StatefulSetType           = "StatefulSet"
-
-	// Networking
-
-	DestinationRules        = "destinationrules"
-	DestinationRuleType     = "DestinationRule"
-	DestinationRuleTypeList = "DestinationRuleList"
-
-	Gateways        = "gateways"
-	GatewayType     = "Gateway"
-	GatewayTypeList = "GatewayList"
-
-	EnvoyFilters        = "envoyfilters"
-	EnvoyFilterType     = "EnvoyFilter"
-	EnvoyFilterTypeList = "EnvoyFilterList"
-
-	Sidecars        = "sidecars"
-	SidecarType     = "Sidecar"
-	SidecarTypeList = "SidecarList"
-
-	ServiceEntries       = "serviceentries"
-	ServiceEntryType     = "ServiceEntry"
-	ServiceentryTypeList = "ServiceEntryList"
-
-	VirtualServices        = "virtualservices"
-	VirtualServiceType     = "VirtualService"
-	VirtualServiceTypeList = "VirtualServiceList"
-
-	WorkloadEntries       = "workloadentries"
-	WorkloadEntryType     = "WorkloadEntry"
-	WorkloadEntryTypeList = "WorkloadEntryList"
-
-	WorkloadGroups        = "workloadgroups"
-	WorkloadGroupType     = "WorkloadGroup"
-	WorkloadGroupTypeList = "WorkloadGroupList"
-
-	// Authorization PeerAuthentications
-	AuthorizationPolicies         = "authorizationpolicies"
-	AuthorizationPoliciesType     = "AuthorizationPolicy"
-	AuthorizationPoliciesTypeList = "AuthorizationPolicyList"
-
-	// Peer Authentications
-	PeerAuthentications         = "peerauthentications"
-	PeerAuthenticationsType     = "PeerAuthentication"
-	PeerAuthenticationsTypeList = "PeerAuthenticationList"
-
-	// Request Authentications
-	RequestAuthentications         = "requestauthentications"
-	RequestAuthenticationsType     = "RequestAuthentication"
-	RequestAuthenticationsTypeList = "RequestAuthenticationList"
-
-	// Iter8 types
-
-	Iter8Experiments        = "experiments"
-	Iter8ExperimentType     = "Experiment"
-	Iter8ExperimentTypeList = "ExperimentList"
-	Iter8ConfigMap          = "iter8config-metrics"
 )
 
 var (
-	NetworkingGroupVersion = schema.GroupVersion{
+	// Networking
+	DestinationRules = NetworkingGroupVersionV1.WithKind(DestinationRuleType)
+	Gateways         = NetworkingGroupVersionV1.WithKind(GatewayType)
+	EnvoyFilters     = NetworkingGroupVersionV1Alpha3.WithKind(EnvoyFilterType)
+	Sidecars         = NetworkingGroupVersionV1.WithKind(SidecarType)
+	ServiceEntries   = NetworkingGroupVersionV1.WithKind(ServiceEntryType)
+	VirtualServices  = NetworkingGroupVersionV1.WithKind(VirtualServiceType)
+	WorkloadEntries  = NetworkingGroupVersionV1.WithKind(WorkloadEntryType)
+	WorkloadGroups   = NetworkingGroupVersionV1.WithKind(WorkloadGroupType)
+	WasmPlugins      = ExtensionGroupVersionV1Alpha1.WithKind(WasmPluginType)
+	Telemetries      = TelemetryGroupV1.WithKind(TelemetryType)
+
+	// K8s Networking
+	K8sGateways        = K8sNetworkingGroupVersionV1.WithKind(K8sGatewayType)
+	K8sGatewayClasses  = K8sNetworkingGroupVersionV1.WithKind(K8sGatewayClassType)
+	K8sGRPCRoutes      = K8sNetworkingGroupVersionV1.WithKind(K8sGRPCRouteType)
+	K8sHTTPRoutes      = K8sNetworkingGroupVersionV1.WithKind(K8sHTTPRouteType)
+	K8sReferenceGrants = K8sNetworkingGroupVersionV1Beta1.WithKind(K8sReferenceGrantType)
+	K8sTCPRoutes       = K8sNetworkingGroupVersionV1Alpha2.WithKind(K8sTCPRouteType)
+	K8sTLSRoutes       = K8sNetworkingGroupVersionV1Alpha2.WithKind(K8sTLSRouteType)
+
+	// Authorization PeerAuthentications
+	AuthorizationPolicies = SecurityGroupVersionV1.WithKind(AuthorizationPoliciesType)
+
+	// Peer Authentications
+	PeerAuthentications = SecurityGroupVersionV1.WithKind(PeerAuthenticationsType)
+
+	// Request Authentications
+	RequestAuthentications = SecurityGroupVersionV1.WithKind(RequestAuthenticationsType)
+
+	// Kubernetes Controllers
+	ConfigMaps             = CoreGroupVersionV1.WithKind(ConfigMapType)
+	CronJobs               = BatchGroupVersionV1.WithKind(CronJobType)
+	DaemonSets             = AppsGroupVersionV1.WithKind(DaemonSetType)
+	Deployments            = AppsGroupVersionV1.WithKind(DeploymentType)
+	DeploymentConfigs      = AppsOpenShiftGroupVersionV1.WithKind(DeploymentConfigType)
+	Endpoints              = CoreGroupVersionV1.WithKind(EndpointsType)
+	Jobs                   = BatchGroupVersionV1.WithKind(JobType)
+	Pods                   = CoreGroupVersionV1.WithKind(PodType)
+	ReplicationControllers = CoreGroupVersionV1.WithKind(ReplicationControllerType)
+	ReplicaSets            = AppsGroupVersionV1.WithKind(ReplicaSetType)
+	Services               = CoreGroupVersionV1.WithKind(ServiceType)
+	StatefulSets           = AppsGroupVersionV1.WithKind(StatefulSetType)
+
+	// Group Versions
+	CoreGroupVersionV1 = schema.GroupVersion{
+		Group:   "",
+		Version: "v1",
+	}
+
+	BatchGroupVersionV1 = schema.GroupVersion{
+		Group:   "batch",
+		Version: "v1",
+	}
+
+	AppsGroupVersionV1 = schema.GroupVersion{
+		Group:   "apps",
+		Version: "v1",
+	}
+
+	AppsOpenShiftGroupVersionV1 = schema.GroupVersion{
+		Group:   "apps.openshift.io",
+		Version: "v1",
+	}
+
+	NetworkingGroupVersionV1Alpha3 = schema.GroupVersion{
 		Group:   "networking.istio.io",
 		Version: "v1alpha3",
 	}
-	ApiNetworkingVersion = NetworkingGroupVersion.Group + "/" + NetworkingGroupVersion.Version
 
-	SecurityGroupVersion = schema.GroupVersion{
-		Group:   "security.istio.io",
-		Version: "v1beta1",
+	NetworkingGroupVersionV1 = schema.GroupVersion{
+		Group:   "networking.istio.io",
+		Version: "v1",
 	}
-	ApiSecurityVersion = SecurityGroupVersion.Group + "/" + SecurityGroupVersion.Version
 
-	// We will add a new extesion API in a similar way as we added the Kubernetes + Istio APIs
-	Iter8GroupVersion = schema.GroupVersion{
-		Group:   "iter8.tools",
+	K8sNetworkingGroupVersionV1Alpha2 = schema.GroupVersion{
+		Group:   "gateway.networking.k8s.io",
 		Version: "v1alpha2",
 	}
-	ApiIter8Version = Iter8GroupVersion.Group + "/" + Iter8GroupVersion.Version
 
-	iter8Types = []struct {
-		objectKind     string
-		collectionKind string
-	}{
-		{
-			objectKind:     Iter8ExperimentType,
-			collectionKind: Iter8ExperimentTypeList,
-		},
+	K8sNetworkingGroupVersionV1Beta1 = schema.GroupVersion{
+		Group:   "gateway.networking.k8s.io",
+		Version: "v1beta1",
 	}
 
-	PluralType = map[string]string{
-		// Networking
-		Gateways:         GatewayType,
-		VirtualServices:  VirtualServiceType,
-		DestinationRules: DestinationRuleType,
-		ServiceEntries:   ServiceEntryType,
-		Sidecars:         SidecarType,
-		WorkloadEntries:  WorkloadEntryType,
-		WorkloadGroups:   WorkloadGroupType,
-		EnvoyFilters:     EnvoyFilterType,
-
-		// Security
-		AuthorizationPolicies:  AuthorizationPoliciesType,
-		PeerAuthentications:    PeerAuthenticationsType,
-		RequestAuthentications: RequestAuthenticationsType,
-
-		// Iter8
-		Iter8Experiments: Iter8ExperimentType,
+	K8sNetworkingGroupVersionV1 = schema.GroupVersion{
+		Group:   "gateway.networking.k8s.io",
+		Version: "v1",
 	}
 
-	ResourceTypesToAPI = map[string]string{
-		DestinationRules:       NetworkingGroupVersion.Group,
-		EnvoyFilters:           NetworkingGroupVersion.Group,
-		Gateways:               NetworkingGroupVersion.Group,
-		ServiceEntries:         NetworkingGroupVersion.Group,
-		Sidecars:               NetworkingGroupVersion.Group,
-		VirtualServices:        NetworkingGroupVersion.Group,
-		WorkloadEntries:        NetworkingGroupVersion.Group,
-		WorkloadGroups:         NetworkingGroupVersion.Group,
-		AuthorizationPolicies:  SecurityGroupVersion.Group,
-		PeerAuthentications:    SecurityGroupVersion.Group,
-		RequestAuthentications: SecurityGroupVersion.Group,
-		// Extensions
-		Iter8Experiments: Iter8GroupVersion.Group,
+	SecurityGroupVersionV1 = schema.GroupVersion{
+		Group:   "security.istio.io",
+		Version: "v1",
 	}
 
-	ApiToVersion = map[string]string{
-		NetworkingGroupVersion.Group: ApiNetworkingVersion,
-		SecurityGroupVersion.Group:   ApiSecurityVersion,
+	ExtensionGroupVersionV1Alpha1 = schema.GroupVersion{
+		Group:   "extensions.istio.io",
+		Version: "v1alpha1",
+	}
+
+	TelemetryGroupV1 = schema.GroupVersion{
+		Group:   "telemetry.istio.io",
+		Version: "v1",
+	}
+
+	// Resources
+	ResourceTypesToAPI = map[string]schema.GroupVersionKind{
+		DestinationRules.String(): DestinationRules,
+		EnvoyFilters.String():     EnvoyFilters,
+		Gateways.String():         Gateways,
+		ServiceEntries.String():   ServiceEntries,
+		Sidecars.String():         Sidecars,
+		VirtualServices.String():  VirtualServices,
+		WorkloadEntries.String():  WorkloadEntries,
+		WorkloadGroups.String():   WorkloadGroups,
+		WasmPlugins.String():      WasmPlugins,
+		Telemetries.String():      Telemetries,
+
+		K8sGateways.String():        K8sGateways,
+		K8sGRPCRoutes.String():      K8sGRPCRoutes,
+		K8sHTTPRoutes.String():      K8sHTTPRoutes,
+		K8sReferenceGrants.String(): K8sReferenceGrants,
+		K8sTCPRoutes.String():       K8sTCPRoutes,
+		K8sTLSRoutes.String():       K8sTLSRoutes,
+
+		AuthorizationPolicies.String():  AuthorizationPolicies,
+		PeerAuthentications.String():    PeerAuthentications,
+		RequestAuthentications.String(): RequestAuthentications,
 	}
 )
 
-type IstioMeshConfig struct {
-	DisableMixerHttpReports bool  `yaml:"disableMixerHttpReports,omitempty"`
-	EnableAutoMtls          *bool `yaml:"enableAutoMtls,omitempty"`
-}
-
 // MTLSDetails is a wrapper to group all Istio objects related to non-local mTLS configurations
 type MTLSDetails struct {
-	DestinationRules        []networking_v1alpha3.DestinationRule `json:"destinationrules"`
-	MeshPeerAuthentications []security_v1beta.PeerAuthentication  `json:"meshpeerauthentications"`
-	PeerAuthentications     []security_v1beta.PeerAuthentication  `json:"peerauthentications"`
-	EnabledAutoMtls         bool                                  `json:"enabledautomtls"`
+	DestinationRules        []*networking_v1.DestinationRule  `json:"destinationrules"`
+	MeshPeerAuthentications []*security_v1.PeerAuthentication `json:"meshpeerauthentications"`
+	PeerAuthentications     []*security_v1.PeerAuthentication `json:"peerauthentications"`
+	EnabledAutoMtls         bool                              `json:"enabledautomtls"`
 }
 
 // RBACDetails is a wrapper for objects related to Istio RBAC (Role Based Access Control)
 type RBACDetails struct {
-	AuthorizationPolicies []security_v1beta.AuthorizationPolicy `json:"authorizationpolicies"`
-}
-
-// ExportedResources is a wrapper to group all exported Istio objects
-// Used to provide exported resources to validation
-type ExportedResources struct {
-	VirtualServices  []networking_v1alpha3.VirtualService  `json:"virtualservices"`
-	DestinationRules []networking_v1alpha3.DestinationRule `json:"destinationrules"`
-	ServiceEntries   []networking_v1alpha3.ServiceEntry    `json:"serviceentries"`
+	AuthorizationPolicies []*security_v1.AuthorizationPolicy `json:"authorizationpolicies"`
 }
 
 type ProxyStatus struct {
-	pilot string
+	Pilot string
 	SyncStatus
 }
 
 // SyncStatus is the synchronization status between Pilot and a given Envoy
 type SyncStatus struct {
+	ClusterID     string `json:"cluster_id,omitempty"`
 	ProxyID       string `json:"proxy,omitempty"`
 	ProxyVersion  string `json:"proxy_version,omitempty"`
 	IstioVersion  string `json:"istio_version,omitempty"`
@@ -199,27 +219,63 @@ type SyncStatus struct {
 	EndpointAcked string `json:"endpoint_acked,omitempty"`
 }
 
-type RegistryStatus struct {
-	pilot string
-	RegistryService
-}
-
 type RegistryService struct {
-	Attributes           map[string]interface{}   `json:"Attributes,omitempty"`
-	Ports                []map[string]interface{} `json:"ports"`
-	ServiceAccounts      []string                 `json:"serviceAccounts,omitempty"`
-	CreationTime         time.Time                `json:"creationTime,omitempty"`
-	Hostname             string                   `json:"hostname"`
-	Address              string                   `json:"address,omitempty"`
-	AutoAllocatedAddress string                   `json:"autoAllocatedAddress,omitempty"`
-	ClusterVIPs          map[string]string        `json:"cluster-vips,omitempty"`
-	Resolution           int                      `json:"Resolution,omitempty"`
-	MeshExternal         bool                     `json:"MeshExternal,omitempty"`
+	Pilot string
+	IstioService
 }
 
-func (imc IstioMeshConfig) GetEnableAutoMtls() bool {
-	if imc.EnableAutoMtls == nil {
-		return true
+// Mapped from https://github.com/istio/istio/blob/master/pilot/pkg/model/service.go
+// It's a helper to fetch the /debug/registryz results before to parse it to the Kiali's Service model
+// Not all fields from /debug/registryz are mapped, only those needed by Kiali
+// There may be differences between Istio 1.11.x and 1.12.x to be addressed case by case in the mapping
+type IstioService struct {
+	Attributes struct {
+		// ServiceRegistry values:
+		// Kubernetes: 	is a service registry backed by k8s API server
+		// External: 	is a service registry for externally provided ServiceEntries
+		// Federation:  special case when registry is provided from a federated environment
+		ServiceRegistry string            `json:"ServiceRegistry,omitempty"`
+		Name            string            `json:"Name,omitempty"`
+		Namespace       string            `json:"Namespace,omitempty"`
+		Labels          map[string]string `json:"Labels,omitempty"`
+		// ExportTo key values:
+		// ".":		Private implies namespace local config
+		// "*":		Public implies config is visible to all
+		// "~":		None implies service is visible to no one. Used for services only
+		ExportTo       map[string]struct{} `json:"ExportTo,omitempty"`
+		LabelSelectors map[string]string   `json:"LabelSelectors,omitempty"`
+		// ClusterExternalAddresses and ClusterExternalPorts are not mapped into the model
+		// Kiali won't use it yet and these attributes changes between Istio 1.11.x and Istio 1.12.x and may bring conflicts
+	} `json:"Attributes,omitempty"`
+	Ports []struct {
+		Name     string `json:"name,omitempty"`
+		Port     int    `json:"port"`
+		Protocol string `json:"protocol,omitempty"`
+	} `json:"ports"`
+	Hostname string `json:"hostname"`
+	// ClusterVIPs defined in Istio 1.11.x
+	ClusterVIPs11 map[string]string `json:"cluster-vips,omitempty"`
+	// ClusterVIPs defined in Istio 1.12.x
+	ClusterVIPs12 struct {
+		Addresses map[string][]string `json:"Addresses,omitempty"`
+	} `json:"clusterVIPs,omitempty"`
+}
+
+type RegistryStatus struct {
+	Services []*RegistryService
+}
+
+func GetPatchType(patchType string) types.PatchType {
+	switch patchType {
+	case "json":
+		return types.JSONPatchType
+	case "strategic":
+		return types.StrategicMergePatchType
+	case "apply":
+		return types.ApplyPatchType
+	case "merge":
+		return types.MergePatchType
+	default:
+		return types.MergePatchType
 	}
-	return *imc.EnableAutoMtls
 }

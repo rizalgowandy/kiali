@@ -2,32 +2,33 @@ package common
 
 import (
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/kiali/kiali/models"
 )
 
 type GenericNoWorkloadFoundChecker struct {
-	SubjectType    string
-	SelectorLabels map[string]string
-	WorkloadList   models.WorkloadList
-	Path           string
+	ObjectGVK             schema.GroupVersionKind
+	SelectorLabels        map[string]string
+	WorkloadsPerNamespace map[string]models.WorkloadList
+	Path                  string
 }
 
-func SelectorNoWorkloadFoundChecker(subjectType string, selectorLabels map[string]string, workloadList models.WorkloadList) GenericNoWorkloadFoundChecker {
+func SelectorNoWorkloadFoundChecker(objectGVK schema.GroupVersionKind, selectorLabels map[string]string, workloadsPerNamespace map[string]models.WorkloadList) GenericNoWorkloadFoundChecker {
 	return GenericNoWorkloadFoundChecker{
-		SubjectType:    subjectType,
-		SelectorLabels: selectorLabels,
-		WorkloadList:   workloadList,
-		Path:           "spec/selector/matchLabels",
+		ObjectGVK:             objectGVK,
+		SelectorLabels:        selectorLabels,
+		WorkloadsPerNamespace: workloadsPerNamespace,
+		Path:                  "spec/selector/matchLabels",
 	}
 }
 
-func WorkloadSelectorNoWorkloadFoundChecker(subjectType string, selectorLabels map[string]string, workloadList models.WorkloadList) GenericNoWorkloadFoundChecker {
+func WorkloadSelectorNoWorkloadFoundChecker(objectGVK schema.GroupVersionKind, selectorLabels map[string]string, workloadsPerNamespace map[string]models.WorkloadList) GenericNoWorkloadFoundChecker {
 	return GenericNoWorkloadFoundChecker{
-		SubjectType:    subjectType,
-		SelectorLabels: selectorLabels,
-		WorkloadList:   workloadList,
-		Path:           "spec/workloadSelector/labels",
+		ObjectGVK:             objectGVK,
+		SelectorLabels:        selectorLabels,
+		WorkloadsPerNamespace: workloadsPerNamespace,
+		Path:                  "spec/workloadSelector/labels",
 	}
 }
 
@@ -46,10 +47,12 @@ func (wsc GenericNoWorkloadFoundChecker) Check() ([]*models.IstioCheck, bool) {
 func (wsc GenericNoWorkloadFoundChecker) hasMatchingWorkload(labelSelector map[string]string) bool {
 	selector := labels.SelectorFromSet(labelSelector)
 
-	for _, wl := range wsc.WorkloadList.Workloads {
-		wlLabelSet := labels.Set(wl.Labels)
-		if selector.Matches(wlLabelSet) {
-			return true
+	for _, wls := range wsc.WorkloadsPerNamespace {
+		for _, wl := range wls.Workloads {
+			wlLabelSet := labels.Set(wl.Labels)
+			if selector.Matches(wlLabelSet) {
+				return true
+			}
 		}
 	}
 	return false

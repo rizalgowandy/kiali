@@ -1,25 +1,23 @@
 package virtualservices
 
 import (
-	networking_v1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
+	networking_v1 "istio.io/client-go/pkg/apis/networking/v1"
 
-	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/models"
 )
 
 type SingleHostChecker struct {
-	Namespace               string
-	Namespaces              models.Namespaces
-	VirtualServices         []networking_v1alpha3.VirtualService
-	ExportedVirtualServices []networking_v1alpha3.VirtualService
+	Cluster         string
+	Namespaces      models.Namespaces
+	VirtualServices []*networking_v1.VirtualService
 }
 
 func (s SingleHostChecker) Check() models.IstioValidations {
-	hostCounter := make(map[string]map[string]map[string]map[string][]*networking_v1alpha3.VirtualService)
+	hostCounter := make(map[string]map[string]map[string]map[string][]*networking_v1.VirtualService)
 	validations := models.IstioValidations{}
 
-	for _, vs := range append(s.VirtualServices, s.ExportedVirtualServices...) {
+	for _, vs := range s.VirtualServices {
 		for _, host := range s.getHosts(vs) {
 			storeHost(hostCounter, vs, host)
 		}
@@ -39,17 +37,24 @@ func (s SingleHostChecker) Check() models.IstioValidations {
 						//   a host for that namespace
 						if targetSameHost {
 							// Reference everything within serviceCounter
-							multipleVirtualServiceCheck(*virtualService, validations, serviceCounter)
+							multipleVirtualServiceCheck(virtualService, validations, serviceCounter, s.Cluster)
 						}
 
 						if isNamespaceWildcard && otherServiceHosts {
 							// Reference the * or in case of * the other hosts inside namespace
 							// or other stars
-							refs := make([]*networking_v1alpha3.VirtualService, 0, len(namespaceCounter))
-							for _, serviceCounter := range namespaceCounter {
-								refs = append(refs, serviceCounter...)
+							refs := make([]*networking_v1.VirtualService, 0, len(namespaceCounter))
+							// here in case of a, b and *, references should be a -> *, b -> *, * -> q,b
+							// * should be referenced to a,b
+							if containsVirtualService(virtualService, namespaceCounter["*"]) {
+								for _, _serviceCounter := range namespaceCounter {
+									refs = append(refs, _serviceCounter...)
+								}
+							} else {
+								// a or b referencing to *
+								refs = append(refs, namespaceCounter["*"]...)
 							}
-							multipleVirtualServiceCheck(*virtualService, validations, refs)
+							multipleVirtualServiceCheck(virtualService, validations, refs, s.Cluster)
 						}
 					}
 				}
@@ -60,14 +65,24 @@ func (s SingleHostChecker) Check() models.IstioValidations {
 	return validations
 }
 
-func multipleVirtualServiceCheck(virtualService networking_v1alpha3.VirtualService, validations models.IstioValidations, references []*networking_v1alpha3.VirtualService) {
+func containsVirtualService(vs *networking_v1.VirtualService, vss []*networking_v1.VirtualService) bool {
+	for _, item := range vss {
+		if vs.Name == item.Name && vs.Namespace == item.Namespace {
+			return true
+		}
+	}
+	return false
+}
+
+func multipleVirtualServiceCheck(virtualService *networking_v1.VirtualService, validations models.IstioValidations, references []*networking_v1.VirtualService, cluster string) {
 	virtualServiceName := virtualService.Name
-	key := models.IstioValidationKey{Name: virtualServiceName, Namespace: virtualService.Namespace, ObjectType: "virtualservice"}
+	key := models.IstioValidationKey{Name: virtualServiceName, Namespace: virtualService.Namespace, ObjectGVK: kubernetes.VirtualServices, Cluster: cluster}
 	checks := models.Build("virtualservices.singlehost", "spec/hosts")
 	rrValidation := &models.IstioValidation{
-		Name:       virtualServiceName,
-		ObjectType: "virtualservice",
-		Valid:      true,
+		Cluster:   cluster,
+		Name:      virtualServiceName,
+		ObjectGVK: kubernetes.VirtualServices,
+		Valid:     true,
 		Checks: []*models.IstioCheck{
 			&checks,
 		},
@@ -75,8 +90,7 @@ func multipleVirtualServiceCheck(virtualService networking_v1alpha3.VirtualServi
 	}
 
 	for _, ref := range references {
-		ref := *ref
-		refKey := models.IstioValidationKey{Name: ref.Name, Namespace: ref.Namespace, ObjectType: "virtualservice"}
+		refKey := models.IstioValidationKey{Name: ref.Name, Namespace: ref.Namespace, ObjectGVK: kubernetes.VirtualServices, Cluster: cluster}
 		if refKey != key {
 			rrValidation.References = append(rrValidation.References, refKey)
 		}
@@ -85,51 +99,47 @@ func multipleVirtualServiceCheck(virtualService networking_v1alpha3.VirtualServi
 	validations.MergeValidations(models.IstioValidations{key: rrValidation})
 }
 
-func storeHost(hostCounter map[string]map[string]map[string]map[string][]*networking_v1alpha3.VirtualService, vs networking_v1alpha3.VirtualService, host kubernetes.Host) {
-	vsList := []*networking_v1alpha3.VirtualService{&vs}
+func storeHost(hostCounter map[string]map[string]map[string]map[string][]*networking_v1.VirtualService, vs *networking_v1.VirtualService, host kubernetes.Host) {
+	vsList := []*networking_v1.VirtualService{vs}
 
 	gwList := vs.Spec.Gateways
 	if len(gwList) == 0 {
 		gwList = []string{"no-gateway"}
 	}
 
-	if !host.CompleteInput {
-		host.Cluster = config.Get().ExternalServices.Istio.IstioIdentityDomain
-		host.Namespace = vs.Namespace
-	}
+	cluster := host.Cluster
+	namespace := host.Namespace
+	service := host.Service
 
 	for _, gw := range gwList {
 		if hostCounter[gw] == nil {
-			hostCounter[gw] = map[string]map[string]map[string][]*networking_v1alpha3.VirtualService{
-				host.Cluster: {
-					host.Namespace: {
-						host.Service: vsList,
+			hostCounter[gw] = map[string]map[string]map[string][]*networking_v1.VirtualService{
+				cluster: {
+					namespace: {
+						service: vsList,
 					},
 				},
 			}
-		} else if hostCounter[gw][host.Cluster] == nil {
-			hostCounter[gw][host.Cluster] = map[string]map[string][]*networking_v1alpha3.VirtualService{
-				host.Namespace: {
-					host.Service: vsList,
+		} else if hostCounter[gw][cluster] == nil {
+			hostCounter[gw][cluster] = map[string]map[string][]*networking_v1.VirtualService{
+				namespace: {
+					service: vsList,
 				},
 			}
-		} else if hostCounter[gw][host.Cluster][host.Namespace] == nil {
-			hostCounter[gw][host.Cluster][host.Namespace] = map[string][]*networking_v1alpha3.VirtualService{
-				host.Service: vsList,
+		} else if hostCounter[gw][cluster][namespace] == nil {
+			hostCounter[gw][cluster][namespace] = map[string][]*networking_v1.VirtualService{
+				service: vsList,
 			}
-		} else if _, ok := hostCounter[gw][host.Cluster][host.Namespace][host.Service]; !ok {
-			hostCounter[gw][host.Cluster][host.Namespace][host.Service] = vsList
+		} else if _, ok := hostCounter[gw][cluster][namespace][service]; !ok {
+			hostCounter[gw][cluster][namespace][service] = vsList
 		} else {
-			hostCounter[gw][host.Cluster][host.Namespace][host.Service] = append(hostCounter[gw][host.Cluster][host.Namespace][host.Service], &vs)
+			hostCounter[gw][cluster][namespace][service] = append(hostCounter[gw][cluster][namespace][service], vs)
 		}
 	}
 }
 
-func (s SingleHostChecker) getHosts(virtualService networking_v1alpha3.VirtualService) []kubernetes.Host {
-	namespace, clusterName := virtualService.Namespace, virtualService.ClusterName
-	if clusterName == "" {
-		clusterName = config.Get().ExternalServices.Istio.IstioIdentityDomain
-	}
+func (s SingleHostChecker) getHosts(virtualService *networking_v1.VirtualService) []kubernetes.Host {
+	namespace := virtualService.Namespace
 
 	if len(virtualService.Spec.Hosts) == 0 {
 		return []kubernetes.Host{}
@@ -138,7 +148,7 @@ func (s SingleHostChecker) getHosts(virtualService networking_v1alpha3.VirtualSe
 	targetHosts := make([]kubernetes.Host, 0, len(virtualService.Spec.Hosts))
 
 	for _, hostName := range virtualService.Spec.Hosts {
-		targetHosts = append(targetHosts, kubernetes.GetHost(hostName, namespace, clusterName, s.Namespaces.GetNames()))
+		targetHosts = append(targetHosts, kubernetes.GetHost(hostName, namespace, s.Namespaces.GetNames()))
 	}
 	return targetHosts
 }

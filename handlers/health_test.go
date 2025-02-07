@@ -1,8 +1,7 @@
 package handlers
 
 import (
-	"context"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -12,9 +11,9 @@ import (
 	osproject_v1 "github.com/openshift/api/project/v1"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 	core_v1 "k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kiali/kiali/business"
@@ -24,163 +23,95 @@ import (
 	"github.com/kiali/kiali/util"
 )
 
+func fakeService(namespace, name string) *core_v1.Service {
+	return &core_v1.Service{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: map[string]string{
+				"app": name,
+			},
+		},
+		Spec: core_v1.ServiceSpec{
+			ClusterIP: "fromservice",
+			Type:      "ClusterIP",
+			Selector:  map[string]string{"app": name},
+			Ports: []core_v1.ServicePort{
+				{
+					Name:     "http",
+					Protocol: "TCP",
+					Port:     3001,
+				},
+				{
+					Name:     "http",
+					Protocol: "TCP",
+					Port:     3000,
+				},
+			},
+		},
+	}
+}
+
 // TestNamespaceAppHealth is unit test (testing request handling, not the prometheus client behaviour)
-func TestNamespaceAppHealth(t *testing.T) {
+func TestClustersHealth(t *testing.T) {
+	kubeObjects := []runtime.Object{fakeService("ns", "reviews"), fakeService("ns", "httpbin"), setupMockData()}
+	for _, obj := range kubetest.FakePodList() {
+		o := obj
+		kubeObjects = append(kubeObjects, &o)
+	}
+	k8s := kubetest.NewFakeK8sClient(kubeObjects...)
+	k8s.OpenShift = true
+	ts, prom := setupClustersHealthEndpoint(t, k8s)
+
+	url := ts.URL + "/api/clusters/health"
+	mockClock()
+
 	conf := config.NewConfig()
-	conf.KubernetesConfig.CacheEnabled = false
 	config.Set(conf)
-	ts, k8s, prom := setupNamespaceHealthEndpoint(t)
-	defer ts.Close()
-
-	url := ts.URL + "/api/namespaces/ns/health"
-
-	k8s.MockServices("ns", []string{"reviews", "httpbin"})
-	k8s.On("GetPods", "ns", mock.AnythingOfType("string")).Return(kubetest.FakePodList(), nil)
-	k8s.MockEmptyWorkloads("ns")
 
 	// Test 17s on rate interval to check that rate interval is adjusted correctly.
-	prom.On("GetAllRequestRates", "ns", "17s", util.Clock.Now()).Return(model.Vector{}, nil)
+	prom.On("GetAllRequestRates", "ns", conf.KubernetesConfig.ClusterName, "17s", util.Clock.Now()).Return(model.Vector{}, nil)
 
 	resp, err := http.Get(url)
 	if err != nil {
 		t.Fatal(err)
 	}
-	actual, _ := ioutil.ReadAll(resp.Body)
+	actual, _ := io.ReadAll(resp.Body)
 
 	assert.NotEmpty(t, actual)
 	assert.Equal(t, 200, resp.StatusCode, string(actual))
-	k8s.AssertNumberOfCalls(t, "GetServices", 1)
-	k8s.AssertNumberOfCalls(t, "GetPods", 1)
-	k8s.AssertNumberOfCalls(t, "GetDeployments", 1)
-	k8s.AssertNumberOfCalls(t, "GetReplicaSets", 1)
 	prom.AssertNumberOfCalls(t, "GetAllRequestRates", 1)
 }
 
-func setupNamespaceHealthEndpoint(t *testing.T) (*httptest.Server, *kubetest.K8SClientMock, *prometheustest.PromClientMock) {
-	k8s := kubetest.NewK8SClientMock()
-	prom := new(prometheustest.PromClientMock)
-
-	mockClientFactory := kubetest.NewK8SClientFactoryMock(k8s)
-	business.SetWithBackends(mockClientFactory, prom)
-
-	setupMockData(k8s)
-
-	mr := mux.NewRouter()
-
-	mr.HandleFunc("/api/namespaces/{namespace}/health", http.HandlerFunc(
-		func(w http.ResponseWriter, r *http.Request) {
-			context := context.WithValue(r.Context(), "authInfo", &api.AuthInfo{Token: "test"})
-			NamespaceHealth(w, r.WithContext(context))
-		}))
-
-	ts := httptest.NewServer(mr)
-	return ts, k8s, prom
-}
-
-// TestAppHealth is unit test (testing request handling, not the prometheus client behaviour)
-func TestAppHealth(t *testing.T) {
+func setupClustersHealthEndpoint(t *testing.T, k8s *kubetest.FakeK8sClient) (*httptest.Server, *prometheustest.PromClientMock) {
 	conf := config.NewConfig()
-	conf.KubernetesConfig.CacheEnabled = false
+	conf.ExternalServices.Istio.IstioAPIEnabled = false
 	config.Set(conf)
-	ts, k8s, prom := setupAppHealthEndpoint(t)
-	defer ts.Close()
-
-	url := ts.URL + "/api/namespaces/ns/apps/reviews/health"
-
-	k8s.On("GetPods", "ns", "app=reviews").Return(kubetest.FakePodList(), nil)
-	k8s.MockEmptyWorkloads("ns")
-
-	// Test 17s on rate interval to check that rate interval is adjusted correctly.
-	prom.On("GetAppRequestRates", mock.AnythingOfType("string"), mock.AnythingOfType("string"), "17s", util.Clock.Now()).Return(model.Vector{}, model.Vector{}, nil)
-
-	resp, err := http.Get(url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	actual, _ := ioutil.ReadAll(resp.Body)
-
-	assert.NotEmpty(t, actual)
-	assert.Equal(t, 200, resp.StatusCode, string(actual))
-	k8s.AssertNumberOfCalls(t, "GetPods", 1)
-	k8s.AssertNumberOfCalls(t, "GetDeployments", 1)
-	k8s.AssertNumberOfCalls(t, "GetReplicaSets", 1)
-	prom.AssertNumberOfCalls(t, "GetAppRequestRates", 1)
-}
-
-func setupAppHealthEndpoint(t *testing.T) (*httptest.Server, *kubetest.K8SClientMock, *prometheustest.PromClientMock) {
-	k8s := kubetest.NewK8SClientMock()
 	prom := new(prometheustest.PromClientMock)
 
-	mockClientFactory := kubetest.NewK8SClientFactoryMock(k8s)
-	business.SetWithBackends(mockClientFactory, prom)
-
-	setupMockData(k8s)
+	business.SetupBusinessLayer(t, k8s, *conf)
+	business.WithProm(prom)
 
 	mr := mux.NewRouter()
 
-	mr.HandleFunc("/api/namespaces/{namespace}/apps/{app}/health", http.HandlerFunc(
-		func(w http.ResponseWriter, r *http.Request) {
-			context := context.WithValue(r.Context(), "authInfo", &api.AuthInfo{Token: "test"})
-			AppHealth(w, r.WithContext(context))
-		}))
+	authInfo := map[string]*api.AuthInfo{conf.KubernetesConfig.ClusterName: {Token: "test"}}
+	mr.HandleFunc("/api/clusters/health", http.HandlerFunc(
+		WithAuthInfo(authInfo, func(w http.ResponseWriter, r *http.Request) {
+			ClustersHealth(w, r)
+		})),
+	)
 
 	ts := httptest.NewServer(mr)
-	return ts, k8s, prom
+	t.Cleanup(ts.Close)
+	return ts, prom
 }
 
-// TestServiceHealth is unit test (testing request handling, not the prometheus client behaviour)
-func TestServiceHealth(t *testing.T) {
-	conf := config.NewConfig()
-	config.Set(conf)
-	ts, _, prom := setupServiceHealthEndpoint(t)
-	defer ts.Close()
-
-	url := ts.URL + "/api/namespaces/ns/services/svc/health"
-
-	// Test 17s on rate interval to check that rate interval is adjusted correctly.
-	prom.On("GetServiceRequestRates", mock.AnythingOfType("string"), mock.AnythingOfType("string"), "17s", util.Clock.Now()).Return(model.Vector{}, nil)
-
-	resp, err := http.Get(url)
-	if err != nil {
-		t.Fatal(err)
+func setupMockData() *osproject_v1.Project {
+	mockClock()
+	return &osproject_v1.Project{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name:              "ns",
+			CreationTimestamp: meta_v1.NewTime(util.Clock.Now().Add(-17 * time.Second)),
+		},
 	}
-	actual, _ := ioutil.ReadAll(resp.Body)
-
-	assert.NotEmpty(t, actual)
-	assert.Equal(t, 200, resp.StatusCode, string(actual))
-	prom.AssertNumberOfCalls(t, "GetServiceRequestRates", 1)
-}
-
-func setupServiceHealthEndpoint(t *testing.T) (*httptest.Server, *kubetest.K8SClientMock, *prometheustest.PromClientMock) {
-	k8s := kubetest.NewK8SClientMock()
-	prom := new(prometheustest.PromClientMock)
-
-	mockClientFactory := kubetest.NewK8SClientFactoryMock(k8s)
-	business.SetWithBackends(mockClientFactory, prom)
-
-	setupMockData(k8s)
-	k8s.On("GetService", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return(&core_v1.Service{}, nil)
-	mr := mux.NewRouter()
-
-	mr.HandleFunc("/api/namespaces/{namespace}/services/{service}/health", http.HandlerFunc(
-		func(w http.ResponseWriter, r *http.Request) {
-			context := context.WithValue(r.Context(), "authInfo", &api.AuthInfo{Token: "test"})
-			ServiceHealth(w, r.WithContext(context))
-		}))
-
-	ts := httptest.NewServer(mr)
-	return ts, k8s, prom
-}
-
-func setupMockData(k8s *kubetest.K8SClientMock) {
-	clockTime := time.Date(2017, 01, 15, 0, 0, 0, 0, time.UTC)
-	util.Clock = util.ClockMock{Time: clockTime}
-
-	k8s.On("GetProject", "ns").Return(
-		&osproject_v1.Project{
-			ObjectMeta: meta_v1.ObjectMeta{
-				Name:              "ns",
-				CreationTimestamp: meta_v1.NewTime(clockTime.Add(-17 * time.Second)),
-			},
-		}, nil)
 }

@@ -1,33 +1,38 @@
 package business
 
 import (
+	"fmt"
+	"io"
+	"os"
 	"time"
-
-	osapps_v1 "github.com/openshift/api/apps/v1"
-	apps_v1 "k8s.io/api/apps/v1"
-	core_v1 "k8s.io/api/core/v1"
-	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/kiali/kiali/config"
 	"github.com/kiali/kiali/kubernetes"
 	"github.com/kiali/kiali/kubernetes/kubetest"
+	"github.com/kiali/kiali/log"
+
+	osapps_v1 "github.com/openshift/api/apps/v1"
+
+	apps_v1 "k8s.io/api/apps/v1"
+	core_v1 "k8s.io/api/core/v1"
+	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // Consolidate fake/mock data used in tests per package
 
-func FakeDeployments() []apps_v1.Deployment {
-	conf := config.NewConfig()
-	config.Set(conf)
+func FakeDeployments(conf config.Config) []apps_v1.Deployment {
 	appLabel := conf.IstioLabels.AppLabelName
 	versionLabel := conf.IstioLabels.VersionLabelName
 	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
 	return []apps_v1.Deployment{
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "Deployment",
+				APIVersion: kubernetes.Deployments.GroupVersion().String(),
+				Kind:       kubernetes.Deployments.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "httpbin-v1",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 			},
 			Spec: apps_v1.DeploymentSpec{
@@ -45,10 +50,12 @@ func FakeDeployments() []apps_v1.Deployment {
 		},
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "Deployment",
+				APIVersion: kubernetes.Deployments.GroupVersion().String(),
+				Kind:       kubernetes.Deployments.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "httpbin-v2",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 			},
 			Spec: apps_v1.DeploymentSpec{
@@ -66,10 +73,12 @@ func FakeDeployments() []apps_v1.Deployment {
 		},
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "Deployment",
+				APIVersion: kubernetes.Deployments.GroupVersion().String(),
+				Kind:       kubernetes.Deployments.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "httpbin-v3",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 			},
 			Spec: apps_v1.DeploymentSpec{
@@ -90,14 +99,15 @@ func FakeDeployments() []apps_v1.Deployment {
 
 func FakeDuplicatedDeployments() []apps_v1.Deployment {
 	conf := config.NewConfig()
-	config.Set(conf)
+
 	appLabel := conf.IstioLabels.AppLabelName
 	versionLabel := conf.IstioLabels.VersionLabelName
 	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
 	return []apps_v1.Deployment{
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "Deployment",
+				APIVersion: kubernetes.Deployments.GroupVersion().String(),
+				Kind:       kubernetes.Deployments.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "duplicated-v1",
@@ -119,19 +129,19 @@ func FakeDuplicatedDeployments() []apps_v1.Deployment {
 	}
 }
 
-func FakeReplicaSets() []apps_v1.ReplicaSet {
-	conf := config.NewConfig()
-	config.Set(conf)
+func FakeReplicaSets(conf config.Config) []apps_v1.ReplicaSet {
 	appLabel := conf.IstioLabels.AppLabelName
 	versionLabel := conf.IstioLabels.VersionLabelName
 	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
 	return []apps_v1.ReplicaSet{
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "ReplicaSet",
+				APIVersion: kubernetes.ReplicaSets.GroupVersion().String(),
+				Kind:       kubernetes.ReplicaSets.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "httpbin-v1",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 			},
 			Spec: apps_v1.ReplicaSetSpec{
@@ -149,10 +159,12 @@ func FakeReplicaSets() []apps_v1.ReplicaSet {
 		},
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "ReplicaSet",
+				APIVersion: kubernetes.ReplicaSets.GroupVersion().String(),
+				Kind:       kubernetes.ReplicaSets.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "httpbin-v2",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 			},
 			Spec: apps_v1.ReplicaSetSpec{
@@ -170,10 +182,12 @@ func FakeReplicaSets() []apps_v1.ReplicaSet {
 		},
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "ReplicaSet",
+				APIVersion: kubernetes.ReplicaSets.GroupVersion().String(),
+				Kind:       kubernetes.ReplicaSets.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "httpbin-v3",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 			},
 			Spec: apps_v1.ReplicaSetSpec{
@@ -194,7 +208,7 @@ func FakeReplicaSets() []apps_v1.ReplicaSet {
 
 func FakeDuplicatedReplicaSets() []apps_v1.ReplicaSet {
 	conf := config.NewConfig()
-	config.Set(conf)
+
 	appLabel := conf.IstioLabels.AppLabelName
 	versionLabel := conf.IstioLabels.VersionLabelName
 	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
@@ -202,14 +216,17 @@ func FakeDuplicatedReplicaSets() []apps_v1.ReplicaSet {
 	return []apps_v1.ReplicaSet{
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "ReplicaSet",
+				APIVersion: kubernetes.ReplicaSets.GroupVersion().String(),
+				Kind:       kubernetes.ReplicaSets.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
-				Name:              "duplicated-v1-12345",
+				Name: "duplicated-v1-12345",
+
 				CreationTimestamp: meta_v1.NewTime(t1),
 				OwnerReferences: []meta_v1.OwnerReference{{
 					Controller: &controller,
-					Kind:       "Deployment",
+					APIVersion: kubernetes.Deployments.GroupVersion().String(),
+					Kind:       kubernetes.Deployments.Kind,
 					Name:       "duplicated-v1",
 				}},
 			},
@@ -233,17 +250,19 @@ func FakeReplicationControllers() []core_v1.ReplicationController {
 	conf := config.NewConfig()
 	// Enable ReplicationController, those are not fetched by default
 	conf.KubernetesConfig.ExcludeWorkloads = []string{}
-	config.Set(conf)
+
 	appLabel := conf.IstioLabels.AppLabelName
 	versionLabel := conf.IstioLabels.VersionLabelName
 	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
 	return []core_v1.ReplicationController{
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "ReplicationController",
+				APIVersion: kubernetes.ReplicationControllers.GroupVersion().String(),
+				Kind:       kubernetes.ReplicationControllers.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "httpbin-v1",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 			},
 			Spec: core_v1.ReplicationControllerSpec{
@@ -261,10 +280,12 @@ func FakeReplicationControllers() []core_v1.ReplicationController {
 		},
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "ReplicationController",
+				APIVersion: kubernetes.ReplicationControllers.GroupVersion().String(),
+				Kind:       kubernetes.ReplicationControllers.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "httpbin-v2",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 			},
 			Spec: core_v1.ReplicationControllerSpec{
@@ -282,10 +303,12 @@ func FakeReplicationControllers() []core_v1.ReplicationController {
 		},
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "ReplicationController",
+				APIVersion: kubernetes.ReplicationControllers.GroupVersion().String(),
+				Kind:       kubernetes.ReplicationControllers.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "httpbin-v3",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 			},
 			Spec: core_v1.ReplicationControllerSpec{
@@ -307,17 +330,19 @@ func FakeReplicationControllers() []core_v1.ReplicationController {
 func FakeDeploymentConfigs() []osapps_v1.DeploymentConfig {
 	conf := config.NewConfig()
 	conf.KubernetesConfig.ExcludeWorkloads = []string{}
-	config.Set(conf)
+
 	appLabel := conf.IstioLabels.AppLabelName
 	versionLabel := conf.IstioLabels.VersionLabelName
 	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
 	return []osapps_v1.DeploymentConfig{
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "DeploymentConfig",
+				APIVersion: kubernetes.DeploymentConfigs.GroupVersion().String(),
+				Kind:       kubernetes.DeploymentConfigs.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "httpbin-v1",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 			},
 			Spec: osapps_v1.DeploymentConfigSpec{
@@ -335,10 +360,12 @@ func FakeDeploymentConfigs() []osapps_v1.DeploymentConfig {
 		},
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "DeploymentConfig",
+				APIVersion: kubernetes.DeploymentConfigs.GroupVersion().String(),
+				Kind:       kubernetes.DeploymentConfigs.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "httpbin-v2",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 			},
 			Spec: osapps_v1.DeploymentConfigSpec{
@@ -356,10 +383,12 @@ func FakeDeploymentConfigs() []osapps_v1.DeploymentConfig {
 		},
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "DeploymentConfig",
+				APIVersion: kubernetes.DeploymentConfigs.GroupVersion().String(),
+				Kind:       kubernetes.DeploymentConfigs.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "httpbin-v3",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 			},
 			Spec: osapps_v1.DeploymentConfigSpec{
@@ -381,17 +410,19 @@ func FakeDeploymentConfigs() []osapps_v1.DeploymentConfig {
 func FakeStatefulSets() []apps_v1.StatefulSet {
 	conf := config.NewConfig()
 	conf.KubernetesConfig.ExcludeWorkloads = []string{}
-	config.Set(conf)
+
 	appLabel := conf.IstioLabels.AppLabelName
 	versionLabel := conf.IstioLabels.VersionLabelName
 	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
 	return []apps_v1.StatefulSet{
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "StatefulSet",
+				APIVersion: kubernetes.StatefulSets.GroupVersion().String(),
+				Kind:       kubernetes.StatefulSets.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "httpbin-v1",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 			},
 			Spec: apps_v1.StatefulSetSpec{
@@ -408,10 +439,12 @@ func FakeStatefulSets() []apps_v1.StatefulSet {
 		},
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "StatefulSet",
+				APIVersion: kubernetes.StatefulSets.GroupVersion().String(),
+				Kind:       kubernetes.StatefulSets.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "httpbin-v2",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 			},
 			Spec: apps_v1.StatefulSetSpec{
@@ -428,10 +461,12 @@ func FakeStatefulSets() []apps_v1.StatefulSet {
 		},
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "StatefulSet",
+				APIVersion: kubernetes.StatefulSets.GroupVersion().String(),
+				Kind:       kubernetes.StatefulSets.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "httpbin-v3",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 			},
 			Spec: apps_v1.StatefulSetSpec{
@@ -452,17 +487,19 @@ func FakeStatefulSets() []apps_v1.StatefulSet {
 func FakeDaemonSets() []apps_v1.DaemonSet {
 	conf := config.NewConfig()
 	conf.KubernetesConfig.ExcludeWorkloads = []string{}
-	config.Set(conf)
+
 	appLabel := conf.IstioLabels.AppLabelName
 	versionLabel := conf.IstioLabels.VersionLabelName
 	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
 	return []apps_v1.DaemonSet{
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "DaemonSet",
+				APIVersion: kubernetes.DaemonSets.GroupVersion().String(),
+				Kind:       kubernetes.DaemonSets.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "httpbin-v1",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 			},
 			Spec: apps_v1.DaemonSetSpec{
@@ -480,10 +517,12 @@ func FakeDaemonSets() []apps_v1.DaemonSet {
 		},
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "DaemonSet",
+				APIVersion: kubernetes.DaemonSets.GroupVersion().String(),
+				Kind:       kubernetes.DaemonSets.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "httpbin-v2",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 			},
 			Spec: apps_v1.DaemonSetSpec{
@@ -501,10 +540,12 @@ func FakeDaemonSets() []apps_v1.DaemonSet {
 		},
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "DaemonSet",
+				APIVersion: kubernetes.DaemonSets.GroupVersion().String(),
+				Kind:       kubernetes.DaemonSets.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "httpbin-v3",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 			},
 			Spec: apps_v1.DaemonSetSpec{
@@ -525,17 +566,19 @@ func FakeDaemonSets() []apps_v1.DaemonSet {
 
 func FakeDuplicatedStatefulSets() []apps_v1.StatefulSet {
 	conf := config.NewConfig()
-	config.Set(conf)
+
 	appLabel := conf.IstioLabels.AppLabelName
 	versionLabel := conf.IstioLabels.VersionLabelName
 	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
 	return []apps_v1.StatefulSet{
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "StatefulSet",
+				APIVersion: kubernetes.StatefulSets.GroupVersion().String(),
+				Kind:       kubernetes.StatefulSets.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "duplicated-v1",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 			},
 			Spec: apps_v1.StatefulSetSpec{
@@ -555,17 +598,19 @@ func FakeDuplicatedStatefulSets() []apps_v1.StatefulSet {
 
 func FakeDepSyncedWithRS() []apps_v1.Deployment {
 	conf := config.NewConfig()
-	config.Set(conf)
+
 	appLabel := conf.IstioLabels.AppLabelName
 	versionLabel := conf.IstioLabels.VersionLabelName
 	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
 	return []apps_v1.Deployment{
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "Deployment",
+				APIVersion: kubernetes.Deployments.GroupVersion().String(),
+				Kind:       kubernetes.Deployments.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "details-v1",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 			},
 			Spec: apps_v1.DeploymentSpec{
@@ -586,7 +631,7 @@ func FakeDepSyncedWithRS() []apps_v1.Deployment {
 
 func FakeRSSyncedWithPods() []apps_v1.ReplicaSet {
 	conf := config.NewConfig()
-	config.Set(conf)
+
 	appLabel := conf.IstioLabels.AppLabelName
 	versionLabel := conf.IstioLabels.VersionLabelName
 	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
@@ -594,14 +639,17 @@ func FakeRSSyncedWithPods() []apps_v1.ReplicaSet {
 	return []apps_v1.ReplicaSet{
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "ReplicaSet",
+				APIVersion: kubernetes.ReplicaSets.GroupVersion().String(),
+				Kind:       kubernetes.ReplicaSets.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "details-v1-3618568057",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 				OwnerReferences: []meta_v1.OwnerReference{{
 					Controller: &controller,
-					Kind:       "Deployment",
+					APIVersion: kubernetes.Deployments.GroupVersion().String(),
+					Kind:       kubernetes.Deployments.Kind,
 					Name:       "details-v1",
 				}},
 			},
@@ -623,7 +671,7 @@ func FakeRSSyncedWithPods() []apps_v1.ReplicaSet {
 
 func FakePodsSyncedWithDeployments() []core_v1.Pod {
 	conf := config.NewConfig()
-	config.Set(conf)
+
 	appLabel := conf.IstioLabels.AppLabelName
 	versionLabel := conf.IstioLabels.VersionLabelName
 	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
@@ -632,11 +680,13 @@ func FakePodsSyncedWithDeployments() []core_v1.Pod {
 		{
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "details-v1-3618568057-dnkjp",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 				Labels:            map[string]string{appLabel: "httpbin", versionLabel: "v1"},
 				OwnerReferences: []meta_v1.OwnerReference{{
 					Controller: &controller,
-					Kind:       "ReplicaSet",
+					APIVersion: kubernetes.ReplicaSets.GroupVersion().String(),
+					Kind:       kubernetes.ReplicaSets.Kind,
 					Name:       "details-v1-3618568057",
 				}},
 				Annotations: kubetest.FakeIstioAnnotations(),
@@ -657,7 +707,7 @@ func FakePodsSyncedWithDeployments() []core_v1.Pod {
 
 func FakePodSyncedWithDeployments() *core_v1.Pod {
 	conf := config.NewConfig()
-	config.Set(conf)
+
 	appLabel := conf.IstioLabels.AppLabelName
 	versionLabel := conf.IstioLabels.VersionLabelName
 	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
@@ -665,11 +715,13 @@ func FakePodSyncedWithDeployments() *core_v1.Pod {
 	return &core_v1.Pod{
 		ObjectMeta: meta_v1.ObjectMeta{
 			Name:              "details-v1-3618568057-dnkjp",
+			Namespace:         "Namespace",
 			CreationTimestamp: meta_v1.NewTime(t1),
 			Labels:            map[string]string{appLabel: "httpbin", versionLabel: "v1"},
 			OwnerReferences: []meta_v1.OwnerReference{{
 				Controller: &controller,
-				Kind:       "ReplicaSet",
+				APIVersion: kubernetes.ReplicaSets.GroupVersion().String(),
+				Kind:       kubernetes.ReplicaSets.Kind,
 				Name:       "details-v1-3618568057",
 			}},
 			Annotations: kubetest.FakeIstioAnnotations(),
@@ -683,6 +735,36 @@ func FakePodSyncedWithDeployments() *core_v1.Pod {
 				{Name: "istio-init", Image: "docker.io/istio/proxy_init:0.7.1"},
 				{Name: "enable-core-dump", Image: "alpine"},
 			},
+		},
+	}
+}
+
+func FakePodWithWaypointAndDeployments() *core_v1.Pod {
+	conf := config.NewConfig()
+
+	appLabel := conf.IstioLabels.AppLabelName
+	versionLabel := conf.IstioLabels.VersionLabelName
+	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
+	controller := true
+	return &core_v1.Pod{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name:              "details-v1-3618568057-dnkjp",
+			Namespace:         "Namespace",
+			CreationTimestamp: meta_v1.NewTime(t1),
+			Labels:            map[string]string{appLabel: "details", versionLabel: "v1"},
+			OwnerReferences: []meta_v1.OwnerReference{{
+				Controller: &controller,
+				APIVersion: kubernetes.ReplicaSets.GroupVersion().String(),
+				Kind:       kubernetes.ReplicaSets.Kind,
+				Name:       "details-v1-3618568057",
+			}},
+			Annotations: kubetest.FakeIstioAnnotations(),
+		},
+		Spec: core_v1.PodSpec{
+			Containers: []core_v1.Container{
+				{Name: "details", Image: "whatever"},
+			},
+			InitContainers: []core_v1.Container{},
 		},
 	}
 }
@@ -702,9 +784,29 @@ func FakePodLogsProxy() *kubernetes.PodLogs {
 	}
 }
 
+func FakePodLogsZtunnel() *kubernetes.PodLogs {
+	content, err := readFile("../tests/data/logs/ztunnel.log")
+	if err != nil {
+		log.Errorf("Error reading logs file: %s", err.Error())
+	}
+	return &kubernetes.PodLogs{
+		Logs: content,
+	}
+}
+
+func FakePodLogsWaypoint() *kubernetes.PodLogs {
+	content, err := readFile("../tests/data/logs/waypoint.log")
+	if err != nil {
+		log.Errorf("Error reading logs file: %s", err.Error())
+	}
+	return &kubernetes.PodLogs{
+		Logs: content,
+	}
+}
+
 func FakePodsSyncedWithDuplicated() []core_v1.Pod {
 	conf := config.NewConfig()
-	config.Set(conf)
+
 	appLabel := conf.IstioLabels.AppLabelName
 	versionLabel := conf.IstioLabels.VersionLabelName
 	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
@@ -713,11 +815,13 @@ func FakePodsSyncedWithDuplicated() []core_v1.Pod {
 		{
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "duplicated-v1-3618568057-1",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 				Labels:            map[string]string{appLabel: "duplicated", versionLabel: "v1"},
 				OwnerReferences: []meta_v1.OwnerReference{{
 					Controller: &controller,
-					Kind:       "StatefulSet",
+					APIVersion: kubernetes.StatefulSets.GroupVersion().String(),
+					Kind:       kubernetes.StatefulSets.Kind,
 					Name:       "duplicated-v1",
 				}},
 				Annotations: kubetest.FakeIstioAnnotations(),
@@ -736,11 +840,13 @@ func FakePodsSyncedWithDuplicated() []core_v1.Pod {
 		{
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "duplicated-v1-3618568057-3",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 				Labels:            map[string]string{appLabel: "duplicated", versionLabel: "v1"},
 				OwnerReferences: []meta_v1.OwnerReference{{
 					Controller: &controller,
-					Kind:       "StatefulSet",
+					APIVersion: kubernetes.StatefulSets.GroupVersion().String(),
+					Kind:       kubernetes.StatefulSets.Kind,
 					Name:       "duplicated-v1",
 				}},
 				Annotations: kubetest.FakeIstioAnnotations(),
@@ -761,7 +867,7 @@ func FakePodsSyncedWithDuplicated() []core_v1.Pod {
 
 func FakePodsNoController() []core_v1.Pod {
 	conf := config.NewConfig()
-	config.Set(conf)
+
 	appLabel := conf.IstioLabels.AppLabelName
 	versionLabel := conf.IstioLabels.VersionLabelName
 	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
@@ -769,10 +875,12 @@ func FakePodsNoController() []core_v1.Pod {
 	return []core_v1.Pod{
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "Pod",
+				APIVersion: kubernetes.Pods.GroupVersion().String(),
+				Kind:       kubernetes.Pods.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "orphan-pod",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 				Labels:            map[string]string{appLabel: "httpbin", versionLabel: "v1"},
 				Annotations:       kubetest.FakeIstioAnnotations(),
@@ -793,7 +901,7 @@ func FakePodsNoController() []core_v1.Pod {
 
 func FakePodsFromCustomController() []core_v1.Pod {
 	conf := config.NewConfig()
-	config.Set(conf)
+
 	appLabel := conf.IstioLabels.AppLabelName
 	versionLabel := conf.IstioLabels.VersionLabelName
 	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
@@ -802,12 +910,14 @@ func FakePodsFromCustomController() []core_v1.Pod {
 		{
 			ObjectMeta: meta_v1.ObjectMeta{
 				Name:              "custom-controller-pod",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 				Labels:            map[string]string{appLabel: "httpbin", versionLabel: "v1"},
 				OwnerReferences: []meta_v1.OwnerReference{{
 					Controller: &controller,
-					Kind:       "ReplicaSet",
-					Name:       "custom-controller-123",
+					APIVersion: kubernetes.ReplicaSets.GroupVersion().String(),
+					Kind:       kubernetes.ReplicaSets.Kind,
+					Name:       "custom-controller-RS-123",
 				}},
 				Annotations: kubetest.FakeIstioAnnotations(),
 			},
@@ -825,9 +935,161 @@ func FakePodsFromCustomController() []core_v1.Pod {
 	}
 }
 
+func FakeZtunnelPods() []core_v1.Pod {
+	conf := config.NewConfig()
+
+	appLabel := conf.IstioLabels.AppLabelName
+	versionLabel := conf.IstioLabels.VersionLabelName
+	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
+	controller := true
+	return []core_v1.Pod{
+		{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:              "ztunnel",
+				Namespace:         "istio-system",
+				CreationTimestamp: meta_v1.NewTime(t1),
+				Labels:            map[string]string{appLabel: "ztunnel", versionLabel: "v1"},
+				OwnerReferences: []meta_v1.OwnerReference{{
+					Controller: &controller,
+					APIVersion: kubernetes.ReplicaSets.GroupVersion().String(),
+					Kind:       kubernetes.ReplicaSets.Kind,
+					Name:       "ztunnel",
+				}},
+				Annotations: kubetest.FakeIstioAnnotations(),
+			},
+			Spec: core_v1.PodSpec{
+				Containers: []core_v1.Container{
+					{Name: "ztunnel-lrzrn", Image: "whatever"},
+				},
+				InitContainers: []core_v1.Container{
+					{Name: "istio-init", Image: "docker.io/istio/proxy_init:0.7.1"},
+				},
+			},
+		},
+	}
+}
+
+func FakeWaypointPod() []core_v1.Pod {
+	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
+	return []core_v1.Pod{
+		{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:              "waypoint",
+				Namespace:         "Namespace",
+				CreationTimestamp: meta_v1.NewTime(t1),
+				Labels:            map[string]string{config.WaypointLabel: config.WaypointLabelValue},
+				Annotations:       kubetest.FakeIstioAnnotations(),
+			},
+			Spec: core_v1.PodSpec{
+				Containers: []core_v1.Container{
+					{Name: "waypoint-dcd74f8b4-nf7jc", Image: "gcr.io/istio-release/proxyv2:1.24.1-distroless"},
+				},
+			},
+		},
+	}
+}
+
+func FakeWaypointNamespaceEnrolledPods(waypoint bool) []core_v1.Pod {
+	conf := config.NewConfig()
+
+	appLabel := conf.IstioLabels.AppLabelName
+	versionLabel := conf.IstioLabels.VersionLabelName
+	waypointLabel := conf.IstioLabels.AmbientWaypointUseLabel
+
+	wpLabels := map[string]string{appLabel: "details", versionLabel: "v1"}
+	if waypoint {
+		wpLabels = map[string]string{appLabel: "details", versionLabel: "v1", waypointLabel: "waypoint"}
+	}
+
+	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
+	return []core_v1.Pod{
+		{ObjectMeta: meta_v1.ObjectMeta{
+			Name:              "details",
+			Namespace:         "Namespace",
+			CreationTimestamp: meta_v1.NewTime(t1),
+			Labels:            wpLabels,
+			Annotations:       kubetest.FakeIstioAmbientAnnotations(),
+		},
+			Spec: core_v1.PodSpec{
+				Containers: []core_v1.Container{
+					{Name: "details", Image: "whatever"},
+				},
+			},
+		},
+		{ObjectMeta: meta_v1.ObjectMeta{
+			Name:              "productpage",
+			Namespace:         "Namespace",
+			CreationTimestamp: meta_v1.NewTime(t1),
+			Labels:            map[string]string{appLabel: "productpage", versionLabel: "v1"},
+			Annotations:       kubetest.FakeIstioAmbientAnnotations(),
+		},
+			Spec: core_v1.PodSpec{
+				Containers: []core_v1.Container{
+					{Name: "productpage", Image: "whatever"},
+				},
+			},
+		},
+	}
+}
+
+func FakeWaypointNServiceEnrolledPods() []core_v1.Service {
+	conf := config.NewConfig()
+	waypointLabel := conf.IstioLabels.AmbientWaypointUseLabel
+
+	return []core_v1.Service{
+		{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:      "details",
+				Namespace: "Namespace",
+				Labels:    map[string]string{"app": "details", waypointLabel: "waypoint"},
+			},
+			Spec: core_v1.ServiceSpec{
+				Selector: map[string]string{"app": "details"},
+			},
+		},
+	}
+
+}
+
+func FakeZtunnelDaemonSet() []apps_v1.DaemonSet {
+	conf := config.NewConfig()
+	conf.KubernetesConfig.ExcludeWorkloads = []string{}
+
+	appLabel := conf.IstioLabels.AppLabelName
+	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
+	return []apps_v1.DaemonSet{
+		{
+			TypeMeta: meta_v1.TypeMeta{
+				APIVersion: kubernetes.DaemonSets.GroupVersion().String(),
+				Kind:       kubernetes.DaemonSets.Kind,
+			},
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:              "ztunnel",
+				Namespace:         "istio-system",
+				CreationTimestamp: meta_v1.NewTime(t1),
+			},
+			Spec: apps_v1.DaemonSetSpec{
+				Template: core_v1.PodTemplateSpec{
+					ObjectMeta: meta_v1.ObjectMeta{
+						Labels: map[string]string{appLabel: "ztunnel"},
+					},
+				},
+				Selector: &meta_v1.LabelSelector{
+					MatchLabels: map[string]string{appLabel: "ztunnel"},
+				},
+			},
+			Status: apps_v1.DaemonSetStatus{
+				DesiredNumberScheduled: 1,
+				CurrentNumberScheduled: 1,
+				NumberAvailable:        1,
+			},
+		},
+	}
+}
+
 func FakeCustomControllerRSSyncedWithPods() []apps_v1.ReplicaSet {
 	conf := config.NewConfig()
-	config.Set(conf)
+
 	appLabel := conf.IstioLabels.AppLabelName
 	versionLabel := conf.IstioLabels.VersionLabelName
 	t1, _ := time.Parse(time.RFC822Z, "08 Mar 18 17:44 +0300")
@@ -835,10 +1097,12 @@ func FakeCustomControllerRSSyncedWithPods() []apps_v1.ReplicaSet {
 	return []apps_v1.ReplicaSet{
 		{
 			TypeMeta: meta_v1.TypeMeta{
-				Kind: "ReplicaSet",
+				APIVersion: kubernetes.ReplicaSets.GroupVersion().String(),
+				Kind:       kubernetes.ReplicaSets.Kind,
 			},
 			ObjectMeta: meta_v1.ObjectMeta{
-				Name:              "custom-controller-123",
+				Name:              "custom-controller-RS-123",
+				Namespace:         "Namespace",
 				CreationTimestamp: meta_v1.NewTime(t1),
 				OwnerReferences: []meta_v1.OwnerReference{{
 					Controller: &controller,
@@ -865,10 +1129,34 @@ func FakeCustomControllerRSSyncedWithPods() []apps_v1.ReplicaSet {
 func FakeServices() []core_v1.Service {
 	return []core_v1.Service{
 		{
-			ObjectMeta: meta_v1.ObjectMeta{Name: "httpbin"},
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:      "httpbin",
+				Namespace: "Namespace",
+				Labels:    map[string]string{"app": "httpbin"},
+			},
 			Spec: core_v1.ServiceSpec{
 				Selector: map[string]string{"app": "httpbin"},
 			},
 		},
 	}
+}
+
+func readFile(fileName string) (string, error) {
+
+	f, err := os.OpenFile(fileName, os.O_RDONLY, 0644)
+	if err != nil {
+		return "", fmt.Errorf("error opening file %s", err)
+	}
+	defer func(f *os.File) {
+		errClose := f.Close()
+		if errClose != nil {
+			log.Errorf("error closing file %s", err)
+		}
+	}(f)
+
+	content, err := io.ReadAll(f)
+	if err != nil {
+		return "", fmt.Errorf("error reading file %s", err)
+	}
+	return string(content), nil
 }

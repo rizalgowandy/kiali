@@ -73,8 +73,11 @@ cd ${SCRIPT_DIR}
 DEFAULT_API_PROXY_HOST="127.0.0.1"
 DEFAULT_API_PROXY_PORT="8001"
 DEFAULT_CLIENT_EXE="kubectl"
+DEFAULT_COPY_CLUSTER_SECRETS="true"
 DEFAULT_ENABLE_SERVER="true"
 DEFAULT_ISTIO_NAMESPACE="istio-system"
+DEFAULT_ISTIOD_URL="http://127.0.0.1:15014/version"
+DEFAULT_ISTIOD_SERVICE_NAME="istiod"
 DEFAULT_KIALI_CONFIG_TEMPLATE_FILE="${SCRIPT_DIR}/run-kiali-config-template.yaml"
 DEFAULT_KIALI_EXE="${GOPATH:-.}/bin/kiali"
 DEFAULT_KUBE_CONTEXT="kiali-developer"
@@ -84,6 +87,8 @@ DEFAULT_LOCAL_REMOTE_PORTS_TRACING="16686:16686"
 DEFAULT_LOG_LEVEL="info"
 DEFAULT_REBOOTABLE="true"
 DEFAULT_TMP_ROOT_DIR="/tmp"
+DEFAULT_TRACING_APP="jaeger"
+DEFAULT_TRACING_SERVICE="tracing"
 
 # Process command line options
 
@@ -93,10 +98,14 @@ while [[ $# -gt 0 ]]; do
     -aph|--api-proxy-host)       API_PROXY_HOST="$2";                shift;shift ;;
     -app|--api-proxy-port)       API_PROXY_PORT="$2";                shift;shift ;;
     -c|--config)                 KIALI_CONFIG_TEMPLATE_FILE="$2";    shift;shift ;;
+    -ccs|--copy-cluster-secrets) COPY_CLUSTER_SECRETS="$2";          shift;shift ;;
     -ce|--client-exe)            CLIENT_EXE="$2";                    shift;shift ;;
+    -cn|--cluster-name)          CLUSTER_NAME="$2";                  shift;shift ;;
     -es|--enable-server)         ENABLE_SERVER="$2";                 shift;shift ;;
     -gu|--grafana-url)           GRAFANA_URL="$2";                   shift;shift ;;
     -in|--istio-namespace)       ISTIO_NAMESPACE="$2";               shift;shift ;;
+    -isn|--istiod-service-name)  ISTIOD_SERVICE_NAME="$2";           shift;shift ;;
+    -iu|--istiod-url)            ISTIOD_URL="$2";                    shift;shift ;;
     -kah|--kubernetes-api-host)  KUBERNETES_API_HOST="$2";           shift;shift ;;
     -kap|--kubernetes-api-port)  KUBERNETES_API_PORT="$2";           shift;shift ;;
     -kc|--kube-context)          KUBE_CONTEXT="$2";                  shift;shift ;;
@@ -108,6 +117,9 @@ while [[ $# -gt 0 ]]; do
     -pu|--prometheus-url)        PROMETHEUS_URL="$2";                shift;shift ;;
     -r|--rebootable)             REBOOTABLE="$2";                    shift;shift ;;
     -trd|--tmp-root-dir)         TMP_ROOT_DIR="$2";                  shift;shift ;;
+    -tr|--tracing-app)           TRACING_APP="$2";                   shift;shift ;;
+    -ts|--tracing-service)       TRACING_SERVICE="$2";               shift;shift ;;
+    -tn|--tracing-namespace)     TRACING_NAMESPACE="$2";             shift;shift ;;
     -tu|--tracing-url)           TRACING_URL="$2";                   shift;shift ;;
     -ucd|--ui-console-dir)       UI_CONSOLE_DIR="$2";                shift;shift ;;
     -h|--help )
@@ -132,9 +144,17 @@ Valid options:
       For details on what settings can go in this config file, see the "spec" field in the
       example Kiali CR here: https://github.com/kiali/kiali-operator/blob/master/deploy/kiali/kiali_cr.yaml
       Default: ${DEFAULT_KIALI_CONFIG_TEMPLATE_FILE}
+  -ccs|--copy-cluster-secrets
+      When true, the remote cluster secrets mounted to the Kiali pod will be copied to your
+      local file system at /kiali-remote-cluster-secrets. Obviously, Kiali must be deployed
+      in the cluster for this option to work.
+      Default: ${DEFAULT_COPY_CLUSTER_SECRETS}
   -ce|--client-exe
       Cluster client executable - must refer to 'oc' or 'kubectl'.
       Default: ${DEFAULT_CLIENT_EXE}
+  -cn|--cluster-name)
+      The name of the cluster as defined by the Istio infrastructure.
+      Default: <not defined>
   -es|--enable-server
       When 'true', this script will start the server and manage its lifecycle.
       When 'false' this script will do nothing to start or stop the server.
@@ -151,6 +171,13 @@ Valid options:
   -in|--istio-namespace
       The name of the control plane namespace - this is where Istio components are installed.
       Default: ${DEFAULT_ISTIO_NAMESPACE}
+  -isn|--istiod-service-name
+      The name of the istiod service.
+      This is used in conjunction with the istiod URL in order to port forward to istiod.
+      Default: ${DEFAULT_ISTIOD_SERVICE_NAME}
+  -iu|--istiod-url
+      The URL of the istiod endpoint.
+      Default: ${DEFAULT_ISTIOD_URL}
   -kah|--kubernetes-api-host
       The hostname of the Kubernetes API Endpoint.
       Default: <will be auto-discovered>
@@ -160,7 +187,7 @@ Valid options:
   -kc|--kube-context
       The context used to connect to the cluster. This is a context that will be
       created/modified in order to proxy the requests to the API server.
-      This context will be associatd with the Kiali service account.
+      This context will be associated with the Kiali service account.
       After it is created, you will be able to inspect this context and its
       related information via "kubectl config" while the server is running,
       but it will be deleted when this script exits and you will return back to
@@ -206,6 +233,15 @@ Valid options:
   -trd|--tmp-root-dir)
       Where temporary files and directories will be created.
       Default: ${DEFAULT_TMP_ROOT_DIR}
+  -tr|--tracing-app)
+      Tracing backend. Jaeger, tempo-query-frontend
+      Default: ${DEFAULT_TRACING_APP}
+  -ts|--tracing-service)
+      Tracing service. tracing, tempo-query-frontend, ...
+      Default: ${DEFAULT_TRACING_SERVICE}
+  -tn|--tracing-namespace)
+      Tracing backend namespace
+      Default: ${DEFAULT_ISTIO_NAMESPACE}
   -tu|--tracing-url
       The URL that can be used to query the exposed Tracing service. You must have exposed Tracing
       to external clients outside of the cluster - that external URL is what this value should be.
@@ -214,11 +250,10 @@ Valid options:
   -ucd|--ui-console-dir
       A directory on the local machine containing the UI console code.
       If not specified, an attempt to find it on the local machine will be made. A search up the
-      directory tree is made, looking for any directory called "kiali-ui" that has a "build" directory under it.
-      The "build" directory of the kiali-ui is generated after you run "yarn build" to
-      generate the distributable package. So, make sure that you build the kiali-ui before
+      directory tree is made, looking for any directory called "kiali-ui" or "frontend" that has a "build" directory under it.
+      The "build" directory of the UI is generated after you run "yarn build" to
+      generate the distributable package. So, make sure that you build the UI before
       using this script and then set this option to the generated build directory.
-      For details, see: https://github.com/kiali/kiali-ui
       Default: <a local build that is auto-discovered>
 HELPMSG
       exit 1
@@ -234,6 +269,8 @@ done
 
 API_PROXY_HOST="${API_PROXY_HOST:-${DEFAULT_API_PROXY_HOST}}"
 API_PROXY_PORT="${API_PROXY_PORT:-${DEFAULT_API_PROXY_PORT}}"
+CLUSTER_NAME="${CLUSTER_NAME:-}"
+COPY_CLUSTER_SECRETS="${COPY_CLUSTER_SECRETS:-${DEFAULT_COPY_CLUSTER_SECRETS}}"
 ENABLE_SERVER="${ENABLE_SERVER:-${DEFAULT_ENABLE_SERVER}}"
 ISTIO_NAMESPACE="${ISTIO_NAMESPACE:-${DEFAULT_ISTIO_NAMESPACE}}"
 KIALI_CONFIG_TEMPLATE_FILE="${KIALI_CONFIG_TEMPLATE_FILE:-${DEFAULT_KIALI_CONFIG_TEMPLATE_FILE}}"
@@ -245,10 +282,16 @@ LOCAL_REMOTE_PORTS_TRACING="${LOCAL_REMOTE_PORTS_TRACING:-${DEFAULT_LOCAL_REMOTE
 LOG_LEVEL="${LOG_LEVEL:-${DEFAULT_LOG_LEVEL}}"
 REBOOTABLE="${REBOOTABLE:-${DEFAULT_REBOOTABLE}}"
 TMP_ROOT_DIR="${TMP_ROOT_DIR:-${DEFAULT_TMP_ROOT_DIR}}"
+TRACING_APP="${TRACING_APP:-${DEFAULT_TRACING_APP}}"
+TRACING_SERVICE="${TRACING_SERVICE:-${DEFAULT_TRACING_SERVICE}}"
+TRACING_NAMESPACE="${TRACING_NAMESPACE:-${ISTIO_NAMESPACE}}"
 
 # these are the env vars required by the Kiali server itself
 KUBERNETES_SERVICE_HOST="${API_PROXY_HOST}"
 KUBERNETES_SERVICE_PORT="${API_PROXY_PORT}"
+
+# this is the secret we will manage if we need to set up our own context
+SERVICE_ACCOUNT_SECRET_NAME="runkiali-secret"
 
 # This is a directory where we write temp files needed to run Kiali locally
 
@@ -280,6 +323,13 @@ else
   IS_OPENSHIFT="false"
   infomsg "You are connecting to a (non-OpenShift) Kubernetes cluster"
 fi
+
+# Port forward data for Istiod, used for the Istiod URL
+ISTIOD_SERVICE_NAME="${ISTIOD_SERVICE_NAME:-${DEFAULT_ISTIOD_SERVICE_NAME}}"
+PORT_FORWARD_SERVICE_ISTIOD="service/${ISTIOD_SERVICE_NAME}"
+LOCAL_REMOTE_PORTS_ISTIOD="15014:15014"
+ISTIOD_URL="${ISTIOD_URL:-${DEFAULT_ISTIOD_URL}}"
+
 
 # If the user didn't tell us what the Prometheus URL is, try to auto-discover it
 
@@ -316,7 +366,7 @@ if [ -z "${PROMETHEUS_URL:-}" ]; then
       warnmsg "Cannot auto-discover Prometheus on Kubernetes. If you exposed it, you can specify the Prometheus URL via --prometheus-url. For now, this session will attempt to port-forward to it."
       prom_remote_port="$(${CLIENT_EXE} get service -n ${ISTIO_NAMESPACE} prometheus -o jsonpath='{.spec.ports[0].targetPort}')"
       if [ "$?" != "0" -o -z "${prom_remote_port}" ]; then
-        warnmsg "Cannot auto-discover Prometheus port on Kubernetes. If you exposed it, you can specify the Prometheus URL via --prometheus-url. For now, this session will attempt to port-forward to it."
+        warnmsg "Failed to port forward. Cannot auto-discover Prometheus port on Kubernetes. If you exposed it, you can specify the Prometheus URL via --prometheus-url. For now, this session will attempt to port-forward to it."
       else
         prom_local_port="$(echo ${LOCAL_REMOTE_PORTS_PROMETHEUS} | cut -d ':' -f 1)"
         LOCAL_REMOTE_PORTS_PROMETHEUS="${prom_local_port}:${prom_remote_port}"
@@ -376,45 +426,51 @@ fi
 PORT_FORWARD_DEPLOYMENT_TRACING=""
 if [ -z "${TRACING_URL:-}" ]; then
   if [ "${IS_OPENSHIFT}" == "true" ]; then
-    trac_host="$(${CLIENT_EXE} get route -n ${ISTIO_NAMESPACE} tracing -o jsonpath='{.spec.host}')"
+    trac_host="$(${CLIENT_EXE} get route -n ${TRACING_NAMESPACE} ${TRACING_SERVICE} -o jsonpath='{.spec.host}')"
     if [ "$?" != "0" -o -z "${trac_host}" ]; then
-      trac_host="$(${CLIENT_EXE} get route -n ${ISTIO_NAMESPACE} jaeger -o jsonpath='{.spec.host}')"
+      trac_host="$(${CLIENT_EXE} get route -n ${TRACING_NAMESPACE} ${TRACING_APP} -o jsonpath='{.spec.host}')"
     fi
     if [ "$?" != "0" -o -z "${trac_host}" ]; then
-      PORT_FORWARD_DEPLOYMENT_TRACING="$(${CLIENT_EXE} get deployment -n ${ISTIO_NAMESPACE} jaeger -o name)"
+      PORT_FORWARD_DEPLOYMENT_TRACING="$(${CLIENT_EXE} get deployment -n ${TRACING_NAMESPACE} ${TRACING_APP} -o name)"
       if [ "$?" != "0" -o -z "${PORT_FORWARD_DEPLOYMENT_TRACING}" ]; then
         errormsg "Cannot auto-discover Tracing on OpenShift. You must specify the Tracing URL via --tracing-url"
         exit 1
       else
         warnmsg "Cannot auto-discover Tracing on OpenShift. If you exposed it, you can specify the Tracing URL via --tracing-url. For now, this session will attempt to port-forward to it."
-        trac_remote_port="$(${CLIENT_EXE} get service -n ${ISTIO_NAMESPACE} tracing -o jsonpath='{.spec.ports[0].targetPort}')"
+        trac_remote_port="$(${CLIENT_EXE} get service -n ${TRACING_NAMESPACE} ${TRACING_SERVICE} -o jsonpath='{.spec.ports[0].targetPort}')"
         if [ "$?" != "0" -o -z "${trac_remote_port}" ]; then
           warnmsg "Cannot auto-discover Tracing port on OpenShift. If you exposed it, you can specify the Tracing URL via --tracing-url. For now, this session will attempt to port-forward to it."
         else
           trac_local_port="$(echo ${LOCAL_REMOTE_PORTS_TRACING} | cut -d ':' -f 1)"
           LOCAL_REMOTE_PORTS_TRACING="${trac_local_port}:${trac_remote_port}"
         fi
-        TRACING_URL="http://127.0.0.1:$(echo ${LOCAL_REMOTE_PORTS_TRACING} | cut -d ':' -f 1)"
+        [ ${TRACING_APP} == 'jaeger' ] && TRACING_PREFIX="/jaeger" || TRACING_PREFIX=""
+        TRACING_URL="http://127.0.0.1:$(echo ${LOCAL_REMOTE_PORTS_TRACING} | cut -d ':' -f 1)${TRACING_PREFIX}"
       fi
     else
       infomsg "Auto-discovered OpenShift route that exposes Tracing"
       TRACING_URL="http://${trac_host}"
     fi
   else
-    PORT_FORWARD_DEPLOYMENT_TRACING="$(${CLIENT_EXE} get deployment -n ${ISTIO_NAMESPACE} jaeger -o name)"
+    PORT_FORWARD_DEPLOYMENT_TRACING="$(${CLIENT_EXE} get deployment -n ${TRACING_NAMESPACE} ${TRACING_APP} -o name)"
     if [ "$?" != "0" -o -z "${PORT_FORWARD_DEPLOYMENT_TRACING}" ]; then
       errormsg "Cannot auto-discover Tracing on Kubernetes. You must specify the Tracing URL via --tracing-url"
       exit 1
     else
       warnmsg "Cannot auto-discover Tracing on Kubernetes. If you exposed it, you can specify the Tracing URL via --tracing-url. For now, this session will attempt to port-forward to it."
-      trac_remote_port="$(${CLIENT_EXE} get service -n ${ISTIO_NAMESPACE} tracing -o jsonpath='{.spec.ports[0].targetPort}')"
+      if [[ "$TRACING_SERVICE" == *"tempo"* ]]; then
+        trac_remote_port="$(${CLIENT_EXE} get service -n ${TRACING_NAMESPACE} ${TRACING_SERVICE} -o jsonpath='{.spec.ports[3].port}')"
+      else
+        trac_remote_port="$(${CLIENT_EXE} get service -n ${TRACING_NAMESPACE} ${TRACING_SERVICE} -o jsonpath='{.spec.ports[0].targetPort}')"
+      fi
       if [ "$?" != "0" -o -z "${trac_remote_port}" ]; then
         warnmsg "Cannot auto-discover Tracing port on Kubernetes. If you exposed it, you can specify the Tracing URL via --tracing-url. For now, this session will attempt to port-forward to it."
       else
         trac_local_port="$(echo ${LOCAL_REMOTE_PORTS_TRACING} | cut -d ':' -f 1)"
         LOCAL_REMOTE_PORTS_TRACING="${trac_local_port}:${trac_remote_port}"
       fi
-      TRACING_URL="http://127.0.0.1:$(echo ${LOCAL_REMOTE_PORTS_TRACING} | cut -d ':' -f 1)"
+      [ ${TRACING_APP} == 'jaeger' ] && TRACING_PREFIX="/jaeger" || TRACING_PREFIX=""
+      TRACING_URL="http://127.0.0.1:$(echo ${LOCAL_REMOTE_PORTS_TRACING} | cut -d ':' -f 1)${TRACING_PREFIX}"
     fi
   fi
 fi
@@ -444,11 +500,15 @@ fi
 if [ -z "${UI_CONSOLE_DIR:-}" ]; then
   infomsg "Attempting to find the UI Console directory..."
 
-  # See if the user has the typical dev environment. Go up the dir tree to find a 'kiali-ui' directory with a 'build' directory under it.
+  # See if the user has the typical dev environment. Go up the dir tree to find a 'frontend' or 'kiali-ui' directory with a 'build' directory under it.
   cur_path="${SCRIPT_DIR}"
   while [[ ${cur_path} != / ]];
   do
-    find_results="$(find "${cur_path}" -maxdepth 1 -mindepth 1 -name "kiali-ui" | head -n 1)"
+    find_results="$(find "${cur_path}" -maxdepth 1 -mindepth 1 -name "frontend" | head -n 1)"
+    if [ -z "${find_results}" ]; then
+      # do this in case you are running an older Kiali that had its kiali-ui split out into a separate repo
+      find_results="$(find "${cur_path}" -maxdepth 1 -mindepth 1 -name "kiali-ui" | head -n 1)"
+    fi
     if [ ! -z "${find_results}" ]; then
       if [ -d "${find_results}/build" ]; then
         UI_CONSOLE_DIR="${find_results}/build"
@@ -467,18 +527,16 @@ if [ -z "${UI_CONSOLE_DIR:-}" ]; then
   fi
 fi
 
-# Kiali will log the version of the UI based on version.txt - create a dummy one to avoid a warning message at startup
-if [ ! -f "${UI_CONSOLE_DIR}/version.txt" ]; then
-  echo "Local-Build" > "${UI_CONSOLE_DIR}/version.txt"
-fi
-
 infomsg "===== SETTINGS ====="
 echo "API_PROXY_HOST=$API_PROXY_HOST"
 echo "API_PROXY_PORT=$API_PROXY_PORT"
 echo "CLIENT_EXE=$CLIENT_EXE"
+echo "CLUSTER_NAME=$CLUSTER_NAME"
+echo "COPY_CLUSTER_SECRETS=$COPY_CLUSTER_SECRETS"
 echo "ENABLE_SERVER=$ENABLE_SERVER"
 echo "GRAFANA_URL=$GRAFANA_URL"
 echo "ISTIO_NAMESPACE=$ISTIO_NAMESPACE"
+echo "ISTIOD_URL=$ISTIOD_URL"
 echo "KIALI_CONFIG_TEMPLATE_FILE=$KIALI_CONFIG_TEMPLATE_FILE"
 echo "KIALI_EXE=$KIALI_EXE"
 echo "KUBE_CONTEXT=$KUBE_CONTEXT"
@@ -493,6 +551,9 @@ echo "LOG_LEVEL=$LOG_LEVEL"
 echo "PROMETHEUS_URL=$PROMETHEUS_URL"
 echo "REBOOTABLE=$REBOOTABLE"
 echo "TMP_ROOT_DIR=$TMP_ROOT_DIR"
+echo "TRACING_APP=$TRACING_APP"
+echo "TRACING_SERVICE=$TRACING_SERVICE"
+echo "TRACING_NAMESPACE=$TRACING_NAMESPACE"
 echo "TRACING_URL=$TRACING_URL"
 echo "UI_CONSOLE_DIR=$UI_CONSOLE_DIR"
 
@@ -508,17 +569,39 @@ if ! echo "${LOG_LEVEL}" | grep -qiE "^(trace|debug|info|warn|error|fatal)$"; th
 [ "${REBOOTABLE}" != "true" -a "${REBOOTABLE}" != "false" ] && errormsg "--rebootable must be 'true' or 'false'" && exit 1
 [ "${ENABLE_SERVER}" != "true" -a "${ENABLE_SERVER}" != "false" ] && errormsg "--enable-server must be 'true' or 'false'" && exit 1
 [ "${ENABLE_SERVER}" == "false" -a "${REBOOTABLE}" == "true" ] && infomsg "--enable-server was set to false - turning off rebootable flag for you" && REBOOTABLE="false"
+[ "${COPY_CLUSTER_SECRETS}" != "true" -a "${COPY_CLUSTER_SECRETS}" != "false" ] && errormsg "--copy-cluster-secrets must be 'true' or 'false'" && exit 1
+
+REMOTE_SECRET_PATH=""
+if [ "${KUBE_CONTEXT}" == "current" ]; then
+  infomsg "Will use the current context as-is: $(${CLIENT_EXE} config current-context)"
+  # Re-use your current kubeconfig file.
+  REMOTE_SECRET_PATH="${HOME}/.kube/config"
+else
+  REMOTE_SECRET_PATH="${TMP_DIR}/kubeconfig"
+fi
 
 # Build the config file from the template
 
 KIALI_CONFIG_FILE="${TMP_DIR}/run-kiali-config.yaml"
 cat ${KIALI_CONFIG_TEMPLATE_FILE} | \
   ISTIO_NAMESPACE=${ISTIO_NAMESPACE} \
+  ISTIOD_URL=${ISTIOD_URL} \
   PROMETHEUS_URL=${PROMETHEUS_URL} \
   GRAFANA_URL=${GRAFANA_URL} \
+  TRACING_APP=${TRACING_APP} \
   TRACING_URL=${TRACING_URL} \
   UI_CONSOLE_DIR=${UI_CONSOLE_DIR}   \
+  REMOTE_SECRET_PATH=${REMOTE_SECRET_PATH} \
   envsubst > ${KIALI_CONFIG_FILE}
+
+# Set kubernetes_config.cluster_name only if the user told us to configure a specific cluster name
+if [ -n "${CLUSTER_NAME}" ]; then
+  cat << EOM >> ${KIALI_CONFIG_FILE}
+
+kubernetes_config:
+  cluster_name: "${CLUSTER_NAME}"
+EOM
+fi
 
 # Kiali wants the UI Console in a directory called "console" under its cwd
 
@@ -527,6 +610,47 @@ if [ ! -d "${TMP_DIR}/console" ]; then
 fi
 cd ${TMP_DIR}
 
+# If we are told to copy the remote cluster secrets, prepare the local directory
+# and pull the files down from the Kiali pod. If there is no Kiali pod deployed,
+# then spit out a warning but keep going.
+
+if [ "${COPY_CLUSTER_SECRETS}" == "true" ]; then
+  infomsg "Attempting to copy the remote cluster secrets from a Kiali pod deployed in the cluster..."
+  POD_NAME="$(${CLIENT_EXE} -n ${ISTIO_NAMESPACE} get pod -l app.kubernetes.io/name=kiali -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
+  if [ -z "${POD_NAME}" ]; then
+    warnmsg "Cannot get the Kiali pod name. Kiali must be deployed in [${ISTIO_NAMESPACE}]. If you do not want to deploy Kiali in the cluster, set '--copy-cluster-secrets' to 'false'."
+  else
+    infomsg "Will copy remote cluster secrets from the Kiali pod [${ISTIO_NAMESPACE}/${POD_NAME}]"
+
+    # Unless this dir already exists, it will most likely fail to be created because
+    # creating a directory under the root directory usually requires sudo access.
+    REMOTE_CLUSTER_SECRETS_DIR="/kiali-remote-cluster-secrets"
+    mkdir -p ${REMOTE_CLUSTER_SECRETS_DIR}
+    if [ ! -d ${REMOTE_CLUSTER_SECRETS_DIR} ]; then
+      errormsg "You first must prepare the remote cluster secrets directory: sudo mkdir -p ${REMOTE_CLUSTER_SECRETS_DIR}; sudo chmod ugo+w ${REMOTE_CLUSTER_SECRETS_DIR}"
+      exit 1
+    fi
+    rm -rf ${REMOTE_CLUSTER_SECRETS_DIR}/*
+
+    # if the directory doesn't exist, then no remote secrets are available, so skip everything else
+    ${CLIENT_EXE} exec -n ${ISTIO_NAMESPACE} --stdin --tty pod/${POD_NAME} -- ls -d ${REMOTE_CLUSTER_SECRETS_DIR} >&/dev/null
+    if [ "$?" == "0" ]; then
+      pod_remote_secrets_dirs=$(${CLIENT_EXE} exec -n ${ISTIO_NAMESPACE} --stdin --tty pod/${POD_NAME} -- ls -1 ${REMOTE_CLUSTER_SECRETS_DIR} | tr -d '\r')
+      for d in $pod_remote_secrets_dirs; do
+        mkdir -p "${REMOTE_CLUSTER_SECRETS_DIR}/$d"
+        pod_remote_secrets_files=$(${CLIENT_EXE} exec -n ${ISTIO_NAMESPACE} --stdin --tty pod/${POD_NAME} -- ls -1 ${REMOTE_CLUSTER_SECRETS_DIR}/${d} | tr -d '\r')
+        for f in $pod_remote_secrets_files; do
+          infomsg "Copying remote cluster secret file: ${REMOTE_CLUSTER_SECRETS_DIR}/${d}/${f}"
+          secret_file_content=$(${CLIENT_EXE} exec -n ${ISTIO_NAMESPACE} --stdin --tty pod/${POD_NAME} -- cat ${REMOTE_CLUSTER_SECRETS_DIR}/${d}/${f})
+          echo "${secret_file_content}" > ${REMOTE_CLUSTER_SECRETS_DIR}/${d}/${f}
+        done
+      done
+    else
+      infomsg "There are no remote cluster secrets mounted on the Kiali pod."
+    fi
+  fi
+fi
+
 # Obtain the service account token and certificates so we can authenticate with the server
 # And then create the dev context that will be used to connect to the cluster.
 # Note that if the user elected to use the "current" kube context, we do none of this.
@@ -534,52 +658,46 @@ cd ${TMP_DIR}
 # Kiali will report errors in this case because it will be missing the service account, and
 # the current user may have permissions that are different than the Kiali service account.
 # But the benefit of this is that you do not need to have a Kiali deployment in the cluster.
-
-if [ "${KUBE_CONTEXT}" == "current" ]; then
-  KUBE_ORIGINAL_CONTEXT="$(${CLIENT_EXE} config current-context)"
-  infomsg "Will use the current context as-is: ${KUBE_ORIGINAL_CONTEXT}"
-  warnmsg "Since you will use your own context, expect some errors to occur in the Kiali Server due to missing service account credentials."
-else
-  TMP_SECRETS_DIR="${TMP_DIR}/secrets"
-  mkdir -p "${TMP_SECRETS_DIR}"
-
-  TOKEN_FILE="${TMP_SECRETS_DIR}/token"
-  CA_FILE="${TMP_SECRETS_DIR}/ca.crt"
+if [ "${KUBE_CONTEXT}" != "current" ]; then
+  TOKEN_FILE="${TMP_DIR}/token"
+  CA_FILE="${TMP_DIR}/ca.crt"
 
   infomsg "Attempting to obtain the service account token and certificates..."
-  SERVICE_ACCOUNT_NAME="$(${CLIENT_EXE} -n ${ISTIO_NAMESPACE} get sa -l app=kiali -o name)"
+  SERVICE_ACCOUNT_NAME="$(${CLIENT_EXE} -n ${ISTIO_NAMESPACE} get sa -l app.kubernetes.io/name=kiali -o jsonpath={.items[0].metadata.name})"
   if [ -z "${SERVICE_ACCOUNT_NAME}" ]; then
     errormsg "Cannot get the service account name. Kiali must be deployed in [${ISTIO_NAMESPACE}]. If you do not want to deploy Kiali in the cluster, use '--kube-context current'"
     exit 1
   fi
-  SERVICE_ACCOUNT_SECRET_NAME="$(${CLIENT_EXE} -n ${ISTIO_NAMESPACE} get ${SERVICE_ACCOUNT_NAME} -o jsonpath='{.secrets[0].name}')"
+
+  # Newer k8s/OpenShift clusters no longer provide secrets for SAs - so manually create a secret that will contain the certs/token
+  cat <<EOM | ${CLIENT_EXE} apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${SERVICE_ACCOUNT_SECRET_NAME}
+  namespace: ${ISTIO_NAMESPACE}
+  annotations:
+    kubernetes.io/service-account.name: ${SERVICE_ACCOUNT_NAME}
+type: kubernetes.io/service-account-token
+EOM
+
+  wait_for_secret=1
+  until [ $wait_for_secret -eq 5 ] || [ "$(${CLIENT_EXE} -n ${ISTIO_NAMESPACE} get secret ${SERVICE_ACCOUNT_SECRET_NAME} -o jsonpath="{.data.token}" 2> /dev/null)" != "" ] ; do
+    sleep $(( wait_for_secret++ ))
+  done
+
   ${CLIENT_EXE} -n ${ISTIO_NAMESPACE} get secret ${SERVICE_ACCOUNT_SECRET_NAME} -o jsonpath="{.data.token}" | base64 --decode > "${TOKEN_FILE}"
   ${CLIENT_EXE} -n ${ISTIO_NAMESPACE} get secret ${SERVICE_ACCOUNT_SECRET_NAME} -o jsonpath="{.data['ca\.crt']}" | base64 --decode > "${CA_FILE}"
   if [ ! -s "${TOKEN_FILE}"  ]; then errormsg "Cannot obtain the Kiali service account token"; exit 1; fi
   if [ ! -s "${CA_FILE}"  ]; then errormsg "Cannot obtain the Kiali service account ca.crt"; exit 1; fi
   chmod 'u=r,go=' "${TOKEN_FILE}" "${CA_FILE}"
 
-  # This is a directory hardcoded into the Kial server - there is no way to configure it to be anything else.
-  # We must link our token and crt files to that hardcoded path the Kiali server will look for.
-  ROOT_SECRETS_DIR="/var/run/secrets/kubernetes.io/serviceaccount"
-  if [ ! -d $(dirname ${ROOT_SECRETS_DIR}) ]; then
-    errormsg "You first must prepare the secrets directory: sudo mkdir -p $(dirname ${ROOT_SECRETS_DIR}); sudo chmod ugo+w $(dirname ${ROOT_SECRETS_DIR})"
-    exit 1
-  fi
-  rm -f ${ROOT_SECRETS_DIR}
-  ln -s "${TMP_SECRETS_DIR}" ${ROOT_SECRETS_DIR}
-
-  # Set up the dev context that we will use to connect to the cluster
-  KUBE_ORIGINAL_CONTEXT="$(${CLIENT_EXE} config current-context)"
-  if [ "${KUBE_ORIGINAL_CONTEXT}" == "${KUBE_CONTEXT}" ]; then
-    errormsg "The current context name is the same as the context to be created [${KUBE_CONTEXT}]. If you want to use the current context, set '--kube-context current'"
-    exit 1
-  fi
-  infomsg "Setting up context [${KUBE_CONTEXT}]"
-  ${CLIENT_EXE} config set-cluster ${KUBE_CONTEXT} "--server=https://${KUBERNETES_API_HOST}:${KUBERNETES_API_PORT}" "--certificate-authority=${CA_FILE}"
-  ${CLIENT_EXE} config set-credentials ${KUBE_CONTEXT} "--token=$(cat ${TOKEN_FILE})"
-  ${CLIENT_EXE} config set-context ${KUBE_CONTEXT} --user=${KUBE_CONTEXT} --cluster=${KUBE_CONTEXT} --namespace=${ISTIO_NAMESPACE}
-  ${CLIENT_EXE} config use-context ${KUBE_CONTEXT}
+  infomsg "Setting up kubeconfig at [${REMOTE_SECRET_PATH}]"
+  # Embedding the ca cert so we don't have pathing issues.
+  ${CLIENT_EXE} config set-cluster ${KUBE_CONTEXT} --kubeconfig="${REMOTE_SECRET_PATH}" "--server=https://${KUBERNETES_API_HOST}:${KUBERNETES_API_PORT}" --certificate-authority="${CA_FILE}" --embed-certs
+  ${CLIENT_EXE} config set-credentials ${KUBE_CONTEXT} --kubeconfig="${REMOTE_SECRET_PATH}" --token="$(cat ${TOKEN_FILE})"
+  ${CLIENT_EXE} config set-context ${KUBE_CONTEXT} --kubeconfig="${REMOTE_SECRET_PATH}" --user=${KUBE_CONTEXT} --cluster=${KUBE_CONTEXT} --namespace=${ISTIO_NAMESPACE}
+  ${CLIENT_EXE} config use-context --kubeconfig="${REMOTE_SECRET_PATH}" ${KUBE_CONTEXT}
 fi
 
 # Functions that port-forward to components we need
@@ -604,7 +722,12 @@ start_port_forward_component() {
     else
       startmsg "The port-forward to ${COMPONENT_NAME} is being started on [${EXPECTED_URL}]"
       set -m
-      (while true; do ${CLIENT_EXE} port-forward -n ${ISTIO_NAMESPACE} ${PORT_FORWARD_DEPLOYMENT} --address=127.0.0.1 ${LOCAL_REMOTE_PORTS} > /dev/null; warnmsg "${COMPONENT_NAME} port-forward died - restarting on [${EXPECTED_URL}]"; sleep 1; done) &
+      if [ "${COMPONENT_NAME}" == "Tracing" ]; then
+        NS=${TRACING_NAMESPACE}
+      else
+        NS=${ISTIO_NAMESPACE}
+      fi
+      (while true; do ${CLIENT_EXE} port-forward -n ${NS} ${PORT_FORWARD_DEPLOYMENT} --address=127.0.0.1 ${LOCAL_REMOTE_PORTS} > /dev/null; warnmsg "${COMPONENT_NAME} port-forward died - restarting on [${EXPECTED_URL}]"; sleep 1; done) &
       set +m
       local childpid="$!"
       printf -v "${PORT_FORWARD_JOB_VARNAME}" "$(jobs -lr | grep "${childpid}" | sed 's/.*\[\([0-9]\+\)\].*/\1/')"
@@ -612,7 +735,6 @@ start_port_forward_component() {
       infomsg "${COMPONENT_NAME} port-forward started (pid=${childpid}, job=${!PORT_FORWARD_JOB_VARNAME})"
       if ! curl ${EXPECTED_URL} > /dev/null 2>&1; then
         errormsg "Cannot port-forward to the ${COMPONENT_NAME} component. You must expose it and specify its URL via ${CMDLINE_OPT}"
-        cleanup_and_exit 1
       fi
     fi
   else
@@ -634,6 +756,14 @@ kill_port_forward_component() {
     killmsg "The port-forward to ${COMPONENT_NAME} has been killed"
     printf -v "${PORT_FORWARD_JOB_VARNAME}" ""
   fi
+}
+
+start_port_forward_istiod() {
+  start_port_forward_component 'Istiod' 'PORT_FORWARD_JOB_ISTIOD' "${PORT_FORWARD_SERVICE_ISTIOD}" "${LOCAL_REMOTE_PORTS_ISTIOD}" "${ISTIOD_URL}" '--istiod-url'
+}
+
+kill_port_forward_istiod() {
+  kill_port_forward_component 'Istiod' 'PORT_FORWARD_JOB_ISTIOD'
 }
 
 start_port_forward_prometheus() {
@@ -724,24 +854,13 @@ ask_to_restart_or_exit() {
 cleanup_and_exit() {
   kill_server
   kill_proxy
+  kill_port_forward_istiod
   kill_port_forward_prometheus
   kill_port_forward_grafana
   kill_port_forward_tracing
-  restore_original_context
 
   exitmsg "Exiting"
   exit ${1:-0}
-}
-
-restore_original_context() {
-  if [ "${KUBE_CONTEXT}" != "current" ]; then
-    infomsg "Restoring current context to the original context: ${KUBE_ORIGINAL_CONTEXT}"
-    ${CLIENT_EXE} config use-context ${KUBE_ORIGINAL_CONTEXT}
-    infomsg "Removing the dev context [${KUBE_CONTEXT}]"
-    ${CLIENT_EXE} config delete-cluster ${KUBE_CONTEXT}
-    ${CLIENT_EXE} config delete-user ${KUBE_CONTEXT}
-    ${CLIENT_EXE} config delete-context ${KUBE_CONTEXT}
-  fi
 }
 
 # Main - start the server (and optionally the proxy) and wait for user input to tell us what to do next
@@ -751,6 +870,7 @@ else
   infomsg "The server is not rebootable. You can kill this script via either [kill $$] or [kill -USR1 $$]"
 fi
 
+start_port_forward_istiod
 start_port_forward_prometheus
 start_port_forward_grafana
 start_port_forward_tracing
